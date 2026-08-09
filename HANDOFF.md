@@ -80,6 +80,17 @@ host tees to `<datadir>/log/python_*.log`. Read that file before theorising.
 
 ---
 
+## Launching the plugin
+
+The Home page side panel now has a **Plugins** entry (between Recent and OrcaCloud) that
+opens the same dialog as Tools ▸ Plugins. Three files in the fork, no new assets:
+
+- `resources/web/homepage/index.html` — the `BtnItem` + inline puzzle SVG (`currentColor`, so it follows the theme)
+- `resources/web/homepage/js/home.js` — `OnClickPlugins()` → `SendWXMessage({command:"homepage_plugins"})`
+- `src/slic3r/GUI/GUI_App.cpp` — `homepage_plugins` → `CallAfter([this]{ open_plugins_dialog(); })`
+
+The label is plain text, not `trans`/`tid`, because a new tid would need a localization entry.
+
 ## Testing
 
 **Standalone webview harness** (`scratchpad/wkprobe.py`) — reproduces the plugin webview

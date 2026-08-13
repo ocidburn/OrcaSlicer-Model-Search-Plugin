@@ -24,6 +24,27 @@ import time
 import urllib.parse
 
 
+def _download_dir():
+    """Where downloaded models are written.
+
+    The CPython audit hook only permits writes under Orca's datadir — the log
+    says so on every start ("[AUDIT] Global allowed root: <datadir>"), so
+    ~/Downloads raises PermissionError once a build enforces it. Plugins live at
+    <datadir>/orca_plugins/<name>/<file>.py, and cloud-subscribed ones a couple
+    of levels deeper, so walk up until orca_plugins is the child.
+    """
+    path = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        parent, leaf = os.path.split(path)
+        if leaf == "orca_plugins":
+            return os.path.join(parent, "model_downloads")
+        if not parent or parent == path:
+            # Not installed under orca_plugins (running the file directly);
+            # nothing is auditing us, so the old location is fine.
+            return os.path.join(os.path.expanduser("~/Downloads"), "OrcaModelSearch")
+        path = parent
+
+
 LICENSE_DESCRIPTIONS = {
     "CC BY": "Share and adapt for any purpose. Must credit the author.",
     "CC BY-SA": "Share and adapt, credit author, same license for remixes.",
@@ -889,8 +910,14 @@ if orca is not None:
                 self._post({"action": "error", "message": "No downloadable files found."})
                 return
 
-            dest_dir = os.path.join(os.path.expanduser("~/Downloads"), "OrcaModelSearch")
-            os.makedirs(dest_dir, exist_ok=True)
+            dest_dir = _download_dir()
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+            except PermissionError as e:
+                self._post({"action": "error", "message":
+                            "Cannot write to %s (%s). Orca's plugin audit hook only "
+                            "allows writes under its data directory." % (dest_dir, e)})
+                return
             paths = []
             for i, f in enumerate(files, 1):
                 self._post({"action": "status",

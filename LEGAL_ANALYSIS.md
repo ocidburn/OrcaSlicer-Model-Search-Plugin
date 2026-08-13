@@ -4,8 +4,8 @@
 
 4 adapters all use **publicly accessible endpoints** (no auth, no access control bypass).
 All platforms serve search results and license metadata from public URLs that the platform's
-own web frontend calls. We access the same public data at reasonable rates with license
-display before download and a first-run disclaimer. Risk: LOW.
+own web frontend calls. We access the same public data at reasonable rates, with the
+license and a responsibility notice displayed before download. Risk: LOW.
 
 Core safeguards implemented:
 1. License metadata displayed BEFORE download (non-negotiable)
@@ -192,9 +192,9 @@ Nothing in this document is legal advice.
 
 | Risk | Severity | Mitigation | Status |
 |------|----------|------------|--------|
-| User downloads ARR model without attribution | HIGH | License displayed before download; first-run disclaimer | Implemented |
+| User downloads ARR model without attribution | HIGH | License and responsibility notice displayed before download | Implemented |
 | Platform ToS violation (scraping) | MEDIUM | Public endpoints only; no auth bypass; reasonable rates | Implemented |
-| Mass copyright infringement | MEDIUM | No bulk download; license gate; disclaimer | Implemented |
+| Mass copyright infringement | MEDIUM | No bulk download; license shown first; liability disclaimer | Implemented |
 | Anti-bot blocking | LOW | Rate limiting; user-agent header | Implemented |
 | GDPR violation | LOW | No data collection | Verified |
 | OrcaSlicer ToS violation | LOW | Plugin is separate work (AGPL-compatible MIT license) | N/A |

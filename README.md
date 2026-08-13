@@ -31,10 +31,10 @@ retired.
 3. **Import** — the model is downloaded and dropped onto the plate; Orca switches to
    Prepare on its own. Or **Open in browser** to go to the model's page.
 
-The download button stays disabled until the licence has been shown. A first-run
-disclaimer explains that complying with each model's licence is the user's
-responsibility. Nothing is cached, re-hosted or redistributed, and the plugin collects
-no data of any kind.
+The licence is on screen before either button can be pressed — the detail panel is the
+only route to them — and a notice beside it states that complying with the licence is
+the user's own responsibility. Nothing is cached, re-hosted or redistributed, and the
+plugin collects no data of any kind.
 
 ## Install
 

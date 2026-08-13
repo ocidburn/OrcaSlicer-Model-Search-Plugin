@@ -58,12 +58,12 @@ Downloading is the user's own act, under the user's own platform account. See
 
 | Aspect | Detail |
 |--------|--------|
-| Endpoint | `GET printables.com/search/models?q=X` — HTML page with JSON-LD embedded data |
-| Auth | None required. Public search page. |
-| License metadata | `license` name (extracted from JSON-LD embedded in search page `<script type="application/ld+json">`) |
-| Files | Search results link to model detail pages. Files hosted on media.printables.com. |
-| Access method | HTML scraping of public search results page. Same page served to anonymous browsers. |
-| ToS risk | **LOW** — accessing public search results page at reasonable rates. No authentication bypass. |
+| Endpoint | `POST api.printables.com/graphql/` — `searchPrints2(query:, limit:)` |
+| Auth | None required. Public API. |
+| License metadata | `license { name }` returned by the API (`LicenseType` exposes no url) |
+| Files | `print(id:){stls{name filePreviewPath}}`; files hosted on files.printables.com. |
+| Access method | The same GraphQL query the printables.com frontend issues. No scraping: the HTML search page is behind a Cloudflare challenge and is no longer requested at all. |
+| ToS risk | **LOW** — public API, no authentication bypass, no challenge circumvention. |
 | Precedent | hiQ v. LinkedIn (9th Cir. 2022): accessing publicly available website data is not a CFAA violation. |
 
 ### 5. Thingiverse (UltiMaker)
@@ -193,7 +193,7 @@ Nothing in this document is legal advice.
 | Risk | Severity | Mitigation | Status |
 |------|----------|------------|--------|
 | User downloads ARR model without attribution | HIGH | License and responsibility notice displayed before download | Implemented |
-| Platform ToS violation (scraping) | MEDIUM | Public endpoints only; no auth bypass; reasonable rates | Implemented |
+| Platform ToS violation (scraping) | MEDIUM | Public APIs only — no HTML scraping anywhere; no auth bypass; reasonable rates | Implemented |
 | Mass copyright infringement | MEDIUM | No bulk download; license shown first; liability disclaimer | Implemented |
 | Anti-bot blocking | LOW | Rate limiting; user-agent header | Implemented |
 | GDPR violation | LOW | No data collection | Verified |

@@ -22,7 +22,7 @@
 | MakerWorld (Bambu) | 30 | `api.bambulab.com/v1/search-service/select/design2` | ❌ `{"error":"Please log in to download models."}` |
 | Nexprint (Elegoo) | 30 | `nexprint.com/gateway/api/v1/model-library-server/model-base-info/search` | ❌ 401 账号未登录 on every `model-file/*` endpoint |
 | Makeronline (Anycubic) | 30 | `POST makeronline.com/api/search/model` | ❌ `files[].url` is 403 (private S3) |
-| **Printables (Prusa)** | 36 | HTML scrape via JSON-LD | ✅ **public, no auth** |
+| **Printables (Prusa)** | 30 | `searchPrints2` GraphQL query | ✅ **public, no auth** |
 
 Disabled: Thingiverse (`/download:ID` → 403 robots), GrabCAD (API retired).
 

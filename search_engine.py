@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search and download 3D models from MakerWorld, Nexprint, Makeronline, and Printables directly within OrcaSlicer. License metadata is always displayed before download."
 # author = "Tommaso Bianchi"
-# version = "0.1.0"
+# version = "0.1.1"
 # ///
 
 try:
@@ -305,7 +305,17 @@ class NexprintSearcher:
 
 
 class PrintablesSearcher:
-    SEARCH_URL = "https://www.printables.com/search/models"
+    # printables.com/search/models is behind a Cloudflare JS challenge — it answers
+    # 403 "Just a moment..." to any client that cannot run the challenge script, no
+    # matter the User-Agent. So ask the API the same thing the site's own frontend
+    # asks: searchPrints2, which needs no authentication. LicenseType carries only
+    # a name, no url, which the mapping below already tolerates.
+    SEARCH_QUERY = (
+        "query Search($query: String!, $limit: Int) {"
+        " searchPrints2(query: $query, limit: $limit) {"
+        " items { id name slug image { filePath } license { name }"
+        " user { publicUsername } } } }"
+    )
 
     @staticmethod
     def enabled(tokens):
@@ -313,35 +323,20 @@ class PrintablesSearcher:
 
     @staticmethod
     def search(query, tokens):
-        import requests, re
+        import requests
 
-        r = requests.get(
-            PrintablesSearcher.SEARCH_URL,
-            params={"q": query},
-            headers={"User-Agent": "OrcaSlicer/2.0"},
+        r = requests.post(
+            PrintablesSearcher.GRAPHQL_URL,
+            json={"query": PrintablesSearcher.SEARCH_QUERY,
+                  "variables": {"query": query, "limit": 30}},
+            headers={"Content-Type": "application/json", "User-Agent": _BROWSER_UA},
             timeout=30,
         )
         r.raise_for_status()
-        html = r.text
-        scripts = re.findall(
-            r'<script[^>]*type="application/(?:ld\+)?json"[^>]*>(.*?)</script>',
-            html,
-            re.DOTALL,
-        )
-        items = []
-        for s in scripts:
-            if not isinstance(s, str):
-                continue
-            try:
-                d = json.loads(s)
-                body = json.loads(d["body"])
-                result = body.get("data", {}).get("result", {})
-                candidate = result.get("items", [])
-            except Exception:
-                continue
-            if candidate and len(candidate) > 5:
-                items = candidate
-                break
+        payload = r.json()
+        if payload.get("errors"):
+            raise RuntimeError(payload["errors"][0].get("message", "GraphQL error"))
+        items = ((payload.get("data") or {}).get("searchPrints2") or {}).get("items") or []
         results = []
         for item in items:
             img = item.get("image") or {}

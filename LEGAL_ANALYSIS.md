@@ -134,6 +134,43 @@ That means, explicitly:
   as the platform publishes it; where a platform reports it wrongly or not at all, the
   authoritative source is the model's own page, which every result links to.
 
+## Disclaimer of Liability for Copyright Infringement
+
+**The authors and contributors of this plugin disclaim all responsibility and all
+liability for any download or use of a copyright-protected design carried out against the
+rights holder's terms.**
+
+The plugin performs a keyword search against public endpoints and returns what those
+platforms publish. It does not host, mirror, cache, re-host or redistribute any model
+file; it does not review, moderate or verify what a platform lists; and it cannot
+determine whether a given listing was uploaded with the rights holder's permission. A
+design may be listed on a platform in breach of someone's copyright without the plugin
+having any means of knowing it.
+
+Accordingly:
+
+- **Selecting and downloading a model is the user's decision and the user's act.** If that
+  design is protected by copyright and the download or subsequent use — printing, sharing,
+  modifying, selling — exceeds what the rights holder permits, the resulting liability is
+  the user's alone.
+- **No liability is accepted by the authors or contributors** for infringement, for any
+  claim brought by a rights holder, or for any direct, indirect, incidental or
+  consequential damages arising from a user's download or use of any model. This is
+  consistent with the MIT licence's exclusion of warranty and of liability, which governs
+  this software.
+- **Licence metadata is informational, not a guarantee of title.** It is reproduced as the
+  platform publishes it. It reflects what the *uploader* declared, which is not proof that
+  the uploader held the rights to declare it. Where the metadata is absent, wrong, or
+  disputed, the model's own page — linked from every result — is authoritative, and the
+  rights holder is the only definitive source.
+- **Rights holders**: this project stores and serves no model content, so there is nothing
+  here to take down. Requests concerning a specific model must be directed to the platform
+  hosting it — MakerWorld, Nexprint, Makeronline or Printables — which is the party in a
+  position to act. If a search adapter is nonetheless implicated, open an issue on the
+  repository.
+
+Nothing in this document is legal advice.
+
 ## Implemented Safeguards
 
 1. **License display** — every result shows the license name, its plain-English summary,

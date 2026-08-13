@@ -633,7 +633,10 @@ PAGE = r"""<!DOCTYPE html>
   <p id="det-summary"></p>
   <p class="responsibility">You download this model under your own account and on your own
     responsibility. Complying with its licence and with the platform's terms of use is
-    yours, not this plugin's — it neither hosts nor redistributes any file.</p>
+    yours, not this plugin's — it neither hosts nor redistributes any file.
+    If a design is protected by copyright, downloading or using it against the rights
+    holder's terms is your act alone, and the authors of this plugin accept no liability
+    for it.</p>
   <button id="det-import-btn" onclick="doImport()">Import into OrcaSlicer</button>
   <button id="det-dl-btn" class="secondary" onclick="doDownload()">Open in browser</button>
 </div>

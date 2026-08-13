@@ -118,6 +118,31 @@ Licence metadata is reproduced as each platform publishes it. Where a platform r
 wrongly or not at all, the model's own page is the authoritative source, and every result
 links to it. As stated in the MIT licence below, the plugin comes with no warranty.
 
+### Copyright — no liability accepted
+
+**The authors and contributors of this plugin disclaim all responsibility and all
+liability for any download or use of a copyright-protected design carried out against the
+rights holder's terms.**
+
+The plugin searches public endpoints and shows what those platforms publish. It does not
+host, mirror or redistribute a single file, it does not moderate what a platform lists,
+and it has no way to tell whether a listing was uploaded with the rights holder's
+permission — a design can be published on a platform in breach of someone's copyright
+without that being visible from the outside.
+
+So choosing and downloading a model is your decision and your act. If the design is
+protected and your download, print, modification, sharing or sale exceeds what the rights
+holder permits, that liability is yours alone; the authors accept none of it, and none for
+any claim a rights holder may bring. Licence metadata is informational — it reflects what
+the *uploader* declared, which is not proof the uploader held the rights to declare it.
+
+**Rights holders:** this project stores and serves no model content, so there is nothing
+here to take down. Requests about a specific model go to the platform hosting it, which is
+the only party able to act on them. If a search adapter is nonetheless implicated, please
+open an issue.
+
+Full reasoning in [`LEGAL_ANALYSIS.md`](LEGAL_ANALYSIS.md). None of it is legal advice.
+
 ## Development
 
 `SEARCH_ENGINE_AUTORUN=1` makes the plugin open its own window, search and click the first

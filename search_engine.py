@@ -953,8 +953,15 @@ if orca is not None:
                 self._post({"action": "error", "message": "Refusing to open non-http URL."})
                 return
             try:
-                subprocess.Popen(["xdg-open", url],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Each desktop has its own opener; xdg-open is Linux-only.
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", url],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif os.name == "nt":
+                    os.startfile(url)  # noqa: S606 — Windows-only, absent elsewhere
+                else:
+                    subprocess.Popen(["xdg-open", url],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self._post({"action": "opened", "url": url})
             except Exception as e:
                 self._post({"action": "error", "message": f"Could not open browser: {e}"})

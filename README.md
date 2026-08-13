@@ -100,6 +100,24 @@ Every adapter calls a public endpoint that the platform's own web frontend calls
 authentication bypass and no credential extraction. The reasoning, per platform, is in
 [`LEGAL_ANALYSIS.md`](LEGAL_ANALYSIS.md).
 
+### Every download is yours, and your responsibility
+
+This plugin searches. It holds no account anywhere, authenticates on nobody's behalf, and
+grants no right to any model. Where a platform puts its files behind a login — MakerWorld,
+Nexprint and Makeronline all do — **you** sign in with your own credentials, and the
+download happens under the terms that platform extends to **you**.
+
+So the licence and the platform's terms of use bind you, not this plugin. The plugin shows
+you the licence before the download button is reachable; honouring it — attribution,
+non-commercial limits, no-derivatives, share-alike — is yours to do. Any token you enter is
+used only to call that platform: never stored elsewhere, never transmitted anywhere else,
+never collected. Nothing is cached, re-hosted or redistributed, and no data of any kind is
+gathered about you.
+
+Licence metadata is reproduced as each platform publishes it. Where a platform reports it
+wrongly or not at all, the model's own page is the authoritative source, and every result
+links to it. As stated in the MIT licence below, the plugin comes with no warranty.
+
 ## Development
 
 `SEARCH_ENGINE_AUTORUN=1` makes the plugin open its own window, search and click the first

@@ -11,8 +11,11 @@ Core safeguards implemented:
 1. License metadata displayed BEFORE download (non-negotiable)
 2. Public endpoints only — no auth bypass, no credential extraction
 3. No caching, redistribution, or re-hosting of model files
-4. First-run disclaimer requiring user acknowledgment
+4. Responsibility notice shown with the license on every model
 5. No data collection or telemetry
+
+Downloading is the user's own act, under the user's own platform account. See
+[User Responsibility](#user-responsibility).
 
 ---
 
@@ -105,14 +108,46 @@ even when the website owner objects. All our endpoints are reachable without aut
 
 ---
 
+## User Responsibility
+
+**Every download is the user's own act, and the user's own responsibility.**
+
+The plugin is a search tool. It does not hold an account on any of these platforms, does
+not authenticate on the user's behalf, and does not obtain any right to any model. Where a
+platform gates its files behind a login — MakerWorld, Nexprint and Makeronline all do —
+the user signs in with their own credentials, under their own account, and the download
+happens under the terms that platform extends to *them*. The plugin is not a party to it.
+
+That means, explicitly:
+
+- **The licence binds the user, not the plugin.** Attribution, non-commercial limits,
+  no-derivatives clauses and share-alike obligations attach to whoever downloads and uses
+  the file. The plugin displays the licence so the user can honour it; it cannot honour it
+  for them.
+- **The platform's terms of use bind the user.** Signing in creates an agreement between
+  the user and the platform. Any account-level consequence of what is done with a
+  downloaded file — including suspension — falls on the account holder.
+- **Credentials stay with the user.** Any token entered is used only to call that platform
+  and is never transmitted anywhere else, collected, or shared.
+- **The plugin supplies no warranty and no indemnity.** It is MIT-licensed and, per that
+  licence, provided "as is" without warranty of any kind. Licence metadata is reproduced
+  as the platform publishes it; where a platform reports it wrongly or not at all, the
+  authoritative source is the model's own page, which every result links to.
+
 ## Implemented Safeguards
 
-1. **First-run disclaimer** — modal dialog explaining license responsibilities
-2. **License display** — every search result shows license name, summary, and link
-3. **License acknowledgment** — download button disabled until user views license
+1. **License display** — every result shows the license name, its plain-English summary,
+   and a link to the full terms
+2. **License shown before download** — the detail panel is the only route to the import and
+   download buttons, so the license and the responsibility notice below it are on screen
+   before either can be pressed
+3. **Responsibility notice** — stated in the detail panel, next to the license, on every
+   model
 4. **No caching** — downloads go to the plugin's local directory only
 5. **No redistribution** — files are never uploaded or shared
-6. **Rate limiting** — reasonable request intervals (30s timeout, sequential queries)
+6. **No credential handling** — the plugin never stores, transmits or proxies a user's
+   platform login
+7. **Rate limiting** — reasonable request intervals (30s timeout, sequential queries)
 
 ---
 

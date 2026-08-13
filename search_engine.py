@@ -606,6 +606,10 @@ PAGE = r"""<!DOCTYPE html>
   .detail-panel button.secondary { background:transparent; border:1px solid var(--orca-border,#444);
     color:var(--orca-fg,#eee); margin-left:8px; }
   #status { margin-top:10px; color:var(--orca-muted,#888); font-size:0.8em; }
+  /* Always visible next to the licence: the detail panel is the only route to a download,
+     so this is the notice every user passes through. */
+  .responsibility { margin:10px 0 0; padding:8px 10px; border-left:3px solid var(--orca-border,#444);
+    color:var(--orca-muted,#888); font-size:0.8em; line-height:1.45; }
 </style>
 <h1>&#128269; 3D Model Search</h1>
 <div class="search-row">
@@ -627,6 +631,9 @@ PAGE = r"""<!DOCTYPE html>
   <p id="det-url"></p>
   <p id="det-license"></p>
   <p id="det-summary"></p>
+  <p class="responsibility">You download this model under your own account and on your own
+    responsibility. Complying with its licence and with the platform's terms of use is
+    yours, not this plugin's — it neither hosts nor redistributes any file.</p>
   <button id="det-import-btn" onclick="doImport()">Import into OrcaSlicer</button>
   <button id="det-dl-btn" class="secondary" onclick="doDownload()">Open in browser</button>
 </div>

@@ -1,0 +1,119 @@
+# 3D Model Search Engine for OrcaSlicer
+
+Search MakerWorld, Nexprint, Makeronline and Printables from inside OrcaSlicer, and
+load a model straight onto the plate.
+
+A Python plugin for OrcaSlicer's plugin system. The licence of every result is shown
+before anything is downloaded.
+
+## Status
+
+**v0.1.0 — early.** Search works on all four platforms. **Import works on Printables
+only** — see the table below; that is not a missing feature, it is where the files are
+reachable without a login.
+
+| Platform | Search | Import | Why |
+|---|---|---|---|
+| **Printables** (Prusa) | yes | **yes** | files are public |
+| MakerWorld (Bambu Lab) | yes | no | `Please log in to download models` |
+| Nexprint (Elegoo) | yes | no | 401 on every file endpoint |
+| Makeronline (Anycubic) | yes | no | file URLs are a private S3 bucket, 403 |
+
+Thingiverse and GrabCAD are disabled: Thingiverse's developer portal was removed in the
+2025 site migration so new app tokens cannot be obtained, and GrabCAD's public API is
+retired.
+
+## Using it
+
+1. **Search** by keyword. Results come from all four platforms at once.
+2. **Click a result** — the detail panel shows the licence, its plain-English summary,
+   and a link to the full terms.
+3. **Import** — the model is downloaded and dropped onto the plate; Orca switches to
+   Prepare on its own. Or **Open in browser** to go to the model's page.
+
+The download button stays disabled until the licence has been shown. A first-run
+disclaimer explains that complying with each model's licence is the user's
+responsibility. Nothing is cached, re-hosted or redistributed, and the plugin collects
+no data of any kind.
+
+## Install
+
+Copy the plugin into your OrcaSlicer data directory:
+
+```
+<datadir>/orca_plugins/search_engine/search_engine.py
+```
+
+`<datadir>` is `~/.config/OrcaSlicer` on Linux, `%APPDATA%\OrcaSlicer` on Windows,
+`~/Library/Application Support/OrcaSlicer` on macOS.
+
+A side-loaded folder is **not** picked up on its own — Orca also wants an install record
+beside the `.py`, which the Plugins dialog writes when you install from there. Creating
+it by hand works just as well:
+
+`<datadir>/orca_plugins/search_engine/.install_state.json`
+
+```json
+{
+  "capabilities": [{ "3D Model Search Engine": true }],
+  "enabled": true,
+  "installed_from": "local",
+  "installed_version": "0.1.0",
+  "plugin_name": "3D Model Search Engine"
+}
+```
+
+Restart Orca, then open it from **Plugins** (side panel on the Home page, or the Tools
+menu). The name, description and version shown there come from the PEP 723 header at the
+top of `search_engine.py`.
+
+## How the import works
+
+The plugin host API is **read-only** — `orca.host.model`, `mesh`, `presets` and `slicing`
+all inspect, none of them add an object. So the plugin sends the model the same way a
+second launch of Orca would: over the session bus, to the `AnotherInstance` method the
+running instance already listens on (`slic3r/GUI/InstanceCheck.cpp`).
+
+```
+name/interface  com.orcaslicer.OrcaSlicer.InstanceCheck.Object<instance_hash>
+object          /com/orcaslicer/OrcaSlicer/InstanceCheck/Object<instance_hash>
+method          AnotherInstance(string)
+```
+
+The string is an argv list in `unescape_strings_cstyle` format — **semicolon-separated
+and quoted** (`"orca-slicer";"/path/file.stl"`), not space-separated, and `argv[0]` is
+skipped as the executable path. Paths there reach `EVT_LOAD_MODEL_OTHER_INSTANCE`, which
+is the plater. The instance hash is discovered from the bus's `ListNames`, so there is
+nothing to configure.
+
+Printables' own file URL is not exposed in its GraphQL schema, but `stls { name
+filePreviewPath }` is, and the preview image sits in the same folder as the STL:
+
+```
+media/prints/3161/stls/123914_<uuid>/3dbenchy_preview.png
+→ https://files.printables.com/media/prints/3161/stls/123914_<uuid>/3dbenchy.stl
+```
+
+## Legal
+
+Every adapter calls a public endpoint that the platform's own web frontend calls, with no
+authentication bypass and no credential extraction. The reasoning, per platform, is in
+[`LEGAL_ANALYSIS.md`](LEGAL_ANALYSIS.md).
+
+## Development
+
+`SEARCH_ENGINE_AUTORUN=1` makes the plugin open its own window, search and click the first
+importable result, so the whole path runs without a mouse.
+
+The webview has no error channel of its own, which made every early diagnosis a guess.
+It now pipes `window.onerror` and `jlog()` through `orca.postMessage` into Python's
+`sys.stderr`, which the host tees to `<datadir>/log/python_*.log`. Read that file first.
+
+`scratchpad/wkprobe.py` reproduces the plugin's webview outside Orca — same WebKit, same
+launcher environment, same `load_html` with a `file://` base URI, on Xvfb. It is much the
+faster loop; use it before touching the real app.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). OrcaSlicer is AGPL-3.0; a Python plugin loaded at runtime
+across the `orca` API boundary is a separate work.

@@ -321,7 +321,7 @@ The regression suite covers authentication, redirect credential isolation, DNS/p
 Typical checks:
 
 ```bash
-python -m py_compile src/search_engine.py scripts/*.py tests/*.py
+python -c "import pathlib, py_compile; [py_compile.compile(str(path), doraise=True) for directory in ('src', 'scripts', 'tests') for path in pathlib.Path(directory).glob('*.py')]"
 python -m unittest discover -s tests -t . -v
 pyright --project pyrightconfig.json
 ruff check .

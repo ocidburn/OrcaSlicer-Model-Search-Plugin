@@ -197,10 +197,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn('onclick="setAllPortals(false)"', mod.PAGE)
         self.assertIn("if(!ps.length){$('status').textContent='Select at least one search portal.';return}", mod.PAGE)
 
-    def test_version_is_033(self):
+    def test_version_is_034(self):
         with open(os.path.join(HERE, "search_engine.py"), encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.3.3"', head)
+        self.assertIn('# version = "0.3.4"', head)
 
 
 if __name__ == "__main__":

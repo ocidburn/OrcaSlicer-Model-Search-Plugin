@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search and import 3D models from MakerWorld, Printables, Thingiverse, Cults3D, MyMiniFactory, Thangs, Makeronline, Creality Cloud, Nexprint, and GrabCAD."
 # author = "Tommaso Bianchi"
-# version = "0.3.3"
+# version = "0.3.4"
 # ///
 
 try:
@@ -1500,13 +1500,126 @@ def _current_orca_executable():
     return candidate if candidate and os.path.isfile(candidate) else ""
 
 
+def _escape_strings_cstyle(values):
+    """Serialize argv using OrcaSlicer's escape_strings_cstyle format."""
+    escaped = []
+    for value in values:
+        value = os.fspath(value)
+        needs_quotes = (len(values) == 1 and not value) or any(
+            ch in value for ch in (" ", "\t", ";", "\\", '"', "\r", "\n")
+        )
+        if not needs_quotes:
+            escaped.append(value)
+            continue
+        out = []
+        for ch in value:
+            if ch in ("\\", '"'):
+                out.append("\\" + ch)
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\n":
+                out.append("\\n")
+            else:
+                out.append(ch)
+        escaped.append('"' + "".join(out) + '"')
+    return ";".join(escaped)
+
+
+def _send_windows_instance_message(executable, paths):
+    """Send model paths directly to the current OrcaSlicer main window on Windows."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        win_dll = getattr(ctypes, "WinDLL", None)
+        winfunctype = getattr(ctypes, "WINFUNCTYPE", None)
+        get_last_error = getattr(ctypes, "get_last_error", lambda: 0)
+        if win_dll is None or winfunctype is None:
+            return False, "Windows ctypes API is unavailable"
+        user32 = win_dll("user32", use_last_error=True)
+        current_pid = os.getpid()
+        candidates = []
+
+        get_window_pid = user32.GetWindowThreadProcessId
+        get_window_pid.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        get_window_pid.restype = wintypes.DWORD
+        get_class_name = user32.GetClassNameW
+        get_class_name.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        get_class_name.restype = ctypes.c_int
+        get_prop = user32.GetPropW
+        get_prop.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+        get_prop.restype = wintypes.HANDLE
+        get_window_text = user32.GetWindowTextW
+        get_window_text.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        get_window_text.restype = ctypes.c_int
+
+        enum_proc_type = winfunctype(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @enum_proc_type
+        def enum_proc(hwnd, _lparam):
+            pid = wintypes.DWORD(0)
+            get_window_pid(hwnd, ctypes.byref(pid))
+            if pid.value != current_pid:
+                return True
+            class_buf = ctypes.create_unicode_buffer(256)
+            if not get_class_name(hwnd, class_buf, len(class_buf)) or class_buf.value != "wxWindowNR":
+                return True
+            minor = get_prop(hwnd, "Instance_Hash_Minor")
+            major = get_prop(hwnd, "Instance_Hash_Major")
+            title_buf = ctypes.create_unicode_buffer(512)
+            get_window_text(hwnd, title_buf, len(title_buf))
+            score = 0
+            if minor or major:
+                score += 100
+            if "orcaslicer" in title_buf.value.lower():
+                score += 10
+            candidates.append((score, int(hwnd)))
+            return True
+
+        enum_windows = user32.EnumWindows
+        enum_windows.argtypes = [enum_proc_type, wintypes.LPARAM]
+        enum_windows.restype = wintypes.BOOL
+        last_error = int(get_last_error())
+        if not enum_windows(enum_proc, 0) and last_error:
+            return False, f"could not enumerate OrcaSlicer windows (Win32 error {last_error})"
+        if not candidates:
+            return False, "could not find the current OrcaSlicer main window"
+        candidates.sort(reverse=True)
+        hwnd = wintypes.HWND(candidates[0][1])
+
+        payload = _escape_strings_cstyle([executable, *paths])
+        payload_buf = ctypes.create_unicode_buffer(payload)
+
+        class COPYDATASTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("dwData", ctypes.c_size_t),
+                ("cbData", wintypes.DWORD),
+                ("lpData", wintypes.LPVOID),
+            ]
+
+        data = COPYDATASTRUCT(
+            1,
+            ctypes.sizeof(payload_buf),
+            ctypes.cast(payload_buf, wintypes.LPVOID),
+        )
+        WM_COPYDATA = 0x004A
+        send_message = user32.SendMessageW
+        send_message.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        send_message.restype = ctypes.c_ssize_t
+        send_message(hwnd, WM_COPYDATA, 0, ctypes.addressof(data))
+        return True, ""
+    except Exception as exc:
+        return False, f"Windows OrcaSlicer import handoff failed: {exc}"
+
+
 def _load_in_orca(paths):
     """Import local files into the already-open OrcaSlicer project.
 
-    The public Python host API is read-only, so use OrcaSlicer's own
-    cross-platform single-instance handoff. Orca's C++ receiver posts
-    EVT_LOAD_MODEL_OTHER_INSTANCE and calls Plater::load_files on the running
-    plater, which adds the supplied models to the current project.
+    On Windows, send OrcaSlicer's native WM_COPYDATA single-instance message
+    directly to the current main window. This avoids depending on CLI options
+    that differ between OrcaSlicer releases. On macOS/Linux, start OrcaSlicer
+    with only the file paths and let its configured single-instance handler
+    forward them to the running plater.
     """
     normalized = []
     for path in paths:
@@ -1520,9 +1633,13 @@ def _load_in_orca(paths):
     executable = _current_orca_executable()
     if not executable:
         return False, "could not determine the running OrcaSlicer executable"
+
+    if os.name == "nt":
+        return _send_windows_instance_message(executable, normalized)
+
     try:
         proc = subprocess.run(
-            [executable, "--single-instance", *normalized],
+            [executable, *normalized],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -1716,6 +1833,7 @@ function renderResults(models){window._results=models||[];var html='';window._re
 $('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)showDetail(m,true)});
 function showDetail(m,open){selectedModel=m;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span>';$('det-summary').textContent=m.license_summary||'No license information available.';$('det-url').innerHTML=m.url?'<strong>Model page:</strong> <a href="'+esc(m.url)+'">'+esc(m.url)+'</a>':'';var b=$('det-import-btn');b.disabled=false;b.textContent=(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
 function closeDetail(){$('detail').classList.remove('active')}
+document.addEventListener('pointerdown',function(e){var d=$('detail');if(!d||!d.classList.contains('active'))return;if(d.contains(e.target))return;closeDetail()},true);
 $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;e.preventDefault();openExternal(a.getAttribute('href'))});
 function licenseClass(l){if(/CC|Creative Commons|CC0|Public Domain/i.test(l||''))return'license-cc';if(/All Rights Reserved|Standard Digital|Exclusive/i.test(l||''))return'license-arr';return''}
 function openExternal(url){orca.postMessage({action:'open_external',url:url})}

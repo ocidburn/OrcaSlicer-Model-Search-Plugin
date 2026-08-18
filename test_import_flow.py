@@ -58,18 +58,38 @@ def load_module():
 
 
 class ImportHandoffTests(unittest.TestCase):
-    def test_load_in_orca_uses_cross_platform_single_instance_handoff(self):
+    def test_non_windows_handoff_does_not_use_invalid_single_instance_cli_flag(self):
         mod = load_module()
         with tempfile.NamedTemporaryFile(suffix=".stl") as fh:
             completed = types.SimpleNamespace(returncode=0, stderr="")
             with mock.patch.object(mod, "_current_orca_executable", return_value="/opt/OrcaSlicer"), \
+                 mock.patch.object(mod.os, "name", "posix"), \
                  mock.patch.object(mod.subprocess, "run", return_value=completed) as run:
                 ok, detail = mod._load_in_orca([fh.name])
         self.assertTrue(ok)
         self.assertEqual(detail, "")
         argv = run.call_args.args[0]
-        self.assertEqual(argv[0:2], ["/opt/OrcaSlicer", "--single-instance"])
-        self.assertEqual(argv[2], os.path.abspath(fh.name))
+        self.assertEqual(argv[0], "/opt/OrcaSlicer")
+        self.assertNotIn("--single-instance", argv)
+        self.assertEqual(argv[1], os.path.abspath(fh.name))
+
+    def test_windows_handoff_uses_native_ipc_without_spawning_orca(self):
+        mod = load_module()
+        with tempfile.NamedTemporaryFile(suffix=".stl") as fh:
+            with mock.patch.object(mod, "_current_orca_executable", return_value=r"C:\Program Files\OrcaSlicer\OrcaSlicer.exe"), \
+                 mock.patch.object(mod.os, "name", "nt"), \
+                 mock.patch.object(mod, "_send_windows_instance_message", return_value=(True, "")) as send, \
+                 mock.patch.object(mod.subprocess, "run") as run:
+                ok, detail = mod._load_in_orca([fh.name])
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        send.assert_called_once()
+        run.assert_not_called()
+
+    def test_escape_strings_cstyle_matches_orca_argv_format(self):
+        mod = load_module()
+        payload = mod._escape_strings_cstyle([r"C:\Program Files\OrcaSlicer.exe", r"C:\Models\part one.stl"])
+        self.assertEqual(payload, r'"C:\\Program Files\\OrcaSlicer.exe";"C:\\Models\\part one.stl"')
 
     def test_load_in_orca_rejects_missing_file(self):
         mod = load_module()
@@ -134,6 +154,11 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertIn("import_selected", mod.PAGE)
         self.assertIn("Select all", mod.PAGE)
         self.assertIn("Select none", mod.PAGE)
+
+    def test_detail_import_panel_closes_on_click_outside(self):
+        mod = load_module()
+        self.assertIn("document.addEventListener('pointerdown'", mod.PAGE)
+        self.assertIn("if(d.contains(e.target))return;closeDetail()", mod.PAGE)
 
 
 if __name__ == "__main__":

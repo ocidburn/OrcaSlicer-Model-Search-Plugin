@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.3.3**
+**Current plugin version: v0.3.4**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -38,6 +38,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 - Downloaded models are handed to the already-running OrcaSlicer instance and added to the current project.
 - Re-running `Search 3D Models` reuses the existing search window instead of opening duplicates.
 - The search field receives focus when the action is invoked again.
+- The model detail/import panel closes when you click elsewhere in the search window.
 
 ## Supported portals
 
@@ -172,13 +173,13 @@ A regression test checks that the UI checkbox set exactly matches `_SEARCHERS`, 
 
 The public Python host API is primarily read-only for model mutation, so the plugin does not try to edit the plater through an undocumented Python object.
 
-After downloading, it uses OrcaSlicer's own cross-platform single-instance handoff:
+After downloading, the plugin hands the local files to OrcaSlicer's normal model-loading path.
 
-```text
-OrcaSlicer --single-instance <downloaded-file-1> <downloaded-file-2> ...
-```
+On **Windows**, v0.3.4 sends OrcaSlicer's native `WM_COPYDATA` single-instance message directly to the current OrcaSlicer main window. It does **not** launch a second OrcaSlicer process and does not depend on the `--single-instance` command-line option.
 
-The already-running OrcaSlicer instance receives those paths and passes them to its normal model-loading path. This is used on Windows, macOS and Linux so the downloaded geometry is added to the **currently open project**.
+On **macOS/Linux**, the plugin starts the OrcaSlicer executable with only the downloaded file paths; OrcaSlicer's configured single-instance handling forwards them to the already-running plater.
+
+The goal on every platform is the same: add the downloaded geometry to the **currently open project** rather than merely leaving it in the download directory.
 
 ### Single file
 
@@ -277,7 +278,7 @@ Calling the action while its window is already open does not create a second cop
 
 ### Import downloads a file but nothing appears in OrcaSlicer
 
-Check the status line in the search window. The plugin attempts a `--single-instance` handoff to the running OrcaSlicer executable. If Orca rejects the handoff, the downloaded files remain in `<datadir>/model_downloads/` and the plugin reports the failure instead of claiming success.
+Check the status line in the search window. On Windows, v0.3.4 sends the file list directly to the current OrcaSlicer main window through native `WM_COPYDATA` IPC. If the main window cannot be found or the handoff fails, the downloaded files remain in `<datadir>/model_downloads/` and the plugin reports the failure instead of claiming success.
 
 ### A portal asks for login again
 

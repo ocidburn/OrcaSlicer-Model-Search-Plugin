@@ -184,10 +184,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn('id="auth-cults3d"', mod.PAGE)
         self.assertIn('id="auth-grabcad"', mod.PAGE)
 
-    def test_version_is_030(self):
+    def test_version_is_031(self):
         with open(os.path.join(HERE, "search_engine.py"), encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.3.0"', head)
+        self.assertIn('# version = "0.3.1"', head)
 
 
 if __name__ == "__main__":

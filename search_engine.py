@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search and import 3D models from MakerWorld, Printables, Thingiverse, Cults3D, MyMiniFactory, Thangs, Makeronline, Creality Cloud, Nexprint, and GrabCAD."
 # author = "Tommaso Bianchi"
-# version = "0.3.0"
+# version = "0.3.1"
 # ///
 
 try:
@@ -30,7 +30,7 @@ from html.parser import HTMLParser
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.3.0 "
+    "OrcaSlicer-Model-Search-Plugin/0.3.1 "
     "(+https://github.com/tommasobbianchi/OrcaSlicer-Model-Search-Plugin)"
 )
 
@@ -1683,8 +1683,9 @@ function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform})}
 function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('status').textContent='Looking for Anycubic Slicer Next session...'}
-orca.onMessage(function(msg){msg=msg||{};if(msg.action==='results'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[])}else if(msg.action==='auth_status'||msg.action==='auth_changed'){updateAuth(msg.states||{});$('auth-submit').disabled=false;if(msg.action==='auth_changed'){closeAuth();$('status').textContent=msg.message||'Account session updated.';if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}}}else if(msg.action==='auth_challenge'){$('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.'}else if(msg.action==='auth_required'){$('det-import-btn').disabled=false;$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform)}else if(msg.action==='status'){$('status').textContent=msg.message}else if(msg.action==='imported'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Imported '+msg.count+' file(s) into OrcaSlicer.'}else if(msg.action==='downloaded_only'){$('det-import-btn').disabled=false;$('status').textContent='Downloaded '+msg.count+' file(s) to '+msg.dir+'. '+msg.message}else if(msg.action==='browser_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'This model must be downloaded in the browser.';if(msg.url)openExternal(msg.url)}else if(msg.action==='opened'){$('status').textContent='Opened in your browser.'}else if(msg.action==='error'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;if($('det-import-btn'))$('det-import-btn').disabled=false;$('status').textContent='Error: '+msg.message}});
+orca.onMessage(function(msg){msg=msg||{};if(msg.action==='results'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[])}else if(msg.action==='auth_status'||msg.action==='auth_changed'){updateAuth(msg.states||{});$('auth-submit').disabled=false;if(msg.action==='auth_changed'){closeAuth();$('status').textContent=msg.message||'Account session updated.';if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}}}else if(msg.action==='auth_challenge'){$('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.'}else if(msg.action==='auth_required'){$('det-import-btn').disabled=false;$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform)}else if(msg.action==='status'){$('status').textContent=msg.message}else if(msg.action==='imported'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Imported '+msg.count+' file(s) into OrcaSlicer.'}else if(msg.action==='downloaded_only'){$('det-import-btn').disabled=false;$('status').textContent='Downloaded '+msg.count+' file(s) to '+msg.dir+'. '+msg.message}else if(msg.action==='browser_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'This model must be downloaded in the browser.';if(msg.url)openExternal(msg.url)}else if(msg.action==='opened'){$('status').textContent='Opened in your browser.'}else if(msg.action==='activate_search'){var q=$('query');if(q){q.focus();q.select()}}else if(msg.action==='error'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;if($('det-import-btn'))$('det-import-btn').disabled=false;$('status').textContent='Error: '+msg.message}});
 orca.postMessage({action:'auth_status'});
+setTimeout(function(){var q=$('query');if(q)q.focus()},0);
 </script></body></html>"""
 
 
@@ -1699,14 +1700,17 @@ if orca is not None:
             self.auth = AuthManager()
 
         def get_name(self):
-            return "3D Model Search"
+            return "Search 3D Models"
 
         def execute(self):
             if self.win is not None and self.win.is_open():
-                self.win.close()
+                # The public UiWindow API has no focus/raise method. Reuse the
+                # existing window and move keyboard focus back to its search box.
+                self.win.post({"action": "activate_search"})
+                return _orca.ExecutionResult.success()
             self.win = _orca.host.ui.create_window(
                 html=PAGE,
-                title="3D Model Search",
+                title="Search 3D Models",
                 width=980,
                 height=720,
                 on_message=self.on_message,

@@ -1689,8 +1689,9 @@ orca.postMessage({action:'auth_status'});
 
 
 if orca is not None:
+    _orca = orca
 
-    class SearchEngineScript(orca.script.ScriptPluginCapabilityBase):
+    class SearchEngineScript(_orca.script.ScriptPluginCapabilityBase):
         win = None
 
         def __init__(self, *args, **kwargs):
@@ -1703,7 +1704,7 @@ if orca is not None:
         def execute(self):
             if self.win is not None and self.win.is_open():
                 self.win.close()
-            self.win = orca.host.ui.create_window(
+            self.win = _orca.host.ui.create_window(
                 html=PAGE,
                 title="3D Model Search",
                 width=980,
@@ -1711,7 +1712,7 @@ if orca is not None:
                 on_message=self.on_message,
                 on_close=self.on_close,
             )
-            return orca.ExecutionResult.success()
+            return _orca.ExecutionResult.success()
 
         def on_close(self):
             self.win = None
@@ -1906,10 +1907,10 @@ if orca is not None:
             except Exception as exc:
                 self._post({"action": "error", "message": f"Could not open browser: {exc}"})
 
-    @orca.plugin
-    class SearchEnginePlugin(orca.base):
+    @_orca.plugin
+    class SearchEnginePlugin(_orca.base):
         def register_capabilities(self):
-            orca.register_capability(SearchEngineScript)
+            _orca.register_capability(SearchEngineScript)
             if os.environ.get("SEARCH_ENGINE_AUTORUN"):
                 def _autorun():
                     time.sleep(12)

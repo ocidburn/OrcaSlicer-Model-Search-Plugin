@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check -q requests ruff
+          npm install -g pyright
+      - name: Python compile
+        run: python -m py_compile search_engine.py
+      - name: Embedded JavaScript syntax
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          source = open('search_engine.py', encoding='utf-8').read()
+          page = re.search(r'PAGE\s*=\s*r?"""(.*?)"""', source, re.S)
+          assert page, 'PAGE literal not found'
+          script = re.search(r'<script>(.*?)</script>', page.group(1), re.S)
+          assert script, 'embedded script not found'
+          open('embedded-ui.js', 'w', encoding='utf-8').write(script.group(1))
+          PY
+          node --check embedded-ui.js
+      - name: Unit tests
+        run: python -m unittest -v test_authenticated_import.py test_catalog_adapters.py test_import_flow.py test_speed_dial_action.py
+      - name: Pyright
+        run: pyright --project pyrightconfig.json
+      - name: Ruff
+        run: ruff check search_engine.py test_authenticated_import.py test_catalog_adapters.py test_import_flow.py test_speed_dial_action.py --select F,B,SIM,UP,PIE,RUF

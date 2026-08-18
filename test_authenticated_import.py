@@ -22,7 +22,7 @@ class FakeResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError("HTTP %s" % self.status_code)
+            raise RuntimeError(f"HTTP {self.status_code}")
 
 
 class FakeAuth:
@@ -40,7 +40,7 @@ class FakeAuth:
     def request(self, platform, method, url, session=None, **kwargs):
         self.calls.append((platform, method, url, kwargs))
         if not self.responses:
-            raise AssertionError("unexpected request: %s" % url)
+            raise AssertionError(f"unexpected request: {url}")
         return self.responses.pop(0)
 
 
@@ -55,7 +55,7 @@ class AuthStoreTests(unittest.TestCase):
                 "secret": "DO-NOT-SAVE-EITHER",
                 "label": "user@example.com",
             })
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 raw = fh.read()
             self.assertNotIn("DO-NOT-SAVE", raw)
             data = json.loads(raw)
@@ -86,6 +86,50 @@ class AuthStoreTests(unittest.TestCase):
             cdn_headers = auth._request_headers("makerworld", "https://s3.us-west-2.amazonaws.com/bucket/file")
             self.assertEqual(api_headers["Authorization"], "Bearer TOP-SECRET")
             self.assertNotIn("Authorization", cdn_headers)
+
+    def test_cross_host_redirect_drops_makeronline_credentials(self):
+        class RedirectResponse:
+            def __init__(self, status, url, location=None):
+                self.status_code = status
+                self.url = url
+                self.headers = {"Location": location} if location else {}
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class RecordingSession:
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    RedirectResponse(302, "https://www.makeronline.com/download/1", "https://cdn.example.test/model.stl"),
+                    RedirectResponse(200, "https://cdn.example.test/model.stl"),
+                ]
+
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                return self.responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("makeronline", "MAKERONLINE-TOP-SECRET")
+            session = RecordingSession()
+            response = auth.request(
+                "makeronline",
+                "GET",
+                "https://www.makeronline.com/download/1",
+                session=session,
+                allow_redirects=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(session.calls), 2)
+        first_headers = session.calls[0][2]["headers"]
+        second_headers = session.calls[1][2]["headers"]
+        self.assertEqual(first_headers["XX-Token"], "MAKERONLINE-TOP-SECRET")
+        self.assertEqual(first_headers["Authorization"], "Bearer MAKERONLINE-TOP-SECRET")
+        self.assertNotIn("XX-Token", second_headers)
+        self.assertNotIn("Authorization", second_headers)
 
 
 class ResolverTests(unittest.TestCase):
@@ -148,6 +192,7 @@ class ResolverTests(unittest.TestCase):
         class NoneAuth:
             def authenticated(self, platform):
                 return False
+
         for resolver, model in [
             (mod.MakerWorldSearcher.get_files, {"_model_id": 1}),
             (mod.NexprintSearcher.get_files, {"_model_id": 1}),

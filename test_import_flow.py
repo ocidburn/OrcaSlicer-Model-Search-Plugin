@@ -13,10 +13,13 @@ class FakeWindow:
     def __init__(self):
         self.posts = []
         self.open = True
+
     def is_open(self):
         return self.open
+
     def post(self, message):
         self.posts.append(message)
+
     def close(self):
         self.open = False
 
@@ -28,15 +31,19 @@ class FakeUI:
 
 def load_module():
     fake = types.ModuleType("orca")
+
     class ScriptPluginCapabilityBase:
         def __init__(self, *args, **kwargs):
             pass
+
     class Base:
         pass
+
     class ExecutionResult:
         @staticmethod
         def success():
             return "success"
+
     fake.script = types.SimpleNamespace(ScriptPluginCapabilityBase=ScriptPluginCapabilityBase)
     fake.base = Base
     fake.ExecutionResult = ExecutionResult
@@ -75,12 +82,12 @@ class ImportHandoffTests(unittest.TestCase):
 
     def test_windows_handoff_uses_native_ipc_without_spawning_orca(self):
         mod = load_module()
-        with tempfile.NamedTemporaryFile(suffix=".stl") as fh:
-            with mock.patch.object(mod, "_current_orca_executable", return_value=r"C:\Program Files\OrcaSlicer\OrcaSlicer.exe"), \
-                 mock.patch.object(mod.os, "name", "nt"), \
-                 mock.patch.object(mod, "_send_windows_instance_message", return_value=(True, "")) as send, \
-                 mock.patch.object(mod.subprocess, "run") as run:
-                ok, detail = mod._load_in_orca([fh.name])
+        with tempfile.NamedTemporaryFile(suffix=".stl") as fh, \
+             mock.patch.object(mod, "_current_orca_executable", return_value=r"C:\Program Files\OrcaSlicer\OrcaSlicer.exe"), \
+             mock.patch.object(mod.os, "name", "nt"), \
+             mock.patch.object(mod, "_send_windows_instance_message", return_value=(True, "")) as send, \
+             mock.patch.object(mod.subprocess, "run") as run:
+            ok, detail = mod._load_in_orca([fh.name])
         self.assertTrue(ok)
         self.assertEqual(detail, "")
         send.assert_called_once()
@@ -105,6 +112,10 @@ class MultiFileSelectionTests(unittest.TestCase):
         action.win = FakeWindow()
         return mod, action
 
+    @staticmethod
+    def adapter(resolver):
+        return types.SimpleNamespace(get_files=resolver)
+
     def test_multiple_resolved_files_show_checkbox_choices_before_download(self):
         mod, action = self.make_action()
         model = {"platform": "Printables", "name": "Demo", "requires_auth": False}
@@ -112,7 +123,7 @@ class MultiFileSelectionTests(unittest.TestCase):
             {"name": "part-a.stl", "url": "https://cdn.example/a.stl"},
             {"name": "part-b.stl", "url": "https://cdn.example/b.stl"},
         ]
-        with mock.patch.dict(mod._FILE_RESOLVERS, {"Printables": resolver}, clear=False), \
+        with mock.patch.dict(mod._SEARCHERS, {"printables": self.adapter(resolver)}, clear=False), \
              mock.patch.object(action, "_download_and_import") as download:
             action._resolve_import(model)
         download.assert_not_called()
@@ -125,14 +136,15 @@ class MultiFileSelectionTests(unittest.TestCase):
         mod, action = self.make_action()
         model = {"platform": "Printables", "name": "Demo", "requires_auth": False}
         files = [{"name": "only.stl", "url": "https://cdn.example/only.stl"}]
-        with mock.patch.dict(mod._FILE_RESOLVERS, {"Printables": lambda model, auth: files}, clear=False), \
+        resolver = lambda model, auth: files
+        with mock.patch.dict(mod._SEARCHERS, {"printables": self.adapter(resolver)}, clear=False), \
              mock.patch.object(action, "_download_and_import") as download:
             action._resolve_import(model)
         download.assert_called_once()
         self.assertEqual(download.call_args.args[1], files)
 
     def test_only_checked_indices_are_downloaded(self):
-        mod, action = self.make_action()
+        _mod, action = self.make_action()
         model = {"platform": "Printables", "name": "Demo", "requires_auth": False}
         files = [
             {"name": "a.stl", "url": "https://cdn.example/a.stl"},

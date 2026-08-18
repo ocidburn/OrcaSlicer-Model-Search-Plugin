@@ -1,6 +1,6 @@
 import importlib.util
-import io
 import os
+import re
 import tempfile
 import unittest
 import zipfile
@@ -91,16 +91,16 @@ class DownloadResolverTests(unittest.TestCase):
     def test_myminifactory_paid_object_goes_to_browser(self):
         model = {"url": "https://www.myminifactory.com/object/3d-print-paid-123"}
         html = '<h1>$12 Paid</h1><button>Add Files To Cart $12</button>'
-        with mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])):
-            with self.assertRaises(mod.BrowserRequired):
-                mod.MyMiniFactorySearcher.get_files(model)
+        with mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])), \
+             self.assertRaises(mod.BrowserRequired):
+            mod.MyMiniFactorySearcher.get_files(model)
 
     def test_thangs_member_model_goes_to_browser(self):
         model = {"url": "https://thangs.com/designer/A/3d-model/Paid-1"}
         html = '<h1>Paid</h1><div>Become a member to download</div>'
-        with mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])):
-            with self.assertRaises(mod.BrowserRequired):
-                mod.ThangsSearcher.get_files(model)
+        with mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])), \
+             self.assertRaises(mod.BrowserRequired):
+            mod.ThangsSearcher.get_files(model)
 
     def test_thingiverse_prefers_public_zip(self):
         model = {"url": "https://www.thingiverse.com/thing:7379392"}
@@ -137,16 +137,15 @@ class DownloadResolverTests(unittest.TestCase):
         self.assertNotIn("Cookie", cdn)
         self.assertEqual(session.cookies.get("sid", domain=".grabcad.com", path="/"), "secret")
 
-
     def test_cults_stale_session_is_reported_as_auth_error(self):
         model = {"url": "https://cults3d.com/en/3d-model/tool/free-model"}
         html = '<form action="/en/users/sign_in"><a href="/users/sign_in">Sign in</a><span>Forgot your password?</span></form>'
         with tempfile.TemporaryDirectory() as td:
             auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
             auth.save_token("cults3d", "_session=expired")
-            with mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])):
-                with self.assertRaises(mod.AuthRequired):
-                    mod.Cults3DSearcher.get_files(model, auth)
+            with mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])), \
+                 self.assertRaises(mod.AuthRequired):
+                mod.Cults3DSearcher.get_files(model, auth)
 
     def test_grabcad_stale_session_is_reported_as_auth_error(self):
         model = {"url": "https://grabcad.com/library/example-1"}
@@ -154,9 +153,9 @@ class DownloadResolverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
             auth.save_token("grabcad", "sid=expired")
-            with mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])):
-                with self.assertRaises(mod.AuthRequired):
-                    mod.GrabcadSearcher.get_files(model, auth)
+            with mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])), \
+                 self.assertRaises(mod.AuthRequired):
+                mod.GrabcadSearcher.get_files(model, auth)
 
     def test_zip_extraction_only_returns_model_files(self):
         with tempfile.TemporaryDirectory() as td:
@@ -175,8 +174,12 @@ class RegistryAndUiTests(unittest.TestCase):
     def test_all_requested_catalogs_are_registered(self):
         requested = {"thingiverse", "cults3d", "myminifactory", "thangs", "makeronline", "crealitycloud", "nexprint", "grabcad"}
         self.assertTrue(requested.issubset(mod._SEARCHERS))
-        display = {"Thingiverse", "Cults3D", "MyMiniFactory", "Thangs", "Makeronline", "Creality Cloud", "Nexprint", "GrabCAD"}
-        self.assertTrue(display.issubset(mod._FILE_RESOLVERS))
+        for platform in requested:
+            self.assertTrue(callable(getattr(mod._SEARCHERS[platform], "get_files", None)))
+
+    def test_searchers_no_longer_expose_legacy_enabled_hook(self):
+        for adapter in mod._SEARCHERS.values():
+            self.assertFalse(hasattr(adapter, "enabled"))
 
     def test_public_sites_do_not_have_auth_controls(self):
         for platform in ("thingiverse", "myminifactory", "thangs", "crealitycloud"):
@@ -184,9 +187,7 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn('id="auth-cults3d"', mod.PAGE)
         self.assertIn('id="auth-grabcad"', mod.PAGE)
 
-
     def test_every_available_searcher_has_portal_checkbox(self):
-        import re
         portals = set(re.findall(r'class="portal-search"[^>]*data-platform="([^"]+)"', mod.PAGE))
         self.assertEqual(portals, set(mod._SEARCHERS))
 
@@ -197,10 +198,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn('onclick="setAllPortals(false)"', mod.PAGE)
         self.assertIn("if(!ps.length){$('status').textContent='Select at least one search portal.';return}", mod.PAGE)
 
-    def test_version_is_034(self):
+    def test_version_is_040(self):
         with open(os.path.join(HERE, "search_engine.py"), encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.3.4"', head)
+        self.assertIn('# version = "0.4.0"', head)
 
 
 if __name__ == "__main__":

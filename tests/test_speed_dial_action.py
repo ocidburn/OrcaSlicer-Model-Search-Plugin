@@ -1,10 +1,8 @@
-import importlib.util
-import os
 import sys
 import types
 import unittest
 
-HERE = os.path.dirname(__file__)
+from tests._module_loader import load_plugin
 
 
 class FakeWindow:
@@ -62,11 +60,7 @@ def load_with_fake_orca():
     previous = sys.modules.get("orca")
     sys.modules["orca"] = fake
     try:
-        spec = importlib.util.spec_from_file_location(
-            "search_engine_speed_dial", os.path.join(HERE, "search_engine.py")
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_plugin("search_engine_speed_dial")
     finally:
         if previous is None:
             sys.modules.pop("orca", None)

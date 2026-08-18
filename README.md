@@ -8,7 +8,7 @@ The plugin opens a non-modal `Search 3D Models` window, lets you choose which po
 
 ## Quick start
 
-1. Download `search_engine.py` from this repository.
+1. Download [`src/search_engine.py`](src/search_engine.py) from this repository. It remains a standalone deployment file; the `src/` directory only keeps the repository organized.
 2. Install/activate it with OrcaSlicer's **Plugins** dialog. For a manual side-load, place it at:
    - Windows: `%APPDATA%\OrcaSlicer\orca_plugins\search_engine\search_engine.py`
    - Linux: `~/.config/OrcaSlicer/orca_plugins/search_engine/search_engine.py`
@@ -303,26 +303,38 @@ Fully restart OrcaSlicer after replacing `search_engine.py`. Python/plugin error
 
 ## Development and validation
 
-The plugin keeps one deployment file, `search_engine.py`, but platform behavior is no longer spread across parallel dictionaries. Each portal has one `PlatformSpec` entry containing its display name, adapter, authentication hosts, cookie mode/scope, login URL and referer policy. Search, import, authentication status and UI routing all consume that registry.
+The plugin keeps one deployment file, `src/search_engine.py`, but platform behavior is no longer spread across parallel dictionaries. Each portal has one `PlatformSpec` entry containing its display name, adapter, authentication hosts, cookie mode/scope, login URL and referer policy. Search, import, authentication status and UI routing all consume that registry.
+
+Repository layout:
+
+```text
+src/       standalone plugin source
+tests/     unit and regression tests
+scripts/   repeatable validation helpers
+docs/      release history and legal notes
+typings/   OrcaSlicer API type stubs
+.github/   cross-platform CI configuration
+```
 
 The regression suite covers authentication, redirect credential isolation, DNS/private-address rejection, catalog adapters, import flow, multi-file selection, registry/UI consistency and Speed Dial window reuse.
 
 Typical checks:
 
 ```bash
-python -m py_compile search_engine.py
-python -m unittest discover -v
+python -m py_compile src/search_engine.py scripts/*.py tests/*.py
+python -m unittest discover -s tests -t . -v
 pyright --project pyrightconfig.json
 ruff check .
-vulture search_engine.py --min-confidence 80
-radon cc search_engine.py -s -a
-bandit -q -r search_engine.py
+vulture src/search_engine.py --min-confidence 80
+radon cc src/search_engine.py -s -a
+bandit -q -r src/search_engine.py
 ```
 
-The embedded JavaScript can also be extracted from `PAGE` and validated with:
+The embedded JavaScript can also be extracted and validated with:
 
 ```bash
-node --check <extracted-script.js>
+python scripts/check_embedded_js.py > embedded-ui.js
+node --check embedded-ui.js
 ```
 
 The v0.4.0 validation gates are:
@@ -350,11 +362,11 @@ This project does not host, mirror or redistribute model files. Downloads use th
 
 The plugin does not grant rights to any model. You are responsible for complying with the model's license and the portal's terms.
 
-See [`LEGAL_ANALYSIS.md`](LEGAL_ANALYSIS.md) for additional project notes. Nothing in this repository is legal advice.
+See [`docs/LEGAL_ANALYSIS.md`](docs/LEGAL_ANALYSIS.md) for additional project notes. Nothing in this repository is legal advice.
 
 ## Changelog
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the consolidated release history.
+See [`docs/CHANGELOG.md`](docs/CHANGELOG.md) for the consolidated release history.
 
 ## License
 

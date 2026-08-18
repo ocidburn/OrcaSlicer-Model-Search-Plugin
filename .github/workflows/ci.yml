@@ -26,37 +26,28 @@ jobs:
             requests ruff==0.16.3 vulture==2.16 radon==6.0.1 bandit==1.9.4
           npm install -g pyright@1.1.413
       - name: Python compile
-        run: python -m py_compile search_engine.py
+        run: python -m py_compile src/search_engine.py scripts/*.py tests/*.py
       - name: Embedded JavaScript syntax
         shell: bash
         run: |
-          python - <<'PY'
-          import re
-          source = open('search_engine.py', encoding='utf-8').read()
-          page = re.search(r'PAGE\s*=\s*r?"""(.*?)"""', source, re.S)
-          assert page, 'PAGE literal not found'
-          script = re.search(r'<script>(.*?)</script>', page.group(1), re.S)
-          assert script, 'embedded script not found'
-          open('embedded-ui.js', 'w', encoding='utf-8').write(script.group(1))
-          PY
+          python scripts/check_embedded_js.py > embedded-ui.js
           node --check embedded-ui.js
       - name: Unit tests
-        run: python -m unittest -v test_authenticated_import.py test_catalog_adapters.py test_import_flow.py test_speed_dial_action.py
+        run: python -m unittest discover -s tests -t . -v
       - name: Pyright
         run: pyright --project pyrightconfig.json
       - name: Ruff
         run: ruff check .
       - name: Dead code
-        run: vulture search_engine.py --min-confidence 80
+        run: vulture src/search_engine.py --min-confidence 80
       - name: Security audit
-        run: bandit -q -r search_engine.py
+        run: bandit -q -r src/search_engine.py
       - name: Complexity regression
         shell: bash
         run: |
-          report="$(radon cc search_engine.py -n D)"
+          report="$(radon cc src/search_engine.py -n D)"
           test -z "$report" || { printf '%s\n' "$report"; exit 1; }
       - name: Windows IPC smoke
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          python -c "import sys, search_engine as s; ok, detail = s._send_windows_instance_message(sys.executable, []); assert not ok and 'could not find' in detail, (ok, detail); print('Windows IPC smoke OK:', detail)"
+        run: python scripts/windows_ipc_smoke.py

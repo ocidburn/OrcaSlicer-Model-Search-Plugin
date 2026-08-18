@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Organized the repository into `src/`, `tests/`, `scripts/`, `docs/`, and `typings/` while keeping the plugin itself as one downloadable Python file.
+- Centralized test-module loading and reusable JavaScript/Windows IPC validation helpers.
+
 ## 0.4.0
 
 - Replaced five parallel platform maps with one `PlatformSpec` registry covering search, import, authentication hosts, cookie scope, login URL, and referer behavior.

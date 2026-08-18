@@ -1,5 +1,5 @@
 {
-  "include": ["search_engine.py"],
+  "include": ["src/search_engine.py", "scripts"],
   "pythonVersion": "3.12",
   "typeCheckingMode": "basic",
   "stubPath": "typings",

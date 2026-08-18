@@ -1,16 +1,12 @@
-import importlib.util
 import json
 import os
 import tempfile
 import unittest
 from unittest import mock
 
-HERE = os.path.dirname(__file__)
-SPEC = importlib.util.spec_from_file_location(
-    "search_engine", os.path.join(HERE, "search_engine.py")
-)
-mod = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(mod)
+from tests._module_loader import load_plugin
+
+mod = load_plugin("search_engine_authenticated_import")
 
 
 class FakeResponse:

@@ -1,4 +1,11 @@
 __pycache__/
-*.pyc
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.venv/
+.coverage
+htmlcov/
+embedded-ui.js
 test_tokens.json
 downloads/

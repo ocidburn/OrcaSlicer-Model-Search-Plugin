@@ -1,16 +1,12 @@
-import importlib.util
 import os
 import tempfile
 import unittest
 import zipfile
 from unittest import mock
 
-HERE = os.path.dirname(__file__)
-SPEC = importlib.util.spec_from_file_location(
-    "search_engine_catalog", os.path.join(HERE, "search_engine.py")
-)
-mod = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(mod)
+from tests._module_loader import PLUGIN_PATH, load_plugin
+
+mod = load_plugin("search_engine_catalog")
 
 
 class CatalogSearchTests(unittest.TestCase):
@@ -303,7 +299,7 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
     def test_version_is_040(self):
-        with open(os.path.join(HERE, "search_engine.py"), encoding="utf-8") as fh:
+        with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
         self.assertIn('# version = "0.4.0"', head)
 

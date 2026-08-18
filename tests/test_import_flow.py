@@ -1,4 +1,3 @@
-import importlib.util
 import os
 import sys
 import tempfile
@@ -6,7 +5,7 @@ import types
 import unittest
 from unittest import mock
 
-HERE = os.path.dirname(__file__)
+from tests._module_loader import load_plugin
 
 
 class FakeWindow:
@@ -55,11 +54,7 @@ def load_module():
     previous = sys.modules.get("orca")
     sys.modules["orca"] = fake
     try:
-        spec = importlib.util.spec_from_file_location(
-            "search_engine_import_flow", os.path.join(HERE, "search_engine.py")
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_plugin("search_engine_import_flow")
     finally:
         if previous is None:
             sys.modules.pop("orca", None)

@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search and import 3D models from MakerWorld, Printables, Thingiverse, Cults3D, MyMiniFactory, Thangs, Makeronline, Creality Cloud, Nexprint, and GrabCAD."
 # author = "Tommaso Bianchi"
-# version = "0.3.1"
+# version = "0.3.2"
 # ///
 
 try:
@@ -30,7 +30,7 @@ from html.parser import HTMLParser
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.3.1 "
+    "OrcaSlicer-Model-Search-Plugin/0.3.2 "
     "(+https://github.com/tommasobbianchi/OrcaSlicer-Model-Search-Plugin)"
 )
 
@@ -1469,41 +1469,70 @@ _PLATFORM_KEY_BY_DISPLAY = {
 # ---------------------------------------------------------------------------
 
 
-def _load_in_orca(paths):
-    """Hand local files to the running OrcaSlicer plater.
-
-    The current plugin host does not expose a direct mutable plater API. On
-    Linux, reuse Orca's single-instance D-Bus handoff. On other platforms the
-    download remains available in model_downloads and a clear error is shown.
-    """
-    if not sys.platform.startswith("linux"):
-        return False, "automatic plater handoff is currently available only on Linux; files were downloaded successfully"
+def _current_orca_executable():
+    """Return the executable of the OrcaSlicer process hosting this plugin."""
     try:
-        names = subprocess.run(
-            ["dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.DBus",
-             "/org/freedesktop/DBus", "org.freedesktop.DBus.ListNames"],
-            capture_output=True, text=True, timeout=15,
-        ).stdout
-    except Exception as exc:
-        return False, f"dbus-send unavailable: {exc}"
-    found = re.findall(r"com\.orcaslicer\.OrcaSlicer\.InstanceCheck\.Object(\d+)", names)
-    if not found:
-        return False, "no running OrcaSlicer instance found on the session bus"
-    instance = found[0]
-    argv = ["orca-slicer"] + list(paths)
-    payload = ";".join('"%s"' % a.replace("\\", "\\\\").replace('"', '\\"') for a in argv)
-    iface = "com.orcaslicer.OrcaSlicer.InstanceCheck.Object" + instance
+        if os.name == "nt":
+            import ctypes
+            buf = ctypes.create_unicode_buffer(32768)
+            length = ctypes.windll.kernel32.GetModuleFileNameW(None, buf, len(buf))
+            if length:
+                return os.path.realpath(buf.value)
+        elif sys.platform == "darwin":
+            import ctypes
+            libc = ctypes.CDLL(None)
+            size = ctypes.c_uint32(0)
+            libc._NSGetExecutablePath(None, ctypes.byref(size))
+            if size.value:
+                buf = ctypes.create_string_buffer(size.value)
+                if libc._NSGetExecutablePath(buf, ctypes.byref(size)) == 0:
+                    return os.path.realpath(os.fsdecode(buf.value))
+        else:
+            appimage = os.environ.get("APPIMAGE", "")
+            if appimage and os.path.isfile(appimage):
+                return os.path.realpath(appimage)
+            proc_exe = "/proc/self/exe"
+            if os.path.exists(proc_exe):
+                return os.path.realpath(proc_exe)
+    except Exception:
+        pass
+    candidate = os.path.realpath(sys.executable or "")
+    return candidate if candidate and os.path.isfile(candidate) else ""
+
+
+def _load_in_orca(paths):
+    """Import local files into the already-open OrcaSlicer project.
+
+    The public Python host API is read-only, so use OrcaSlicer's own
+    cross-platform single-instance handoff. Orca's C++ receiver posts
+    EVT_LOAD_MODEL_OTHER_INSTANCE and calls Plater::load_files on the running
+    plater, which adds the supplied models to the current project.
+    """
+    normalized = []
+    for path in paths:
+        path = os.path.abspath(os.fspath(path))
+        if not os.path.isfile(path):
+            return False, f"downloaded model file no longer exists: {path}"
+        normalized.append(path)
+    if not normalized:
+        return False, "no model files selected for import"
+
+    executable = _current_orca_executable()
+    if not executable:
+        return False, "could not determine the running OrcaSlicer executable"
     try:
         proc = subprocess.run(
-            ["dbus-send", "--session", "--type=method_call", "--dest=" + iface,
-             "/com/orcaslicer/OrcaSlicer/InstanceCheck/Object" + instance,
-             iface + ".AnotherInstance", "string:" + payload],
-            capture_output=True, text=True, timeout=15,
+            [executable, "--single-instance", *normalized],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
         )
     except Exception as exc:
-        return False, str(exc)
+        return False, f"OrcaSlicer import handoff failed: {exc}"
     if proc.returncode != 0:
-        return False, (proc.stderr or "").strip()[:300]
+        detail = (proc.stderr or "").strip().replace("\n", " ")[:400]
+        return False, detail or f"OrcaSlicer handoff exited with code {proc.returncode}"
     return True, ""
 
 
@@ -1622,7 +1651,7 @@ button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search
 .accounts{display:grid;grid-template-columns:repeat(5,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account strong{display:block;font-size:.86em}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.platforms{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px}.platforms label{font-size:.84em;color:var(--orca-muted,#aaa)}
 #results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
 .panel{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(650px,calc(100% - 32px));max-height:70vh;overflow:auto;z-index:20;padding:14px 34px 14px 14px;border:1px solid var(--orca-border,#444);border-radius:8px;background:var(--orca-bg,#1e1e1e);box-shadow:0 6px 28px rgba(0,0,0,.55);display:none}.panel.active{display:block}.close{position:absolute;right:8px;top:6px;background:none!important;font-size:1.35em;padding:2px 6px}.panel p{font-size:.86em;color:var(--orca-muted,#aaa);margin:6px 0}.panel a{color:var(--orca-accent,#4a9eff)}.responsibility{border-left:3px solid var(--orca-border,#444);padding:8px 10px;margin:10px 0;font-size:.78em;color:var(--orca-muted,#888)}
-.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.file-list{max-height:46vh;overflow:auto;border:1px solid var(--orca-border,#555);border-radius:6px;margin:10px 0}.file-choice{display:flex;align-items:flex-start;gap:9px;padding:9px 10px;border-bottom:1px solid var(--orca-border,#444);cursor:pointer}.file-choice:last-child{border-bottom:0}.file-choice input{margin-top:2px}.file-choice span{overflow-wrap:anywhere}.file-tools{display:flex;gap:7px;margin:8px 0}.file-count{font-size:.8em;color:var(--orca-muted,#999)}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
 @media(max-width:680px){.accounts{grid-template-columns:1fr}}
 </style>
 <h1 style="margin:0;font-size:1.25em">&#128269; 3D Model Search</h1>
@@ -1648,7 +1677,7 @@ button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search
 </div>
 <div id="results"></div>
 <div id="detail" class="panel"><button class="close" onclick="closeDetail()">&times;</button><h2 id="det-name"></h2><p id="det-author"></p><p id="det-platform"></p><p id="det-url"></p><p id="det-license"></p><p id="det-summary"></p><p class="responsibility">Downloads use your own account session and the platform's own file URL. The plugin does not host or redistribute models. You remain responsible for the model license and the platform terms.</p><button id="det-import-btn" onclick="doImport()">Import into OrcaSlicer</button><button class="secondary" onclick="doDownload()">Open in browser</button></div>
-<div id="modal-bg" class="modal-backdrop" onclick="closeAuth()"></div>
+<div id="modal-bg" class="modal-backdrop" onclick="closeTopModal()"></div>
 <div id="auth-modal" class="auth-modal">
   <h2 id="auth-title" style="margin:0 0 5px;font-size:1.05em">Account</h2>
   <div id="auth-note" class="auth-note"></div>
@@ -1658,9 +1687,16 @@ button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search
   <div class="field"><label id="token-label">Session/access token (alternative)</label><input id="auth-token" type="password" autocomplete="off"></div>
   <div class="button-row"><button id="auth-submit" onclick="submitAuth()">Connect</button><button id="official-login" class="secondary" onclick="openOfficialLogin()">Open official login</button><button id="import-anycubic" class="secondary" style="display:none" onclick="importAnycubic()">Import from Anycubic Slicer Next</button><button id="auth-logout" class="danger" onclick="logoutAuth()">Forget session</button><button class="secondary" onclick="closeAuth()">Cancel</button></div>
 </div>
+<div id="file-modal" class="auth-modal">
+  <h2 style="margin:0 0 5px;font-size:1.05em">Choose files to import</h2>
+  <div class="auth-note">This model contains multiple downloadable files. Select the files that should be downloaded and added to the current OrcaSlicer project.</div>
+  <div class="file-tools"><button class="secondary" onclick="setAllFiles(true)">Select all</button><button class="secondary" onclick="setAllFiles(false)">Select none</button><span id="file-count" class="file-count"></span></div>
+  <div id="file-list" class="file-list"></div>
+  <div class="button-row"><button id="file-import" onclick="confirmFileImport()">Import selected</button><button class="secondary" onclick="closeFilePicker()">Cancel</button></div>
+</div>
 <div id="status">Ready.</div>
 <script>
-var selectedModel=null, searching=false, authPlatform=null, authStates={}, pendingImport=null;
+var selectedModel=null, searching=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[];
 var $=function(id){return document.getElementById(id)};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',MyMiniFactory:'myminifactory',Thangs:'thangs','Creality Cloud':'crealitycloud',GrabCAD:'grabcad'}[display]||String(display||'').toLowerCase()}
@@ -1676,14 +1712,21 @@ $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.targe
 function licenseClass(l){if(/CC|Creative Commons|CC0|Public Domain/i.test(l||''))return'license-cc';if(/All Rights Reserved|Standard Digital|Exclusive/i.test(l||''))return'license-arr';return''}
 function openExternal(url){orca.postMessage({action:'open_external',url:url})}
 function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedModel.download_url)}
-function doImport(){if(!selectedModel)return;if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var b=$('det-import-btn');b.disabled=true;b.textContent='Importing...';$('status').textContent='Resolving files...';orca.postMessage({action:'import',model:selectedModel})}
+function doImport(){if(!selectedModel)return;if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
 function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':'Session/access token (alternative)';$('auth-note').textContent=p==='makerworld'?'Use Bambu email/password or paste an existing Bambu Cloud access token. MFA verification codes are supported.':p==='nexprint'?'Sign in on the official Nexprint site, then paste the auth_token session cookie. The plugin never asks for or stores your Nexprint password.':p==='grabcad'?'GrabCAD Community Library downloads require membership. Sign in on the official GrabCAD page, then paste the Cookie request header (or the session cookie string). The plugin never asks for your GrabCAD password.':p==='cults3d'?'Cults3D requires an account even for free downloads. Sign in on the official Cults3D page, then paste the Cookie request header/session cookies. The plugin never asks for your Cults3D password.':'Makeronline no longer uses the legacy direct password endpoint. Sign in with Anycubic Slicer Next and click Import from Anycubic Slicer Next, or paste an existing access token.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
-function closeAuth(){$('auth-modal').classList.remove('active');$('modal-bg').classList.remove('active');$('auth-password').value='';$('auth-token').value=''}
+function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
+function closeAuth(){$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
+function closeFilePicker(){$('file-modal').classList.remove('active');pendingFiles=[];syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
+function closeTopModal(){if($('file-modal').classList.contains('active'))closeFilePicker();else closeAuth()}
+function updateFileCount(){var all=document.querySelectorAll('#file-list input[type=checkbox]');var checked=document.querySelectorAll('#file-list input[type=checkbox]:checked');$('file-count').textContent=checked.length+' / '+all.length+' selected';$('file-import').disabled=checked.length===0}
+function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){html+='<label class="file-choice"><input type="checkbox" checked value="'+Number(f.index)+'" onchange="updateFileCount()"><span>'+esc(f.name||('File '+(Number(f.index)+1)))+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
+function setAllFiles(value){document.querySelectorAll('#file-list input[type=checkbox]').forEach(function(x){x.checked=!!value});updateFileCount()}
+function confirmFileImport(){var selected=[];document.querySelectorAll('#file-list input[type=checkbox]:checked').forEach(function(x){selected.push(parseInt(x.value,10))});if(!selected.length)return;$('file-import').disabled=true;$('status').textContent='Downloading selected files...';$('file-modal').classList.remove('active');syncBackdrop();orca.postMessage({action:'import_selected',indices:selected})}
 function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform})}
 function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('status').textContent='Looking for Anycubic Slicer Next session...'}
-orca.onMessage(function(msg){msg=msg||{};if(msg.action==='results'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[])}else if(msg.action==='auth_status'||msg.action==='auth_changed'){updateAuth(msg.states||{});$('auth-submit').disabled=false;if(msg.action==='auth_changed'){closeAuth();$('status').textContent=msg.message||'Account session updated.';if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}}}else if(msg.action==='auth_challenge'){$('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.'}else if(msg.action==='auth_required'){$('det-import-btn').disabled=false;$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform)}else if(msg.action==='status'){$('status').textContent=msg.message}else if(msg.action==='imported'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Imported '+msg.count+' file(s) into OrcaSlicer.'}else if(msg.action==='downloaded_only'){$('det-import-btn').disabled=false;$('status').textContent='Downloaded '+msg.count+' file(s) to '+msg.dir+'. '+msg.message}else if(msg.action==='browser_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'This model must be downloaded in the browser.';if(msg.url)openExternal(msg.url)}else if(msg.action==='opened'){$('status').textContent='Opened in your browser.'}else if(msg.action==='activate_search'){var q=$('query');if(q){q.focus();q.select()}}else if(msg.action==='error'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;if($('det-import-btn'))$('det-import-btn').disabled=false;$('status').textContent='Error: '+msg.message}});
+orca.onMessage(function(msg){msg=msg||{};if(msg.action==='results'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[])}else if(msg.action==='auth_status'||msg.action==='auth_changed'){updateAuth(msg.states||{});$('auth-submit').disabled=false;if(msg.action==='auth_changed'){closeAuth();$('status').textContent=msg.message||'Account session updated.';if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}}}else if(msg.action==='auth_challenge'){$('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.'}else if(msg.action==='auth_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform)}else if(msg.action==='file_choices'){showFilePicker(msg.files||[]);$('status').textContent='Select one or more files to import.'}else if(msg.action==='status'){$('status').textContent=msg.message}else if(msg.action==='imported'){closeFilePicker();$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Imported '+msg.count+' file(s) into the current OrcaSlicer project.'}else if(msg.action==='downloaded_only'){closeFilePicker();$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Downloaded '+msg.count+' file(s) to '+msg.dir+'. '+msg.message}else if(msg.action==='browser_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'This model must be downloaded in the browser.';if(msg.url)openExternal(msg.url)}else if(msg.action==='opened'){$('status').textContent='Opened in your browser.'}else if(msg.action==='activate_search'){var q=$('query');if(q){q.focus();q.select()}}else if(msg.action==='error'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;if($('det-import-btn')){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer'}if($('file-import'))$('file-import').disabled=false;$('status').textContent='Error: '+msg.message}});
 orca.postMessage({action:'auth_status'});
 setTimeout(function(){var q=$('query');if(q)q.focus()},0);
 </script></body></html>"""
@@ -1698,6 +1741,9 @@ if orca is not None:
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.auth = AuthManager()
+            self._pending_import_lock = threading.RLock()
+            self._pending_import_model = None
+            self._pending_import_files = []
 
         def get_name(self):
             return "Search 3D Models"
@@ -1733,10 +1779,13 @@ if orca is not None:
             action = msg.get("action", "")
             if action == "search":
                 threading.Thread(target=self._do_search, args=(msg,), daemon=True).start()
-            elif action == "import":
+            elif action == "resolve_import":
                 model = msg.get("model") or {}
                 if model:
-                    threading.Thread(target=self._do_import, args=(model,), daemon=True).start()
+                    threading.Thread(target=self._resolve_import, args=(model,), daemon=True).start()
+            elif action == "import_selected":
+                indices = msg.get("indices") or []
+                threading.Thread(target=self._import_selected, args=(indices,), daemon=True).start()
             elif action == "open_external":
                 threading.Thread(target=self._open_external, args=(msg.get("url", ""),), daemon=True).start()
             elif action == "auth_status":
@@ -1828,7 +1877,7 @@ if orca is not None:
             if errors:
                 self._post({"action": "status", "message": " | ".join(errors)})
 
-        def _do_import(self, model):
+        def _resolve_import(self, model):
             platform_name = model.get("platform", "")
             platform_key = _PLATFORM_KEY_BY_DISPLAY.get(platform_name, "")
             resolver = _FILE_RESOLVERS.get(platform_name)
@@ -1860,12 +1909,68 @@ if orca is not None:
                 self._post({"action": "error", "message": "No downloadable files were returned by the platform."})
                 return
 
+            normalized = []
+            for index, item in enumerate(files):
+                if not isinstance(item, dict) or not item.get("url"):
+                    continue
+                normalized.append({
+                    "url": item.get("url", ""),
+                    "name": item.get("name") or f"model_{index + 1}.3mf",
+                })
+            if not normalized:
+                self._post({"action": "error", "message": "The platform returned no valid downloadable file URLs."})
+                return
+
+            if len(normalized) == 1:
+                self._download_and_import(model, normalized)
+                return
+
+            with self._pending_import_lock:
+                self._pending_import_model = dict(model)
+                self._pending_import_files = normalized
+            self._post({
+                "action": "file_choices",
+                "files": [{"index": i, "name": item["name"]} for i, item in enumerate(normalized)],
+            })
+
+        def _import_selected(self, indices):
+            try:
+                selected_indices = []
+                seen = set()
+                for value in indices:
+                    index = int(value)
+                    if index < 0 or index in seen:
+                        continue
+                    seen.add(index)
+                    selected_indices.append(index)
+            except (TypeError, ValueError):
+                self._post({"action": "error", "message": "Invalid file selection."})
+                return
+
+            with self._pending_import_lock:
+                model = self._pending_import_model
+                files = list(self._pending_import_files)
+                self._pending_import_model = None
+                self._pending_import_files = []
+            if not model or not files:
+                self._post({"action": "error", "message": "File selection expired. Press Import again to refresh the file list."})
+                return
+            selected = [files[i] for i in selected_indices if i < len(files)]
+            if not selected:
+                self._post({"action": "error", "message": "Select at least one file to import."})
+                return
+            self._download_and_import(model, selected)
+
+        def _download_and_import(self, model, files):
+            platform_name = model.get("platform", "")
+            platform_key = _PLATFORM_KEY_BY_DISPLAY.get(platform_name, "")
             dest_dir = _download_dir()
             try:
                 _ensure_private_dir(dest_dir)
             except OSError as exc:
                 self._post({"action": "error", "message": f"Cannot create download directory {dest_dir}: {exc}"})
                 return
+
             paths = []
             for index, item in enumerate(files, 1):
                 name = item.get("name") or f"model_{index}.3mf"
@@ -1890,6 +1995,8 @@ if orca is not None:
                 self._post({"action": "downloaded_only", "count": len(paths), "dir": dest_dir,
                             "message": "No directly loadable STL/3MF/CAD file was found in the download."})
                 return
+
+            self._post({"action": "status", "message": f"Adding {len(load_paths)} file(s) to the current OrcaSlicer project..."})
             ok, detail = _load_in_orca(load_paths)
             if ok:
                 self._post({"action": "imported", "count": len(load_paths), "dir": dest_dir})

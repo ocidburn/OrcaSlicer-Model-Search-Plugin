@@ -184,10 +184,23 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn('id="auth-cults3d"', mod.PAGE)
         self.assertIn('id="auth-grabcad"', mod.PAGE)
 
-    def test_version_is_032(self):
+
+    def test_every_available_searcher_has_portal_checkbox(self):
+        import re
+        portals = set(re.findall(r'class="portal-search"[^>]*data-platform="([^"]+)"', mod.PAGE))
+        self.assertEqual(portals, set(mod._SEARCHERS))
+
+    def test_portal_selection_controls_are_present(self):
+        self.assertIn('id="search-portals"', mod.PAGE)
+        self.assertIn('id="source-count"', mod.PAGE)
+        self.assertIn('onclick="setAllPortals(true)"', mod.PAGE)
+        self.assertIn('onclick="setAllPortals(false)"', mod.PAGE)
+        self.assertIn("if(!ps.length){$('status').textContent='Select at least one search portal.';return}", mod.PAGE)
+
+    def test_version_is_033(self):
         with open(os.path.join(HERE, "search_engine.py"), encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.3.2"', head)
+        self.assertIn('# version = "0.3.3"', head)
 
 
 if __name__ == "__main__":

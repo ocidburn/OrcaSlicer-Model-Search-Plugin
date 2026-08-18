@@ -50,7 +50,9 @@ def load_with_fake_orca():
             return "success"
 
     ui = FakeUI()
-    fake.script = types.SimpleNamespace(ScriptPluginCapabilityBase=ScriptPluginCapabilityBase)
+    fake.script = types.SimpleNamespace(
+        ScriptPluginCapabilityBase=ScriptPluginCapabilityBase
+    )
     fake.base = Base
     fake.ExecutionResult = ExecutionResult
     fake.host = types.SimpleNamespace(ui=ui)
@@ -60,7 +62,9 @@ def load_with_fake_orca():
     previous = sys.modules.get("orca")
     sys.modules["orca"] = fake
     try:
-        spec = importlib.util.spec_from_file_location("search_engine_speed_dial", os.path.join(HERE, "search_engine.py"))
+        spec = importlib.util.spec_from_file_location(
+            "search_engine_speed_dial", os.path.join(HERE, "search_engine.py")
+        )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     finally:

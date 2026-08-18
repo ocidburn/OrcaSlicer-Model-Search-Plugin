@@ -22,8 +22,9 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          python -m pip install --disable-pip-version-check -q requests ruff
-          npm install -g pyright
+          python -m pip install --disable-pip-version-check -q \
+            requests ruff==0.16.3 vulture==2.16 radon==6.0.1 bandit==1.9.4
+          npm install -g pyright@1.1.413
       - name: Python compile
         run: python -m py_compile search_engine.py
       - name: Embedded JavaScript syntax
@@ -44,4 +45,18 @@ jobs:
       - name: Pyright
         run: pyright --project pyrightconfig.json
       - name: Ruff
-        run: ruff check search_engine.py test_authenticated_import.py test_catalog_adapters.py test_import_flow.py test_speed_dial_action.py --select F,B,SIM,UP,PIE,RUF
+        run: ruff check .
+      - name: Dead code
+        run: vulture search_engine.py --min-confidence 80
+      - name: Security audit
+        run: bandit -q -r search_engine.py
+      - name: Complexity regression
+        shell: bash
+        run: |
+          report="$(radon cc search_engine.py -n D)"
+          test -z "$report" || { printf '%s\n' "$report"; exit 1; }
+      - name: Windows IPC smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -c "import sys, search_engine as s; ok, detail = s._send_windows_instance_message(sys.executable, []); assert not ok and 'could not find' in detail, (ok, detail); print('Windows IPC smoke OK:', detail)"

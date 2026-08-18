@@ -9,32 +9,35 @@
 # version = "0.4.0"
 # ///
 
-try:
-    import orca
-except ImportError:
-    orca = None
-
 import html
 import ipaddress
 import json
 import os
 import re
-import subprocess
+import socket
+import subprocess  # nosec B404
 import sys
 import threading
 import time
 import urllib.parse
+import webbrowser
 import zipfile
-from contextlib import suppress
-from typing import ClassVar
 from html.parser import HTMLParser
+from typing import ClassVar
+
+try:
+    import orca
+except ImportError:
+    orca = None
 
 
-PLUGIN_VERSION = "0.4.0"
 _BROWSER_UA = (
-    f"OrcaSlicer-Model-Search-Plugin/{PLUGIN_VERSION} "
-    "(+https://github.com/tommasobbianchi/OrcaSlicer-Model-Search-Plugin)"
+    "OrcaSlicer-Model-Search-Plugin/0.4.0 "
+    "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
+_MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+_MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
+_MAX_REDIRECTS = 5
 
 LICENSE_DESCRIPTIONS = {
     "CC BY": "Share and adapt for any purpose. Must credit the author.",
@@ -84,8 +87,10 @@ def _auth_file():
 
 def _ensure_private_dir(path):
     os.makedirs(path, exist_ok=True)
-    with suppress(OSError):
+    try:
         os.chmod(path, 0o700)
+    except OSError:
+        pass
 
 
 def _safe_filename(name, fallback="model.3mf"):
@@ -118,9 +123,13 @@ def _parse_license(name, url=""):
     if not summary:
         upper = name.upper()
         if "CC" in upper:
-            summary = "Creative Commons license. See the model page for the complete terms."
+            summary = (
+                "Creative Commons license. See the model page for the complete terms."
+            )
         elif "GPL" in upper:
-            summary = "GNU General Public License. See the model page for the complete terms."
+            summary = (
+                "GNU General Public License. See the model page for the complete terms."
+            )
         elif name:
             summary = "See the model page for the complete license terms."
     return {"name": name, "url": url or "", "summary": summary}
@@ -152,10 +161,77 @@ class VerificationRequired(AuthError):
         super().__init__(message)
 
 
-class AuthStore:
-    """Small token/session-only credential store with atomic writes."""
+class PlatformSpec:
+    """Single source of truth for search, import, and authentication behavior."""
 
-    _FORBIDDEN_KEYS = frozenset({"password", "passwd", "secret"})
+    __slots__ = (
+        "adapter",
+        "auth_hosts",
+        "auth_mode",
+        "cookie_domain",
+        "cookie_name",
+        "display",
+        "key",
+        "login_url",
+        "referer",
+    )
+
+    def __init__(
+        self,
+        key,
+        display,
+        adapter,
+        *,
+        auth_hosts=(),
+        auth_mode="",
+        login_url="",
+        referer="",
+        cookie_domain="",
+        cookie_name="",
+    ):
+        self.key = key
+        self.display = display
+        self.adapter = adapter
+        self.auth_hosts = tuple(auth_hosts)
+        self.auth_mode = auth_mode
+        self.login_url = login_url
+        self.referer = referer
+        self.cookie_domain = cookie_domain
+        self.cookie_name = cookie_name
+
+    @property
+    def requires_auth(self):
+        return bool(self.auth_mode)
+
+
+_PLATFORMS = {}
+_PLATFORMS_BY_DISPLAY = {}
+
+
+def _platform(key):
+    return _PLATFORMS.get(key)
+
+
+def _platform_for_display(display):
+    return _PLATFORMS_BY_DISPLAY.get(display)
+
+
+def _platform_for_model(model):
+    spec = _platform(str(model.get("_platform_key") or ""))
+    return spec or _platform_for_display(model.get("platform", ""))
+
+
+def _display_name(key):
+    spec = _platform(key)
+    return spec.display if spec else key
+
+
+class AuthStore:
+    """Small token-only credential store.
+
+    Passwords are never persisted.  The file lives below Orca's data directory
+    and is written with restrictive permissions where the OS supports them.
+    """
 
     def __init__(self, path=None):
         self.path = path or _auth_file()
@@ -164,7 +240,7 @@ class AuthStore:
     def load(self):
         with self._lock:
             try:
-                with open(self.path, encoding="utf-8") as fh:
+                with open(self.path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
                 return data if isinstance(data, dict) else {}
             except (FileNotFoundError, ValueError, OSError):
@@ -175,84 +251,38 @@ class AuthStore:
         return value if isinstance(value, dict) else {}
 
     def _write(self, data):
-        folder = os.path.dirname(self.path) or "."
+        folder = os.path.dirname(self.path)
         _ensure_private_dir(folder)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
+        temporary_path = self.path + ".tmp"
+        with open(temporary_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, sort_keys=True)
             fh.write("\n")
-        with suppress(OSError):
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, self.path)
-        with suppress(OSError):
+        try:
+            os.chmod(temporary_path, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary_path, self.path)
+        try:
             os.chmod(self.path, 0o600)
+        except OSError:
+            pass
 
     def set(self, platform, value):
-        clean = dict(value or {})
-        for forbidden in self._FORBIDDEN_KEYS:
-            clean.pop(forbidden, None)
+        value = dict(value or {})
+        # Defense in depth: never let caller accidentally persist a password.
+        for key in tuple(value):
+            if str(key).lower() in ("password", "passwd", "secret"):
+                value.pop(key)
         with self._lock:
             data = self.load()
-            data[platform] = clean
+            data[platform] = value
             self._write(data)
 
     def delete(self, platform):
         with self._lock:
             data = self.load()
-            if platform not in data:
-                return
-            del data[platform]
+            data.pop(platform, None)
             self._write(data)
-
-_PLATFORM_HOSTS = {
-    "makerworld": ("api.bambulab.com", "makerworld.com"),
-    "nexprint": ("nexprint.com",),
-    "makeronline": ("makeronline.com", "anycubic.com"),
-    "grabcad": ("grabcad.com",),
-    "cults3d": ("cults3d.com",),
-}
-
-_PLATFORM_DISPLAY = {
-    "makerworld": "MakerWorld",
-    "nexprint": "Nexprint",
-    "makeronline": "Makeronline",
-    "printables": "Printables",
-    "thingiverse": "Thingiverse",
-    "cults3d": "Cults3D",
-    "myminifactory": "MyMiniFactory",
-    "thangs": "Thangs",
-    "crealitycloud": "Creality Cloud",
-    "grabcad": "GrabCAD",
-}
-_PLATFORM_KEY_BY_DISPLAY = {display: key for key, display in _PLATFORM_DISPLAY.items()}
-_AUTH_TOKEN_FIELD = {
-    "makerworld": "access_token",
-    "nexprint": "auth_token",
-    "makeronline": "access_token",
-    "cults3d": "auth_token",
-    "grabcad": "auth_token",
-}
-_AUTH_DEFAULT_LABEL = {
-    "cults3d": "Cults3D browser session",
-    "grabcad": "GrabCAD browser session",
-}
-_AUTH_LOGIN_URL = {
-    "makerworld": "https://makerworld.com/en/sign-in",
-    "nexprint": "https://www.nexprint.com/en/account/login",
-    "makeronline": "https://uc.makeronline.com/",
-    "cults3d": "https://cults3d.com/en/users/sign_in",
-    "grabcad": "https://login.grabcad.com/login",
-}
-_TOKEN_ONLY_AUTH_ERROR = {
-    "makeronline": (
-        "Makeronline direct email/password login is no longer supported by the current Anycubic flow. "
-        "Sign in with Anycubic Slicer Next and use 'Import from Anycubic Slicer Next', "
-        "or paste an existing access token."
-    ),
-    "nexprint": "Nexprint login requires auth_token from the official signed-in browser session",
-    "cults3d": "Cults3D requires a Cookie header/session cookies from the official signed-in browser session",
-    "grabcad": "GrabCAD requires a Cookie header/session cookie from the official signed-in browser session",
-}
 
 
 def _host_matches(host, suffixes):
@@ -276,21 +306,33 @@ def _is_http_url(url):
 
 
 def _reject_obvious_local_target(url):
-    """Reject localhost/private literal IPs. Hostnames are left to the OS resolver."""
+    """Reject URLs whose hostname or current DNS answers are not globally routable."""
     host = _url_host(url)
     if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
         raise ValueError("Refusing a localhost download URL")
     try:
         ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
+        try:
+            addresses = {
+                item[4][0]
+                for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            }
+        except socket.gaierror as exc:
+            raise ValueError(f"Could not resolve download host: {host}") from exc
+        if not addresses:
+            raise ValueError(f"Could not resolve download host: {host}")
+        if any(not ipaddress.ip_address(address).is_global for address in addresses):
+            raise ValueError(
+                "Refusing a download host that resolves to a private/local address"
+            )
         return
-    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+    if not ip.is_global:
         raise ValueError("Refusing a private/local download URL")
 
 
 class AuthManager:
     BAMBU_LOGIN = "https://api.bambulab.com/v1/user-service/user/login"
-    BAMBU_PROFILE = "https://api.bambulab.com/v1/design-user-service/my/preference"
 
     def __init__(self, store=None):
         self.store = store or AuthStore()
@@ -299,20 +341,32 @@ class AuthManager:
         return self.store.get(platform)
 
     def token(self, platform):
-        field = _AUTH_TOKEN_FIELD.get(platform)
-        return self.credential(platform).get(field, "") if field else ""
+        data = self.credential(platform)
+        return (
+            data.get("access_token")
+            or data.get("auth_token")
+            or data.get("token")
+            or ""
+        )
 
     def authenticated(self, platform):
         return bool(self.token(platform))
 
     def status(self):
         out = {}
-        for platform in _AUTH_TOKEN_FIELD:
-            data = self.credential(platform)
-            configured = self.authenticated(platform)
-            out[platform] = {
+        for spec in _PLATFORMS.values():
+            if not spec.requires_auth:
+                continue
+            data = self.credential(spec.key)
+            configured = bool(
+                data.get("access_token") or data.get("auth_token") or data.get("token")
+            )
+            out[spec.key] = {
                 "authenticated": configured,
-                "label": data.get("label") or ("Connected" if configured else "Not connected"),
+                "label": data.get("label")
+                or data.get("email")
+                or data.get("username")
+                or ("Connected" if configured else "Not connected"),
                 "expires_at": data.get("expires_at"),
             }
         return out
@@ -325,39 +379,57 @@ class AuthManager:
         token = (token or "").strip()
         if token.lower().startswith("bearer "):
             token = token[7:].strip()
-        if platform == "nexprint" and "auth_token=" in token:
+        spec = _platform(platform)
+        mode = spec.auth_mode if spec else ""
+        if mode == "named_cookie" and "auth_token=" in token:
             # Accept either the cookie value or a copied Cookie header.
             m = re.search(r"(?:^|[;\s])auth_token=([^;\s]+)", token)
             if m:
                 token = m.group(1).strip()
-        if platform in ("grabcad", "cults3d") and token.lower().startswith("cookie:"):
-            # Accept either a raw Cookie header value or a copied "Cookie: ..." header.
+        # Accept either a raw Cookie header value or a copied "Cookie: ..." header.
+        if mode == "cookie_header" and token.lower().startswith("cookie:"):
             token = token.split(":", 1)[1].strip()
-        if platform == "makeronline":
-            m = re.match(r"(?i)^(?:XX-Token|Authorization)\s*:\s*(?:Bearer\s+)?(.+)$", token)
+        if mode == "anycubic":
+            m = re.match(
+                r"(?i)^(?:XX-Token|Authorization)\s*:\s*(?:Bearer\s+)?(.+)$", token
+            )
             if m:
                 token = m.group(1).strip()
         return token
 
-    def save_token(self, platform, token, label="", refresh_token="", expires_in=None):
-        field = _AUTH_TOKEN_FIELD.get(platform)
-        if field is None:
-            raise AuthError(f"Unknown authentication platform: {platform or '<empty>'}")
+    def save_token(
+        self, platform, token, label="", refresh_token=None, expires_in=None
+    ):
+        spec = _platform(platform)
+        if spec is None or not spec.requires_auth:
+            raise AuthError("Unknown authentication platform")
         token = self.normalize_token(platform, token)
         if not token:
             raise AuthError("Token is empty")
-        if platform in ("cults3d", "grabcad") and "=" not in token:
-            raise AuthError("Paste browser session cookies in name=value form (or the full Cookie request header)")
+        if spec.auth_mode == "cookie_header" and "=" not in token:
+            raise AuthError(
+                "Paste browser session cookies in name=value form (or the full Cookie request header)"
+            )
         data = {
-            field: token,
-            "label": (label or _AUTH_DEFAULT_LABEL.get(platform, "")).strip(),
+            "access_token": token,
+            "label": (label or "").strip(),
             "saved_at": int(time.time()),
         }
+        if spec.auth_mode in ("named_cookie", "cookie_header"):
+            data = {
+                "auth_token": token,
+                "label": (label or "").strip(),
+                "saved_at": int(time.time()),
+            }
+        if spec.auth_mode == "cookie_header" and not data["label"]:
+            data["label"] = f"{spec.display} browser session"
         if refresh_token:
             data["refresh_token"] = refresh_token
         if expires_in:
-            with suppress(TypeError, ValueError):
+            try:
                 data["expires_at"] = int(time.time()) + int(expires_in)
+            except (TypeError, ValueError):
+                pass
         self.store.set(platform, data)
         return data
 
@@ -366,28 +438,26 @@ class AuthManager:
             "User-Agent": _BROWSER_UA,
             "Accept": "application/json, text/plain, */*",
         }
+        spec = _platform(platform)
         host = _url_host(url)
-        if platform not in _PLATFORM_HOSTS or not _host_matches(host, _PLATFORM_HOSTS[platform]):
+        if (
+            spec is None
+            or not spec.auth_hosts
+            or not _host_matches(host, spec.auth_hosts)
+        ):
             return headers
         token = self.token(platform)
         if not token:
             return headers
-        if platform == "makerworld":
+        if spec.auth_mode == "bearer":
             headers["Authorization"] = "Bearer " + token
-            headers["Referer"] = "https://makerworld.com/"
-        elif platform == "makeronline":
+        elif spec.auth_mode == "anycubic":
             # Current Anycubic web/cloud clients use XX-Token; Bearer is also
-            # accepted by some Makeronline endpoints. Both are scoped only to
-            # *.makeronline.com / *.anycubic.com to prevent credential leakage.
+            # accepted by some Makeronline endpoints.
             headers["XX-Token"] = token
             headers["Authorization"] = "Bearer " + token
-            headers["Referer"] = "https://www.makeronline.com/"
-        elif platform == "nexprint":
-            headers["Referer"] = "https://www.nexprint.com/"
-        elif platform == "grabcad":
-            headers["Referer"] = "https://grabcad.com/library"
-        elif platform == "cults3d":
-            headers["Referer"] = "https://cults3d.com/"
+        if spec.referer:
+            headers["Referer"] = spec.referer
         return headers
 
     def session(self, platform):
@@ -395,16 +465,17 @@ class AuthManager:
 
         session = requests.Session()
         session.headers.update({"User-Agent": _BROWSER_UA})
-        if platform == "nexprint":
+        spec = _platform(platform)
+        if spec is None:
+            return session
+        if spec.auth_mode == "named_cookie":
             token = self.token(platform)
             if token:
-                # Nexprint documents auth_token as the login-session cookie used
-                # to authenticate API requests. Domain scoping prevents it from
-                # being sent to model CDN hosts.
-                session.cookies.set("auth_token", token, domain=".nexprint.com", path="/")
-        elif platform in ("cults3d", "grabcad"):
+                session.cookies.set(
+                    spec.cookie_name, token, domain=spec.cookie_domain, path="/"
+                )
+        elif spec.auth_mode == "cookie_header":
             token = self.token(platform)
-            domain = ".cults3d.com" if platform == "cults3d" else ".grabcad.com"
             if token:
                 # Parse a copied Cookie header into a domain-scoped cookie jar.
                 # This prevents session cookies from following redirects to CDNs.
@@ -415,20 +486,28 @@ class AuthManager:
                     name, value = part.split("=", 1)
                     name, value = name.strip(), value.strip()
                     if name and value:
-                        session.cookies.set(name, value, domain=domain, path="/")
+                        session.cookies.set(
+                            name, value, domain=spec.cookie_domain, path="/"
+                        )
         return session
 
     def request(self, platform, method, url, session=None, **kwargs):
+        """Request a URL while rebuilding scoped auth headers after every redirect."""
+        import requests
+
         if not _is_http_url(url):
             raise ValueError("Refusing non-HTTP URL")
         session = session or self.session(platform)
         supplied = dict(kwargs.pop("headers", {}) or {})
-        follow_redirects = bool(kwargs.pop("allow_redirects", True))
+        for name in tuple(supplied):
+            if name.lower() in ("authorization", "cookie", "xx-token"):
+                supplied.pop(name)
+        follow_redirects = kwargs.pop("allow_redirects", True)
         current_url = url
         current_method = str(method or "GET").upper()
-        redirect_codes = {301, 302, 303, 307, 308}
-
-        for redirect_index in range(6):
+        request_kwargs = dict(kwargs)
+        for redirect_count in range(_MAX_REDIRECTS + 1):
+            _reject_obvious_local_target(current_url)
             headers = self._request_headers(platform, current_url)
             headers.update(supplied)
             response = session.request(
@@ -436,87 +515,97 @@ class AuthManager:
                 current_url,
                 headers=headers,
                 allow_redirects=False,
-                **kwargs,
+                **request_kwargs,
             )
-            if not follow_redirects or response.status_code not in redirect_codes:
+            if not follow_redirects or response.status_code not in (
+                301,
+                302,
+                303,
+                307,
+                308,
+            ):
                 return response
-            location = response.headers.get("location") or response.headers.get("Location")
+            location = response.headers.get("location")
             if not location:
                 return response
-            next_url = urllib.parse.urljoin(response.url or current_url, location)
+            if redirect_count == _MAX_REDIRECTS:
+                response.close()
+                raise requests.TooManyRedirects(f"More than {_MAX_REDIRECTS} redirects")
+            redirect_status = response.status_code
+            current_url = urllib.parse.urljoin(response.url, location)
+            if not _is_http_url(current_url):
+                response.close()
+                raise ValueError("Refusing redirect to a non-HTTP URL")
             response.close()
-            if not _is_http_url(next_url):
-                raise ValueError("Refusing redirect to non-HTTP URL")
-            if redirect_index == 5:
-                raise RuntimeError("Too many HTTP redirects")
-
-            current_url = next_url
-            kwargs.pop("params", None)
-            if response.status_code == 303 or (
-                response.status_code in (301, 302) and current_method not in ("GET", "HEAD")
+            request_kwargs.pop("params", None)
+            if redirect_status == 303 or (
+                redirect_status in (301, 302) and current_method not in ("GET", "HEAD")
             ):
                 current_method = "GET"
-                for key in ("data", "json", "files"):
-                    kwargs.pop(key, None)
+                for key in ("data", "files", "json"):
+                    request_kwargs.pop(key, None)
+        raise requests.TooManyRedirects(f"More than {_MAX_REDIRECTS} redirects")
 
     @staticmethod
     def _makerworld_login_payload(account, password, code):
+        account = (account or "").strip()
+        if not account:
+            raise AuthError("MakerWorld email/account is required")
+        payload = {"account": account}
         if code:
-            return {"account": account, "code": code.strip()}
-        if password:
-            return {"account": account, "password": password}
-        raise AuthError("Password or verification code is required")
+            payload["code"] = code.strip()
+        elif password:
+            payload["password"] = password
+        else:
+            raise AuthError("Password or verification code is required")
+        return account, payload
 
     @staticmethod
     def _makerworld_login_data(response):
+        if 300 <= response.status_code < 400:
+            raise AuthError("MakerWorld login returned an unexpected redirect")
         try:
             data = response.json()
         except ValueError:
             data = {}
         if response.status_code >= 400:
-            message = data.get("message") or data.get("error") or f"HTTP {response.status_code}"
+            message = (
+                data.get("message")
+                or data.get("error")
+                or f"HTTP {response.status_code}"
+            )
             raise AuthError(f"MakerWorld login failed: {message}")
-        if data.get("accessToken"):
+        access = data.get("accessToken")
+        if access:
             return data
         login_type = str(data.get("loginType") or "")
         if "verify" in login_type.lower() or data.get("needVerify"):
-            raise VerificationRequired("MakerWorld requires a verification code. Enter the code sent by Bambu Lab.")
-        raise AuthError(data.get("message") or data.get("error") or "MakerWorld did not return an access token")
-
-    @staticmethod
-    def _makerworld_profile_label(access_token, fallback):
-        import requests
-        try:
-            response = requests.get(
-                AuthManager.BAMBU_PROFILE,
-                headers={"Authorization": "Bearer " + access_token, "User-Agent": _BROWSER_UA},
-                timeout=15,
+            raise VerificationRequired(
+                "MakerWorld requires a verification code. Enter the code sent by Bambu Lab."
             )
-            if response.ok:
-                data = response.json()
-                return data.get("name") or data.get("handle") or fallback
-        except Exception:
-            return fallback
-        return fallback
+        raise AuthError(
+            data.get("message")
+            or data.get("error")
+            or "MakerWorld did not return an access token"
+        )
 
-    def login_makerworld(self, account, password="", code=""):
+    def login_makerworld(self, account, password=None, code=None):
         import requests
-        account = (account or "").strip()
-        if not account:
-            raise AuthError("MakerWorld email/account is required")
+
+        account, payload = self._makerworld_login_payload(account, password, code)
         response = requests.post(
             self.BAMBU_LOGIN,
-            json=self._makerworld_login_payload(account, password, code),
+            json=payload,
             headers={"User-Agent": _BROWSER_UA, "Accept": "application/json"},
             timeout=30,
+            allow_redirects=False,
         )
         data = self._makerworld_login_data(response)
-        access = data["accessToken"]
         return self.save_token(
             "makerworld",
-            access,
-            label=self._makerworld_profile_label(access, account),
-            refresh_token=data.get("refreshToken") or "",
+            data["accessToken"],
+            label=account,
+            refresh_token=data.get("refreshToken"),
             expires_in=data.get("expiresIn"),
         )
 
@@ -546,15 +635,35 @@ class AuthManager:
         paths = []
         appdata = os.environ.get("APPDATA")
         if appdata:
-            paths.extend([
-                os.path.join(appdata, "AnycubicSlicerNext", "AnycubicSlicerNext.conf"),
-                os.path.join(appdata, "AnycubicSlicerNext", "config.json"),
-            ])
-        paths.extend([
-            os.path.join(home, "Library", "Application Support", "AnycubicSlicerNext", "AnycubicSlicerNext.conf"),
-            os.path.join(home, ".config", "AnycubicSlicerNext", "AnycubicSlicerNext.conf"),
-            os.path.join(home, ".local", "share", "AnycubicSlicerNext", "AnycubicSlicerNext.conf"),
-        ])
+            paths.extend(
+                [
+                    os.path.join(
+                        appdata, "AnycubicSlicerNext", "AnycubicSlicerNext.conf"
+                    ),
+                    os.path.join(appdata, "AnycubicSlicerNext", "config.json"),
+                ]
+            )
+        paths.extend(
+            [
+                os.path.join(
+                    home,
+                    "Library",
+                    "Application Support",
+                    "AnycubicSlicerNext",
+                    "AnycubicSlicerNext.conf",
+                ),
+                os.path.join(
+                    home, ".config", "AnycubicSlicerNext", "AnycubicSlicerNext.conf"
+                ),
+                os.path.join(
+                    home,
+                    ".local",
+                    "share",
+                    "AnycubicSlicerNext",
+                    "AnycubicSlicerNext.conf",
+                ),
+            ]
+        )
         # Preserve order, remove duplicates.
         return list(dict.fromkeys(paths))
 
@@ -562,11 +671,11 @@ class AuthManager:
         candidates = candidates or self.anycubic_config_candidates()
         for path in candidates:
             try:
-                with open(path, encoding="utf-8") as fh:
+                with open(path, "r", encoding="utf-8") as fh:
                     raw = fh.read()
             except OSError:
                 continue
-            token = ""
+            token = None
             label = "Anycubic Slicer Next"
             try:
                 obj = json.loads(raw)
@@ -576,7 +685,10 @@ class AuthManager:
                     label = obj.get("user_name") or obj.get("nickname") or label
             except ValueError:
                 # Some builds use INI-like text. Match only explicit token keys.
-                m = re.search(r'(?im)^\s*(?:access_token|accessToken|XX-Token)\s*[=:]\s*["\']?([^"\'\s,}]+)', raw)
+                m = re.search(
+                    r'(?im)^\s*(?:access_token|accessToken|XX-Token)\s*[=:]\s*["\']?([^"\'\s,}]+)',
+                    raw,
+                )
                 token = m.group(1).strip() if m else ""
             if token:
                 data = self.save_token("makeronline", token, label=str(label))
@@ -588,17 +700,36 @@ class AuthManager:
         )
 
 
-
 # ---------------------------------------------------------------------------
 # Public web-catalog helpers
 # ---------------------------------------------------------------------------
 
-_LOADABLE_MODEL_EXTS = (
-    ".3mf", ".stl", ".obj", ".step", ".stp", ".iges", ".igs", ".amf",
-    ".ply", ".scad", ".fcstd", ".f3d",
+_MODEL_FILE_EXTS = (
+    ".3mf",
+    ".stl",
+    ".obj",
+    ".step",
+    ".stp",
+    ".iges",
+    ".igs",
+    ".amf",
+    ".ply",
+    ".scad",
+    ".fcstd",
+    ".f3d",
+    ".zip",
 )
-_MODEL_FILE_EXTS = (*_LOADABLE_MODEL_EXTS, ".zip")
-_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".mp4", ".webm")
+_IMAGE_EXTS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".avif",
+    ".mp4",
+    ".webm",
+)
 
 
 def _clean_web_text(value):
@@ -608,7 +739,7 @@ def _clean_web_text(value):
 
 
 def _decode_embedded_url(value):
-    value = html.unescape(str(value or "")).strip().strip('"\'')
+    value = html.unescape(str(value or "")).strip().strip("\"'")
     value = value.replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
     value = value.replace("\\u003A", ":").replace("\\u003a", ":")
     value = value.replace("\\u0026", "&")
@@ -616,7 +747,9 @@ def _decode_embedded_url(value):
 
 
 def _slug_title(url):
-    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rstrip("/").split("/")[-1])
+    path = urllib.parse.unquote(
+        urllib.parse.urlsplit(url).path.rstrip("/").split("/")[-1]
+    )
     path = re.sub(r"-\d+$", "", path)
     path = re.sub(r"[-_]+", " ", path).strip()
     return path[:120] or "Untitled"
@@ -628,6 +761,7 @@ class _CatalogHTMLParser(HTMLParser):
         self.anchors = []
         self._anchor = None
         self._text = []
+        self.meta = {}
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -640,9 +774,19 @@ class _CatalogHTMLParser(HTMLParser):
             }
             self._text = []
         elif tag == "img" and self._anchor is not None:
-            self._anchor["img"] = attrs.get("src") or attrs.get("data-src") or attrs.get("data-lazy-src") or ""
+            self._anchor["img"] = (
+                attrs.get("src")
+                or attrs.get("data-src")
+                or attrs.get("data-lazy-src")
+                or ""
+            )
             if not self._anchor.get("title"):
                 self._anchor["title"] = attrs.get("alt", "")
+        elif tag == "meta":
+            key = attrs.get("property") or attrs.get("name")
+            content = attrs.get("content")
+            if key and content:
+                self.meta[str(key).lower()] = content
 
     def handle_data(self, data):
         if self._anchor is not None:
@@ -658,23 +802,41 @@ class _CatalogHTMLParser(HTMLParser):
 
 def _parse_catalog_html(raw):
     parser = _CatalogHTMLParser()
-    with suppress(Exception):
-        parser.feed(raw or "")
+    parser.feed(raw or "")
     return parser
 
 
 def _fetch_html(url, auth=None, platform="", timeout=30):
     import requests
-    session = auth.session(platform) if auth is not None and platform else requests.Session()
+
+    session = (
+        auth.session(platform) if auth is not None and platform else requests.Session()
+    )
     if auth is not None and platform:
-        response = auth.request(platform, "GET", url, session=session, timeout=timeout, allow_redirects=True,
-                                headers={"Accept": "text/html,application/xhtml+xml"})
+        response = auth.request(
+            platform,
+            "GET",
+            url,
+            session=session,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={"Accept": "text/html,application/xhtml+xml"},
+        )
     else:
-        response = session.get(url, timeout=timeout, allow_redirects=True,
-                               headers={"User-Agent": _BROWSER_UA, "Accept": "text/html,application/xhtml+xml"})
+        response = session.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={
+                "User-Agent": _BROWSER_UA,
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
     if response.status_code in (401, 403) and platform in ("grabcad", "cults3d"):
-        display = _PLATFORM_DISPLAY.get(platform, platform)
-        raise AuthRequired(f"{display} rejected the browser session. Sign in again and paste a fresh Cookie header.")
+        display = _display_name(platform)
+        raise AuthRequired(
+            f"{display} rejected the browser session. Sign in again and paste a fresh Cookie header."
+        )
     response.raise_for_status()
     return response.text, response.url
 
@@ -682,17 +844,25 @@ def _fetch_html(url, auth=None, platform="", timeout=30):
 def _looks_like_login_page(raw, platform=""):
     sample = (raw or "")[:300000].lower()
     if platform == "grabcad":
-        return ("sign in or create account" in sample or "sign in with email" in sample or
-                ('action="/login"' in sample and "forgot password" in sample))
+        return (
+            "sign in or create account" in sample
+            or "sign in with email" in sample
+            or ('action="/login"' in sample and "forgot password" in sample)
+        )
     if platform == "cults3d":
-        return ("/users/sign_in" in sample or "/en/users/sign_in" in sample or
-                ("sign in" in sample and "forgot your password" in sample))
+        return (
+            "/users/sign_in" in sample
+            or "/en/users/sign_in" in sample
+            or ("sign in" in sample and "forgot your password" in sample)
+        )
     return False
 
 
-def _extract_catalog_models(raw, base_url, path_pattern, platform, requires_auth=False, limit=30):
+def _extract_catalog_models(
+    raw, base_url, path_pattern, platform, requires_auth=False, limit=30
+):
     parser = _parse_catalog_html(raw)
-    regex = re.compile(path_pattern, re.I)
+    regex = re.compile(path_pattern, re.IGNORECASE)
     found = []
     seen = set()
 
@@ -702,32 +872,46 @@ def _extract_catalog_models(raw, base_url, path_pattern, platform, requires_auth
             return
         absolute = urllib.parse.urljoin(base_url, href)
         parsed = urllib.parse.urlsplit(absolute)
-        canonical = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        canonical = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, "", "")
+        )
         if not regex.search(parsed.path):
             return
         if canonical in seen:
             return
         seen.add(canonical)
-        found.append({
-            "name": _clean_web_text(title) or _slug_title(canonical),
-            "author": "Unknown",
-            "platform": platform,
-            "thumbnail_url": urllib.parse.urljoin(base_url, _decode_embedded_url(img)) if img else "",
-            "license": "Unknown",
-            "license_url": "",
-            "license_summary": "Open the model page to review the exact license before importing.",
-            "download_url": canonical,
-            "url": canonical,
-            "requires_auth": requires_auth,
-        })
+        found.append(
+            {
+                "name": _clean_web_text(title) or _slug_title(canonical),
+                "author": "Unknown",
+                "platform": platform,
+                "thumbnail_url": urllib.parse.urljoin(
+                    base_url, _decode_embedded_url(img)
+                )
+                if img
+                else "",
+                "license": "Unknown",
+                "license_url": "",
+                "license_summary": "Open the model page to review the exact license before importing.",
+                "download_url": canonical,
+                "url": canonical,
+                "requires_auth": requires_auth,
+            }
+        )
 
     for a in parser.anchors:
-        add(a.get("href"), a.get("text") or a.get("title") or a.get("aria"), a.get("img"))
+        add(
+            a.get("href"),
+            a.get("text") or a.get("title") or a.get("aria"),
+            a.get("img"),
+        )
         if len(found) >= limit:
             return found
 
     # SSR/Next/Vue pages frequently put model paths in JSON rather than anchors.
-    normalized = (raw or "").replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    normalized = (
+        (raw or "").replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    )
     for match in regex.finditer(normalized):
         path = match.group(0)
         add(path)
@@ -736,29 +920,35 @@ def _extract_catalog_models(raw, base_url, path_pattern, platform, requires_auth
     return found
 
 
-def _catalog_search(query, url_templates, path_pattern, platform, auth=None, auth_platform="", requires_auth=False):
+def _catalog_search(
+    query, url_templates, path_pattern, platform, auth=None, requires_auth=False
+):
     last_error = None
     for template in url_templates:
         url = template.format(query=urllib.parse.quote(query.strip(), safe=""))
         try:
             raw, final_url = _fetch_html(
                 url,
-                auth=auth if auth_platform else None,
-                platform=auth_platform,
+                auth=auth if requires_auth else None,
+                platform="grabcad" if requires_auth else "",
             )
-            if auth_platform and _looks_like_login_page(raw, auth_platform):
-                display = _PLATFORM_DISPLAY.get(auth_platform, auth_platform)
-                raise AuthRequired(f"{display} search requires a signed-in browser session.")
-            models = _extract_catalog_models(raw, final_url, path_pattern, platform, requires_auth=requires_auth)
+            if requires_auth and _looks_like_login_page(raw, "grabcad"):
+                raise AuthRequired(
+                    "GrabCAD search requires a signed-in GrabCAD browser session."
+                )
+            models = _extract_catalog_models(
+                raw, final_url, path_pattern, platform, requires_auth=requires_auth
+            )
             if models:
                 return models
         except AuthRequired:
             raise
-        except Exception as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             last_error = exc
     if last_error:
         raise RuntimeError(f"{platform} search failed: {last_error}")
     return []
+
 
 def _extract_download_candidates(raw, base_url):
     parser = _parse_catalog_html(raw)
@@ -778,7 +968,12 @@ def _extract_download_candidates(raw, base_url):
             return
         low_label = (label or "").lower()
         direct = path.endswith(_MODEL_FILE_EXTS)
-        action = "download" in low_label or "download" in low_url or "/files/" in low_url or "/file/" in low_url
+        action = (
+            "download" in low_label
+            or "download" in low_url
+            or "/files/" in low_url
+            or "/file/" in low_url
+        )
         if not (direct or action):
             return
         if url in seen:
@@ -789,142 +984,205 @@ def _extract_download_candidates(raw, base_url):
     for a in parser.anchors:
         add(a.get("href"), a.get("text") or a.get("title") or a.get("aria"))
 
-    normalized = (raw or "").replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    normalized = (
+        (raw or "").replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    )
     normalized = normalized.replace("\\u003A", ":").replace("\\u003a", ":")
-    for match in re.finditer(r'https?://[^"\'<>\\\s]+', normalized, re.I):
+    for match in re.finditer(r'https?://[^"\'<>\\\s]+', normalized, re.IGNORECASE):
         add(match.group(0))
-    for match in re.finditer(r'(?P<q>["\'])(?P<path>/[^"\']{1,700}(?:download|files?)[^"\']*)(?P=q)', normalized, re.I):
+    for match in re.finditer(
+        r'(?P<q>["\'])(?P<path>/[^"\']{1,700}(?:download|files?)[^"\']*)(?P=q)',
+        normalized,
+        re.IGNORECASE,
+    ):
         add(match.group("path"))
     return candidates
 
 
-def _probe_request(session, url, auth=None, platform="", use_range=True):
-    import requests
-
+def _request_probe(session, url, auth, platform, use_range):
     headers = {"Accept": "*/*"}
     if use_range:
         headers["Range"] = "bytes=0-0"
-    try:
-        if auth is not None and platform:
-            return auth.request(
-                platform, "GET", url, session=session, stream=True, timeout=25,
-                allow_redirects=True, headers=headers,
-            )
-        return session.get(
-            url, stream=True, timeout=25, allow_redirects=True,
-            headers={"User-Agent": _BROWSER_UA, **headers},
+    return auth.request(
+        platform,
+        "GET",
+        url,
+        session=session,
+        stream=True,
+        timeout=25,
+        allow_redirects=True,
+        headers=headers,
+    )
+
+
+def _probe_result(response, platform):
+    if response.status_code in (401, 403) and platform in ("grabcad", "cults3d"):
+        raise AuthRequired(
+            f"{_display_name(platform)} session was rejected while resolving files."
         )
-    except requests.RequestException:
-        return None
-
-
-def _download_info(response):
     if response.status_code >= 400:
         return None
     content_type = (response.headers.get("content-type") or "").lower()
     disposition = response.headers.get("content-disposition") or ""
     final_url = response.url
     final_path = urllib.parse.urlsplit(final_url).path.lower()
-    if "text/html" in content_type or "application/xhtml" in content_type:
-        return None
-    downloadable = (
+    is_html = "text/html" in content_type or "application/xhtml" in content_type
+    is_download = (
         final_path.endswith(_MODEL_FILE_EXTS)
         or "attachment" in disposition.lower()
-        or any(token in content_type for token in ("zip", "octet-stream", "model/", "3mf", "stl"))
+        or any(
+            kind in content_type
+            for kind in ("zip", "octet-stream", "model/", "3mf", "stl")
+        )
     )
-    if not downloadable:
+    if is_html or not is_download:
         return None
-    match = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", disposition, re.I)
+    match = re.search(
+        r"filename\*?=(?:UTF-8''|\")?([^\";]+)", disposition, re.IGNORECASE
+    )
     filename = urllib.parse.unquote(match.group(1).strip().strip('"')) if match else ""
     if not filename:
-        filename = os.path.basename(urllib.parse.urlsplit(final_url).path) or "model_download"
+        filename = (
+            os.path.basename(urllib.parse.urlsplit(final_url).path) or "model_download"
+        )
     return {"url": final_url, "name": _safe_filename(filename, "model_download")}
 
 
 def _probe_download(url, auth=None, platform=""):
-    """Validate a candidate without consuming the full response body."""
+    """Validate a candidate without downloading the full file."""
     import requests
 
     if not _is_http_url(url):
         return None
-    _reject_obvious_local_target(url)
-    session = auth.session(platform) if auth is not None and platform else requests.Session()
-    response = _probe_request(session, url, auth=auth, platform=platform, use_range=True)
-    if response is None:
-        return None
     try:
+        _reject_obvious_local_target(url)
+    except ValueError:
+        return None
+    request_auth = auth or AuthManager()
+    session = request_auth.session(platform)
+    try:
+        response = _request_probe(session, url, request_auth, platform, use_range=True)
         if response.status_code in (405, 416):
             response.close()
-            response = _probe_request(session, url, auth=auth, platform=platform, use_range=False)
-            if response is None:
-                return None
-        if response.status_code in (401, 403) and platform in ("grabcad", "cults3d"):
-            display = _PLATFORM_DISPLAY.get(platform, platform)
-            raise AuthRequired(f"{display} session was rejected while resolving files.")
-        return _download_info(response)
+            response = _request_probe(
+                session, url, request_auth, platform, use_range=False
+            )
+    except (requests.RequestException, ValueError):
+        return None
+    try:
+        return _probe_result(response, platform)
     finally:
-        if response is not None:
-            response.close()
+        response.close()
 
-def _collect_page_candidates(urls, auth=None, platform_key=""):
-    body_parts = []
+
+def _collect_page_candidates(urls, auth, platform_key):
+    import requests
+
+    bodies = []
     candidates = []
     for url in urls:
         try:
-            raw, fetched = _fetch_html(url, auth=auth if platform_key else None, platform=platform_key)
+            raw, fetched = _fetch_html(
+                url, auth=auth if platform_key else None, platform=platform_key
+            )
         except AuthRequired:
             raise
-        except Exception:
+        except (requests.RequestException, OSError, ValueError):
             continue
-        if platform_key in ("cults3d", "grabcad") and _looks_like_login_page(raw, platform_key):
-            display = _PLATFORM_DISPLAY.get(platform_key, platform_key)
-            raise AuthRequired(f"{display} browser session is no longer signed in. Refresh the saved Cookie header.")
-        body_parts.append(raw)
+        if platform_key in ("cults3d", "grabcad") and _looks_like_login_page(
+            raw, platform_key
+        ):
+            display = _display_name(platform_key)
+            raise AuthRequired(
+                f"{display} browser session is no longer signed in. Refresh the saved Cookie header."
+            )
+        bodies.append(raw)
         candidates.extend(_extract_download_candidates(raw, fetched))
-    return "\n".join(body_parts), candidates
+    return "\n".join(bodies), candidates
 
 
-def _validated_candidates(candidates, auth=None, platform_key=""):
-    ordered = sorted(
-        candidates,
-        key=lambda item: 0 if urllib.parse.urlsplit(item[0]).path.lower().endswith(_MODEL_FILE_EXTS) else 1,
+def _validated_candidates(candidates, auth, platform_key):
+    candidates.sort(
+        key=lambda item: (
+            0
+            if urllib.parse.urlsplit(item[0]).path.lower().endswith(_MODEL_FILE_EXTS)
+            else 1
+        )
     )
     files = []
     seen = set()
-    for candidate, label in ordered[:30]:
-        probed = _probe_download(candidate, auth=auth if platform_key else None, platform=platform_key)
+    for candidate, label in candidates[:30]:
+        probed = _probe_download(
+            candidate, auth=auth if platform_key else None, platform=platform_key
+        )
         if not probed or probed["url"] in seen:
             continue
         seen.add(probed["url"])
         if not os.path.splitext(probed["name"])[1]:
-            probed["name"] += ".3mf" if "3mf" in (label or "").lower() else ".zip"
+            extension = ".3mf" if "3mf" in (label or "").lower() else ".zip"
+            probed["name"] += extension
         files.append(probed)
     return files
 
 
-def _public_page_files(model, auth=None, platform_key="", extra_urls=(), restricted_markers=(), no_direct_message=""):
+def _public_page_files(
+    model,
+    auth=None,
+    platform_key="",
+    extra_urls=(),
+    restricted_markers=(),
+    no_direct_message="",
+):
     page_url = model.get("url") or model.get("download_url") or ""
     if not page_url:
         raise ValueError("Model page URL is missing")
-    body, candidates = _collect_page_candidates(
-        [page_url, *(url for url in extra_urls if url)], auth=auth, platform_key=platform_key
-    )
-    if any(marker.lower() in body.lower() for marker in restricted_markers):
+    urls = [page_url, *(url for url in extra_urls if url)]
+    body, candidates = _collect_page_candidates(urls, auth, platform_key)
+    if restricted_markers and any(
+        marker.lower() in body.lower() for marker in restricted_markers
+    ):
         raise BrowserRequired(
-            "This model is paid, membership-gated, or requires the platform checkout/download page.", page_url
+            "This model is paid, membership-gated, or requires the platform checkout/download page.",
+            page_url,
         )
-    files = _validated_candidates(candidates, auth=auth, platform_key=platform_key)
+    files = _validated_candidates(candidates, auth, platform_key)
     if files:
         return files
     raise BrowserRequired(
-        no_direct_message or "The platform did not expose a direct downloadable model file to this session.", page_url
+        no_direct_message
+        or "The platform did not expose a direct downloadable model file to this session.",
+        page_url,
     )
 
 
-def _extract_api_files(detail, list_keys, url_keys, name_keys):
-    rows = next((detail.get(key) for key in list_keys if isinstance(detail.get(key), list)), [])
+# ---------------------------------------------------------------------------
+# Search adapters
+# ---------------------------------------------------------------------------
+
+
+def _model_identifier(model, field, pattern, missing_message):
+    value = model.get(field)
+    if value:
+        return value
+    match = re.search(pattern, model.get("url", ""), re.IGNORECASE)
+    if match:
+        return match.group(1)
+    raise ValueError(missing_message)
+
+
+def _api_data(response, error_message):
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("code") not in (0, "0", 200, "200", None):
+        raise RuntimeError(
+            payload.get("msg") or payload.get("message") or error_message
+        )
+    return payload.get("data") or {}
+
+
+def _file_records(records, url_keys, name_keys, fallback_extension=".stl"):
     files = []
-    for index, item in enumerate(rows, 1):
+    for index, item in enumerate(records or (), 1):
         if not isinstance(item, dict):
             continue
         url = next((item.get(key) for key in url_keys if item.get(key)), "")
@@ -932,17 +1190,38 @@ def _extract_api_files(detail, list_keys, url_keys, name_keys):
             continue
         name = next((item.get(key) for key in name_keys if item.get(key)), "")
         if not name:
-            name = os.path.basename(urllib.parse.urlsplit(url).path) or f"model_{index}.stl"
+            name = (
+                os.path.basename(urllib.parse.urlsplit(url).path)
+                or f"model_{index}{fallback_extension}"
+            )
         files.append({"name": name, "url": url})
     return files
 
 
-# ---------------------------------------------------------------------------
-# Search adapters
+def _normalize_download_files(files):
+    normalized = []
+    for index, item in enumerate(files or ()):
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        normalized.append(
+            {
+                "url": item["url"],
+                "name": item.get("name") or f"model_{index + 1}.3mf",
+            }
+        )
+    return normalized
 
-# ---------------------------------------------------------------------------
-# Search adapters
-# ---------------------------------------------------------------------------
+
+def _selected_file_indices(values):
+    selected = []
+    seen = set()
+    for value in values or ():
+        index = int(value)
+        if index >= 0 and index not in seen:
+            seen.add(index)
+            selected.append(index)
+    return selected
+
 
 MAKERONLINE_LICENSES = {
     1: ("CC BY", "https://creativecommons.org/licenses/by/4.0/"),
@@ -959,7 +1238,6 @@ MAKERONLINE_BASE = "https://www.makeronline.com"
 
 class MakeronlineSearcher:
     SEARCH_URL = f"{MAKERONLINE_BASE}/api/search/model"
-
 
     @staticmethod
     def search(query, _context):
@@ -991,47 +1269,54 @@ class MakeronlineSearcher:
             return []
         results = []
         for item in (data.get("data") or {}).get("data") or []:
-            lic_name, lic_url = MAKERONLINE_LICENSES.get(item.get("license", 0), ("Unknown", ""))
+            lic_name, lic_url = MAKERONLINE_LICENSES.get(
+                item.get("license", 0), ("Unknown", "")
+            )
             lic = _parse_license(lic_name, lic_url)
-            results.append({
-                "name": item.get("title", "Untitled"),
-                "author": item.get("show_user_name") or item.get("user_name", "Unknown"),
-                "platform": "Makeronline",
-                "thumbnail_url": (item.get("mold_image") or "").replace("thumbnail", "400x300"),
-                "license": lic["name"],
-                "license_url": lic["url"],
-                "license_summary": lic["summary"],
-                "download_url": item.get("target_url", ""),
-                "url": item.get("target_url", ""),
-                "_mold_id": item.get("mold_id"),
-                "requires_auth": True,
-            })
+            results.append(
+                {
+                    "name": item.get("title", "Untitled"),
+                    "author": item.get("show_user_name")
+                    or item.get("user_name", "Unknown"),
+                    "platform": "Makeronline",
+                    "thumbnail_url": (item.get("mold_image") or "").replace(
+                        "thumbnail", "400x300"
+                    ),
+                    "license": lic["name"],
+                    "license_url": lic["url"],
+                    "license_summary": lic["summary"],
+                    "download_url": item.get("target_url", ""),
+                    "url": item.get("target_url", ""),
+                    "_mold_id": item.get("mold_id"),
+                    "requires_auth": True,
+                }
+            )
         return results
 
     @staticmethod
     def get_files(model, auth):
         if not auth.authenticated("makeronline"):
             raise AuthRequired("Makeronline requires an Anycubic account session")
-        mold_id = model.get("_mold_id")
-        if not mold_id:
-            m = re.search(r"(?:mold|model)[^0-9]*(\d+)", model.get("url", ""), re.I)
-            mold_id = m.group(1) if m else ""
-        if not mold_id:
-            raise ValueError("Makeronline model id is missing")
+        mold_id = _model_identifier(
+            model,
+            "_mold_id",
+            r"(?:mold|model)[^0-9]*(\d+)",
+            "Makeronline model id is missing",
+        )
         session = auth.session("makeronline")
         response = auth.request(
-            "makeronline", "GET", f"{MAKERONLINE_BASE}/api/mold/detail",
-            session=session, params={"id": mold_id}, timeout=30,
+            "makeronline",
+            "GET",
+            f"{MAKERONLINE_BASE}/api/mold/detail",
+            session=session,
+            params={"id": mold_id},
+            timeout=30,
         )
         if response.status_code in (401, 403):
             raise AuthRequired("Makeronline session was rejected; log in again")
-        response.raise_for_status()
-        data = response.json()
-        if data.get("code") not in (0, "0", None):
-            raise RuntimeError(data.get("msg") or data.get("message") or "Makeronline detail API failed")
-        return _extract_api_files(
-            data.get("data") or {},
-            ("files",),
+        detail = _api_data(response, "Makeronline detail API failed")
+        return _file_records(
+            detail.get("files"),
             ("url", "file_url", "download_url"),
             ("file_name", "name"),
         )
@@ -1052,8 +1337,9 @@ NEXPRINT_BASE = "https://www.nexprint.com"
 
 
 class NexprintSearcher:
-    SEARCH_URL = f"{NEXPRINT_BASE}/gateway/api/v1/model-library-server/model-base-info/search"
-
+    SEARCH_URL = (
+        f"{NEXPRINT_BASE}/gateway/api/v1/model-library-server/model-base-info/search"
+    )
 
     @staticmethod
     def search(query, _context):
@@ -1069,52 +1355,58 @@ class NexprintSearcher:
         data = response.json()
         if data.get("code") not in (0, "0", 200, "200", None):
             return []
-        page = ((data.get("data") or {}).get("pageResult") or {})
+        page = (data.get("data") or {}).get("pageResult") or {}
         results = []
         for item in page.get("list") or []:
-            lic_name, lic_url = NEXPRINT_LICENSES.get(item.get("licenseType", 0), ("Unknown", ""))
+            lic_name, lic_url = NEXPRINT_LICENSES.get(
+                item.get("licenseType", 0), ("Unknown", "")
+            )
             lic = _parse_license(lic_name, lic_url)
             model_id = item.get("modelId") or item.get("id")
-            results.append({
-                "name": item.get("modelName", "Untitled"),
-                "author": item.get("authorName") or ((item.get("author") or {}).get("nickname", "Unknown")),
-                "platform": "Nexprint",
-                "thumbnail_url": item.get("coverImgUrl", ""),
-                "license": lic["name"],
-                "license_url": lic["url"],
-                "license_summary": lic["summary"],
-                "download_url": f"{NEXPRINT_BASE}/models/{model_id or ''}",
-                "url": f"{NEXPRINT_BASE}/models/{model_id or ''}",
-                "_model_id": model_id,
-                "requires_auth": True,
-            })
+            results.append(
+                {
+                    "name": item.get("modelName", "Untitled"),
+                    "author": item.get("authorName")
+                    or ((item.get("author") or {}).get("nickname", "Unknown")),
+                    "platform": "Nexprint",
+                    "thumbnail_url": item.get("coverImgUrl", ""),
+                    "license": lic["name"],
+                    "license_url": lic["url"],
+                    "license_summary": lic["summary"],
+                    "download_url": f"{NEXPRINT_BASE}/models/{model_id or ''}",
+                    "url": f"{NEXPRINT_BASE}/models/{model_id or ''}",
+                    "_model_id": model_id,
+                    "requires_auth": True,
+                }
+            )
         return results
 
     @staticmethod
     def get_files(model, auth):
         if not auth.authenticated("nexprint"):
             raise AuthRequired("Nexprint requires a logged-in auth_token session")
-        model_id = model.get("_model_id")
-        if not model_id:
-            m = re.search(r"/models/(\d+)", model.get("url", ""))
-            model_id = m.group(1) if m else ""
-        if not model_id:
-            raise ValueError("Nexprint model id is missing")
+        model_id = _model_identifier(
+            model,
+            "_model_id",
+            r"/models/(\d+)",
+            "Nexprint model id is missing",
+        )
         session = auth.session("nexprint")
         response = auth.request(
-            "nexprint", "GET",
+            "nexprint",
+            "GET",
             f"{NEXPRINT_BASE}/gateway/api/v1/model-library-server/model-base-info/get",
-            session=session, params={"id": model_id}, timeout=30,
+            session=session,
+            params={"id": model_id},
+            timeout=30,
         )
         if response.status_code in (401, 403):
-            raise AuthRequired("Nexprint session was rejected; refresh auth_token and log in again")
-        response.raise_for_status()
-        data = response.json()
-        if data.get("code") not in (0, "0", 200, "200", None):
-            raise RuntimeError(data.get("msg") or data.get("message") or "Nexprint detail API failed")
-        return _extract_api_files(
-            data.get("data") or {},
-            ("modelFileInfoList", "files"),
+            raise AuthRequired(
+                "Nexprint session was rejected; refresh auth_token and log in again"
+            )
+        detail = _api_data(response, "Nexprint detail API failed")
+        return _file_records(
+            detail.get("modelFileInfoList") or detail.get("files"),
             ("fileUrl", "url", "downloadUrl"),
             ("fileName", "name"),
         )
@@ -1128,14 +1420,16 @@ class PrintablesSearcher:
         " items { id name slug image { filePath } license { name } user { publicUsername } } } }"
     )
 
-
     @staticmethod
     def search(query, _context):
         import requests
 
         response = requests.post(
             PrintablesSearcher.GRAPHQL_URL,
-            json={"query": PrintablesSearcher.SEARCH_QUERY, "variables": {"query": query, "limit": 30}},
+            json={
+                "query": PrintablesSearcher.SEARCH_QUERY,
+                "variables": {"query": query, "limit": 30},
+            },
             headers={"Content-Type": "application/json", "User-Agent": _BROWSER_UA},
             timeout=30,
         )
@@ -1143,37 +1437,48 @@ class PrintablesSearcher:
         payload = response.json()
         if payload.get("errors"):
             raise RuntimeError(payload["errors"][0].get("message", "GraphQL error"))
-        items = ((payload.get("data") or {}).get("searchPrints2") or {}).get("items") or []
+        items = ((payload.get("data") or {}).get("searchPrints2") or {}).get(
+            "items"
+        ) or []
         results = []
         for item in items:
             path = (item.get("image") or {}).get("filePath", "")
             lic_obj = item.get("license") or {}
-            lic = _parse_license(lic_obj.get("name", "") if isinstance(lic_obj, dict) else "")
-            url = f"https://www.printables.com/model/{item.get('id','')}-{item.get('slug','')}"
-            results.append({
-                "name": item.get("name", "Untitled"),
-                "author": (item.get("user") or {}).get("publicUsername", "Unknown"),
-                "platform": "Printables",
-                "thumbnail_url": f"https://media.printables.com/{path}" if path else "",
-                "license": lic["name"] or "Unknown",
-                "license_url": lic["url"],
-                "license_summary": lic["summary"] or "Check Printables for license details.",
-                "download_url": url,
-                "url": url,
-                "requires_auth": False,
-                "importable": True,
-            })
+            lic = _parse_license(
+                lic_obj.get("name", "") if isinstance(lic_obj, dict) else ""
+            )
+            url = f"https://www.printables.com/model/{item.get('id', '')}-{item.get('slug', '')}"
+            results.append(
+                {
+                    "name": item.get("name", "Untitled"),
+                    "author": (item.get("user") or {}).get("publicUsername", "Unknown"),
+                    "platform": "Printables",
+                    "thumbnail_url": f"https://media.printables.com/{path}"
+                    if path
+                    else "",
+                    "license": lic["name"] or "Unknown",
+                    "license_url": lic["url"],
+                    "license_summary": lic["summary"]
+                    or "Check Printables for license details.",
+                    "download_url": url,
+                    "url": url,
+                    "requires_auth": False,
+                    "importable": True,
+                }
+            )
         return results
 
     @staticmethod
     def get_files(model, auth=None):
         import requests
 
-        model_url = model.get("url", "") if isinstance(model, dict) else str(model or "")
+        model_url = (
+            model.get("url", "") if isinstance(model, dict) else str(model or "")
+        )
         m = re.search(r"/model/(\d+)", model_url)
         if not m:
             return []
-        query = "{print(id:" + m.group(1) + "){stls{name filePreviewPath}}}"
+        query = f"{{print(id:{m.group(1)}){{stls{{name filePreviewPath}}}}}}"
         response = requests.post(
             PrintablesSearcher.GRAPHQL_URL,
             json={"query": query},
@@ -1181,17 +1486,21 @@ class PrintablesSearcher:
             timeout=30,
         )
         response.raise_for_status()
-        stls = ((response.json().get("data") or {}).get("print") or {}).get("stls") or []
+        stls = ((response.json().get("data") or {}).get("print") or {}).get(
+            "stls"
+        ) or []
         files = []
         for stl in stls:
             preview, name = stl.get("filePreviewPath") or "", stl.get("name") or ""
             if not preview or "/" not in preview or not name:
                 continue
             folder = preview.rsplit("/", 1)[0]
-            files.append({
-                "name": name,
-                "url": f"https://files.printables.com/{folder}/{urllib.parse.quote(name)}",
-            })
+            files.append(
+                {
+                    "name": name,
+                    "url": f"https://files.printables.com/{folder}/{urllib.parse.quote(name)}",
+                }
+            )
         return files
 
 
@@ -1199,14 +1508,20 @@ class MakerWorldSearcher:
     SEARCH_URL = "https://api.bambulab.com/v1/search-service/select/design2"
     DESIGN_BASE = "https://api.bambulab.com/v1/design-service"
     BASE = "https://makerworld.com"
-    LICENSES: ClassVar[dict] = {
+    LICENSES: ClassVar = {
         "CC0": ("CC0", "https://creativecommons.org/publicdomain/zero/1.0/"),
         "BY": ("CC BY", "https://creativecommons.org/licenses/by/4.0/"),
         "BY-SA": ("CC BY-SA", "https://creativecommons.org/licenses/by-sa/4.0/"),
         "BY-NC": ("CC BY-NC", "https://creativecommons.org/licenses/by-nc/4.0/"),
-        "BY-NC-SA": ("CC BY-NC-SA", "https://creativecommons.org/licenses/by-nc-sa/4.0/"),
+        "BY-NC-SA": (
+            "CC BY-NC-SA",
+            "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+        ),
         "BY-ND": ("CC BY-ND", "https://creativecommons.org/licenses/by-nd/4.0/"),
-        "BY-NC-ND": ("CC BY-NC-ND", "https://creativecommons.org/licenses/by-nc-nd/4.0/"),
+        "BY-NC-ND": (
+            "CC BY-NC-ND",
+            "https://creativecommons.org/licenses/by-nc-nd/4.0/",
+        ),
         "Standard Digital File License": ("Standard Digital File License", ""),
         "MakerWorld Exclusive License": ("MakerWorld Exclusive License", ""),
     }
@@ -1214,6 +1529,7 @@ class MakerWorldSearcher:
     @staticmethod
     def search(query, _context):
         import requests
+
         response = requests.get(
             MakerWorldSearcher.SEARCH_URL,
             params={"keyword": query, "limit": "30"},
@@ -1223,119 +1539,151 @@ class MakerWorldSearcher:
         response.raise_for_status()
         results = []
         for hit in response.json().get("hits") or []:
-            raw_license = hit.get("license", "Unknown")
-            lic_name, lic_url = MakerWorldSearcher.LICENSES.get(raw_license, (raw_license, ""))
+            lic_name, lic_url = MakerWorldSearcher.LICENSES.get(
+                hit.get("license", "Unknown"), (hit.get("license", "Unknown"), "")
+            )
             lic = _parse_license(lic_name, lic_url)
             creator = hit.get("designCreator") or {}
             model_id = hit.get("id")
-            results.append({
-                "name": hit.get("title", "Untitled"),
-                "author": creator.get("name", "Unknown"),
-                "platform": "MakerWorld",
-                "thumbnail_url": hit.get("cover", ""),
-                "license": lic["name"],
-                "license_url": lic["url"],
-                "license_summary": lic["summary"],
-                "download_url": f"{MakerWorldSearcher.BASE}/en/models/{model_id or ''}",
-                "url": f"{MakerWorldSearcher.BASE}/en/models/{model_id or ''}",
-                "_model_id": model_id,
-                "requires_auth": True,
-            })
+            results.append(
+                {
+                    "name": hit.get("title", "Untitled"),
+                    "author": creator.get("name", "Unknown"),
+                    "platform": "MakerWorld",
+                    "thumbnail_url": hit.get("cover", ""),
+                    "license": lic["name"],
+                    "license_url": lic["url"],
+                    "license_summary": lic["summary"],
+                    "download_url": f"{MakerWorldSearcher.BASE}/en/models/{model_id or ''}",
+                    "url": f"{MakerWorldSearcher.BASE}/en/models/{model_id or ''}",
+                    "_model_id": model_id,
+                    "requires_auth": True,
+                }
+            )
         return results
 
     @staticmethod
     def _profile_from_url(url):
-        match = re.search(r"#profileId[-=](\d+)", url or "", re.I)
-        return match.group(1) if match else ""
+        m = re.search(r"#profileId[-=](\d+)", url or "", re.IGNORECASE)
+        return m.group(1) if m else ""
 
     @staticmethod
-    def _design_id(model):
-        design_id = model.get("_model_id")
-        if design_id:
-            return design_id
-        match = re.search(r"/models/(\d+)", model.get("url", ""))
-        return match.group(1) if match else ""
-
-    @staticmethod
-    def _fetch_design(auth, session, design_id):
+    def _load_design(design_id, auth, session):
         response = auth.request(
-            "makerworld", "GET", f"{MakerWorldSearcher.DESIGN_BASE}/design/{design_id}",
-            session=session, timeout=30,
+            "makerworld",
+            "GET",
+            f"{MakerWorldSearcher.DESIGN_BASE}/design/{design_id}",
+            session=session,
+            timeout=30,
         )
         if response.status_code == 418:
-            raise RuntimeError("MakerWorld is challenging this request with CAPTCHA; use Open in browser and retry later")
+            raise RuntimeError(
+                "MakerWorld is challenging this request with CAPTCHA; use Open in browser and retry later"
+            )
         response.raise_for_status()
-        return response.json()
+        design = response.json()
+        if not (design.get("modelId") or design.get("model_id")):
+            raise RuntimeError("MakerWorld design metadata did not contain modelId")
+        return design
 
     @staticmethod
-    def _resolve_profile(auth, session, design_id, design, model_url):
+    def _select_profile(model_url, design_id, design, auth, session):
         profile_id = MakerWorldSearcher._profile_from_url(model_url)
         if profile_id:
             return profile_id, ""
         instances = design.get("instances") or []
         if not instances:
             response = auth.request(
-                "makerworld", "GET", f"{MakerWorldSearcher.DESIGN_BASE}/design/{design_id}/instances",
-                session=session, timeout=30,
+                "makerworld",
+                "GET",
+                f"{MakerWorldSearcher.DESIGN_BASE}/design/{design_id}/instances",
+                session=session,
+                timeout=30,
             )
             response.raise_for_status()
             payload = response.json()
             instances = payload.get("hits") or payload.get("instances") or []
-        if not instances:
-            raise RuntimeError("MakerWorld returned no printable profile for this design")
-        first = instances[0] or {}
-        profile_id = first.get("profileId") or first.get("profile_id") or first.get("id")
+        first = instances[0] if instances else {}
+        profile_id = (
+            first.get("profileId") or first.get("profile_id") or first.get("id")
+        )
         if not profile_id:
-            raise RuntimeError("MakerWorld returned a profile without an id")
+            raise RuntimeError(
+                "MakerWorld returned no printable profile for this design"
+            )
         return profile_id, first.get("title") or first.get("name") or ""
 
     @staticmethod
-    def _download_profile(auth, session, internal_model_id, profile_id, profile_title, design, design_id):
+    def _download_profile(profile_id, internal_model_id, auth, session):
+        download_api = (
+            f"https://api.bambulab.com/v1/iot-service/api/user/profile/{profile_id}"
+        )
         response = auth.request(
-            "makerworld", "GET",
-            f"https://api.bambulab.com/v1/iot-service/api/user/profile/{profile_id}",
-            session=session, params={"model_id": str(internal_model_id)}, timeout=30,
+            "makerworld",
+            "GET",
+            download_api,
+            session=session,
+            params={"model_id": str(internal_model_id)},
+            timeout=30,
         )
         if response.status_code == 401:
             raise AuthRequired("MakerWorld session expired; log in again")
-        if response.status_code == 418:
-            raise RuntimeError("MakerWorld is challenging this request with CAPTCHA; use Open in browser and retry later")
         if response.status_code == 403:
             try:
-                payload = response.json()
-                reason = payload.get("error") or payload.get("message") or "access denied"
+                body = response.json()
+                reason = body.get("error") or body.get("message") or "access denied"
             except ValueError:
                 reason = "access denied"
             raise RuntimeError(f"MakerWorld refused this profile: {reason}")
+        if response.status_code == 418:
+            raise RuntimeError(
+                "MakerWorld is challenging this request with CAPTCHA; use Open in browser and retry later"
+            )
         response.raise_for_status()
         payload = response.json()
-        body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        url = body.get("url") or body.get("downloadUrl") or body.get("download_url") or ""
-        if not url:
-            raise RuntimeError("MakerWorld download API returned no signed URL")
-        name = body.get("name") or body.get("filename") or profile_title or design.get("title") or f"makerworld_{design_id}.3mf"
-        if not os.path.splitext(name)[1]:
-            name += ".3mf"
-        return {"name": name, "url": url, "signed": True}
+        return payload.get("data") if isinstance(payload.get("data"), dict) else payload
 
     @staticmethod
     def get_files(model, auth):
         if not auth.authenticated("makerworld"):
-            raise AuthRequired("MakerWorld import requires a Bambu/MakerWorld account session")
-        design_id = MakerWorldSearcher._design_id(model)
-        if not design_id:
-            raise ValueError("MakerWorld design id is missing")
-        session = auth.session("makerworld")
-        design = MakerWorldSearcher._fetch_design(auth, session, design_id)
-        internal_model_id = design.get("modelId") or design.get("model_id")
-        if not internal_model_id:
-            raise RuntimeError("MakerWorld design metadata did not contain modelId")
-        profile_id, profile_title = MakerWorldSearcher._resolve_profile(
-            auth, session, design_id, design, model.get("url", "")
+            raise AuthRequired(
+                "MakerWorld import requires a Bambu/MakerWorld account session"
+            )
+        design_id = _model_identifier(
+            model,
+            "_model_id",
+            r"/models/(\d+)",
+            "MakerWorld design id is missing",
         )
-        return [MakerWorldSearcher._download_profile(
-            auth, session, internal_model_id, profile_id, profile_title, design, design_id
-        )]
+        session = auth.session("makerworld")
+        design = MakerWorldSearcher._load_design(design_id, auth, session)
+        internal_model_id = design.get("modelId") or design.get("model_id")
+        profile_id, profile_title = MakerWorldSearcher._select_profile(
+            model.get("url", ""),
+            design_id,
+            design,
+            auth,
+            session,
+        )
+        body = MakerWorldSearcher._download_profile(
+            profile_id, internal_model_id, auth, session
+        )
+        url = (
+            body.get("url") or body.get("downloadUrl") or body.get("download_url") or ""
+        )
+        if not url:
+            raise RuntimeError("MakerWorld download API returned no signed URL")
+        name = (
+            body.get("name")
+            or body.get("filename")
+            or profile_title
+            or design.get("title")
+            or f"makerworld_{design_id}.3mf"
+        )
+        if not os.path.splitext(name)[1]:
+            name += ".3mf"
+        return [{"name": name, "url": url, "signed": True}]
+
 
 class ThingiverseSearcher:
     BASE = "https://www.thingiverse.com"
@@ -1345,10 +1693,14 @@ class ThingiverseSearcher:
     )
     PATH_RE = r"/thing(?::|%3A)\d+"
 
-
     @staticmethod
-    def search(query, _context):
-        return _catalog_search(query, ThingiverseSearcher.SEARCH_URLS, ThingiverseSearcher.PATH_RE, "Thingiverse")
+    def search(query, context):
+        return _catalog_search(
+            query,
+            ThingiverseSearcher.SEARCH_URLS,
+            ThingiverseSearcher.PATH_RE,
+            "Thingiverse",
+        )
 
     @staticmethod
     def get_files(model, auth=None):
@@ -1360,7 +1712,7 @@ class ThingiverseSearcher:
         # parsing the model and Files pages for individual public file links.
         zip_candidate = _probe_download(url + "/zip")
         if zip_candidate:
-            m = re.search(r"thing(?::|%3A)(\d+)", url, re.I)
+            m = re.search(r"thing(?::|%3A)(\d+)", url, re.IGNORECASE)
             zip_candidate["name"] = f"thingiverse_{m.group(1) if m else 'model'}.zip"
             return [zip_candidate]
         return _public_page_files(
@@ -1378,10 +1730,11 @@ class Cults3DSearcher:
     )
     PATH_RE = r"/en/3d-model/[a-z0-9_-]+/[a-z0-9%._~+()-]+"
 
-
     @staticmethod
-    def search(query, _context):
-        items = _catalog_search(query, Cults3DSearcher.SEARCH_URLS, Cults3DSearcher.PATH_RE, "Cults3D")
+    def search(query, context):
+        items = _catalog_search(
+            query, Cults3DSearcher.SEARCH_URLS, Cults3DSearcher.PATH_RE, "Cults3D"
+        )
         for item in items:
             item["requires_auth"] = True
         return items
@@ -1392,9 +1745,13 @@ class Cults3DSearcher:
         # documented API intentionally does not expose other users' 3D files.
         # Use the user's browser session only against cults3d.com.
         if auth is None or not auth.authenticated("cults3d"):
-            raise AuthRequired("Cults3D requires a signed-in Cults account before downloading files")
+            raise AuthRequired(
+                "Cults3D requires a signed-in Cults account before downloading files"
+            )
         return _public_page_files(
-            model, auth=auth, platform_key="cults3d",
+            model,
+            auth=auth,
+            platform_key="cults3d",
             no_direct_message="Cults3D did not expose a direct file to this signed-in session. Use Open in browser for the official download/checkout flow.",
         )
 
@@ -1409,10 +1766,14 @@ class MyMiniFactorySearcher:
     )
     PATH_RE = r"/object/3d-print-[a-z0-9%._~+()-]+-\d+"
 
-
     @staticmethod
-    def search(query, _context):
-        return _catalog_search(query, MyMiniFactorySearcher.SEARCH_URLS, MyMiniFactorySearcher.PATH_RE, "MyMiniFactory")
+    def search(query, context):
+        return _catalog_search(
+            query,
+            MyMiniFactorySearcher.SEARCH_URLS,
+            MyMiniFactorySearcher.PATH_RE,
+            "MyMiniFactory",
+        )
 
     @staticmethod
     def get_files(model, auth=None):
@@ -1431,16 +1792,21 @@ class ThangsSearcher:
     )
     PATH_RE = r"/designer/[^\"'<>?#]+/3d-model/[^\"'<>?#]+"
 
-
     @staticmethod
-    def search(query, _context):
-        return _catalog_search(query, ThangsSearcher.SEARCH_URLS, ThangsSearcher.PATH_RE, "Thangs")
+    def search(query, context):
+        return _catalog_search(
+            query, ThangsSearcher.SEARCH_URLS, ThangsSearcher.PATH_RE, "Thangs"
+        )
 
     @staticmethod
     def get_files(model, auth=None):
         return _public_page_files(
             model,
-            restricted_markers=("Become a member to download", "Add download to cart", "Purchase model for"),
+            restricted_markers=(
+                "Become a member to download",
+                "Add download to cart",
+                "Purchase model for",
+            ),
             no_direct_message="Thangs did not expose a public direct file for this free model. Use Open in browser for member/paid or interactive downloads.",
         )
 
@@ -1450,10 +1816,14 @@ class CrealityCloudSearcher:
     SEARCH_URLS = (BASE + "/search/model?q={query}",)
     PATH_RE = r"/model-detail/[a-z0-9%._~+()-]+"
 
-
     @staticmethod
-    def search(query, _context):
-        return _catalog_search(query, CrealityCloudSearcher.SEARCH_URLS, CrealityCloudSearcher.PATH_RE, "Creality Cloud")
+    def search(query, context):
+        return _catalog_search(
+            query,
+            CrealityCloudSearcher.SEARCH_URLS,
+            CrealityCloudSearcher.PATH_RE,
+            "Creality Cloud",
+        )
 
     @staticmethod
     def get_files(model, auth=None):
@@ -1472,14 +1842,19 @@ class GrabcadSearcher:
     )
     PATH_RE = r"/library/[a-z0-9%._~+()-]+"
 
-
     @staticmethod
     def search(query, context):
         if not isinstance(context, AuthManager) or not context.authenticated("grabcad"):
-            raise AuthRequired("GrabCAD requires a free member account to access/download Community Library models. Connect a browser session first.")
+            raise AuthRequired(
+                "GrabCAD requires a free member account to access/download Community Library models. Connect a browser session first."
+            )
         return _catalog_search(
-            query, GrabcadSearcher.SEARCH_URLS, GrabcadSearcher.PATH_RE,
-            "GrabCAD", auth=context, auth_platform="grabcad", requires_auth=True,
+            query,
+            GrabcadSearcher.SEARCH_URLS,
+            GrabcadSearcher.PATH_RE,
+            "GrabCAD",
+            auth=context,
+            requires_auth=True,
         )
 
     @staticmethod
@@ -1494,52 +1869,65 @@ class GrabcadSearcher:
         )
 
 
-_SEARCHERS = {
-    "printables": PrintablesSearcher,
-    "nexprint": NexprintSearcher,
-    "makeronline": MakeronlineSearcher,
-    "makerworld": MakerWorldSearcher,
-    "thingiverse": ThingiverseSearcher,
-    "cults3d": Cults3DSearcher,
-    "myminifactory": MyMiniFactorySearcher,
-    "thangs": ThangsSearcher,
-    "crealitycloud": CrealityCloudSearcher,
-    "grabcad": GrabcadSearcher,
-}
+_PLATFORM_SPECS = (
+    PlatformSpec("printables", "Printables", PrintablesSearcher),
+    PlatformSpec(
+        "nexprint",
+        "Nexprint",
+        NexprintSearcher,
+        auth_hosts=("nexprint.com",),
+        auth_mode="named_cookie",
+        login_url="https://www.nexprint.com/en/account/login",
+        referer="https://www.nexprint.com/",
+        cookie_domain=".nexprint.com",
+        cookie_name="auth_token",
+    ),
+    PlatformSpec(
+        "makeronline",
+        "Makeronline",
+        MakeronlineSearcher,
+        auth_hosts=("makeronline.com", "anycubic.com"),
+        auth_mode="anycubic",
+        login_url="https://uc.makeronline.com/",
+        referer="https://www.makeronline.com/",
+    ),
+    PlatformSpec(
+        "makerworld",
+        "MakerWorld",
+        MakerWorldSearcher,
+        auth_hosts=("api.bambulab.com", "makerworld.com"),
+        auth_mode="bearer",
+        login_url="https://makerworld.com/en/sign-in",
+        referer="https://makerworld.com/",
+    ),
+    PlatformSpec("thingiverse", "Thingiverse", ThingiverseSearcher),
+    PlatformSpec(
+        "cults3d",
+        "Cults3D",
+        Cults3DSearcher,
+        auth_hosts=("cults3d.com",),
+        auth_mode="cookie_header",
+        login_url="https://cults3d.com/en/users/sign_in",
+        referer="https://cults3d.com/",
+        cookie_domain=".cults3d.com",
+    ),
+    PlatformSpec("myminifactory", "MyMiniFactory", MyMiniFactorySearcher),
+    PlatformSpec("thangs", "Thangs", ThangsSearcher),
+    PlatformSpec("crealitycloud", "Creality Cloud", CrealityCloudSearcher),
+    PlatformSpec(
+        "grabcad",
+        "GrabCAD",
+        GrabcadSearcher,
+        auth_hosts=("grabcad.com",),
+        auth_mode="cookie_header",
+        login_url="https://login.grabcad.com/login",
+        referer="https://grabcad.com/library",
+        cookie_domain=".grabcad.com",
+    ),
+)
+_PLATFORMS.update((spec.key, spec) for spec in _PLATFORM_SPECS)
+_PLATFORMS_BY_DISPLAY.update((spec.display, spec) for spec in _PLATFORM_SPECS)
 
-
-def _platform_key_for_model(model):
-    key = str(model.get("_platform_key") or "")
-    if key in _SEARCHERS:
-        return key
-    return _PLATFORM_KEY_BY_DISPLAY.get(model.get("platform", ""), "")
-
-
-def _normalize_download_files(files):
-    normalized = []
-    for index, item in enumerate(files or []):
-        if not isinstance(item, dict) or not item.get("url"):
-            continue
-        normalized.append({
-            "url": item.get("url", ""),
-            "name": item.get("name") or f"model_{index + 1}.3mf",
-        })
-    return normalized
-
-
-def _selected_file_indices(values):
-    selected = []
-    seen = set()
-    for value in values or []:
-        index = int(value)
-        if index >= 0 and index not in seen:
-            seen.add(index)
-            selected.append(index)
-    return selected
-
-
-# ---------------------------------------------------------------------------
-# Orca import and download helpers
 
 # ---------------------------------------------------------------------------
 # Orca import and download helpers
@@ -1548,15 +1936,18 @@ def _selected_file_indices(values):
 
 def _current_orca_executable():
     """Return the executable of the OrcaSlicer process hosting this plugin."""
+    candidate = os.path.realpath(sys.executable or "")
     try:
         if os.name == "nt":
             import ctypes
+
             buf = ctypes.create_unicode_buffer(32768)
             length = ctypes.windll.kernel32.GetModuleFileNameW(None, buf, len(buf))
             if length:
                 return os.path.realpath(buf.value)
         elif sys.platform == "darwin":
             import ctypes
+
             libc = ctypes.CDLL(None)
             size = ctypes.c_uint32(0)
             libc._NSGetExecutablePath(None, ctypes.byref(size))
@@ -1571,9 +1962,8 @@ def _current_orca_executable():
             proc_exe = "/proc/self/exe"
             if os.path.exists(proc_exe):
                 return os.path.realpath(proc_exe)
-    except Exception:
-        pass
-    candidate = os.path.realpath(sys.executable or "")
+    except (AttributeError, OSError, TypeError, ValueError):
+        return candidate if candidate and os.path.isfile(candidate) else ""
     return candidate if candidate and os.path.isfile(candidate) else ""
 
 
@@ -1639,7 +2029,10 @@ def _send_windows_instance_message(executable, paths):
             if pid.value != current_pid:
                 return True
             class_buf = ctypes.create_unicode_buffer(256)
-            if not get_class_name(hwnd, class_buf, len(class_buf)) or class_buf.value != "wxWindowNR":
+            if (
+                not get_class_name(hwnd, class_buf, len(class_buf))
+                or class_buf.value != "wxWindowNR"
+            ):
                 return True
             minor = get_prop(hwnd, "Instance_Hash_Minor")
             major = get_prop(hwnd, "Instance_Hash_Major")
@@ -1658,8 +2051,10 @@ def _send_windows_instance_message(executable, paths):
         enum_windows.restype = wintypes.BOOL
         if not enum_windows(enum_proc, 0):
             last_error = int(get_last_error())
-            if last_error:
-                return False, f"could not enumerate OrcaSlicer windows (Win32 error {last_error})"
+            return (
+                False,
+                f"could not enumerate OrcaSlicer windows (Win32 error {last_error})",
+            )
         if not candidates:
             return False, "could not find the current OrcaSlicer main window"
         candidates.sort(reverse=True)
@@ -1681,12 +2076,35 @@ def _send_windows_instance_message(executable, paths):
             ctypes.cast(payload_buf, wintypes.LPVOID),
         )
         WM_COPYDATA = 0x004A
-        send_message = user32.SendMessageW
-        send_message.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-        send_message.restype = ctypes.c_ssize_t
-        send_message(hwnd, WM_COPYDATA, 0, ctypes.addressof(data))
+        send_message = user32.SendMessageTimeoutW
+        send_message.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        send_message.restype = wintypes.LPARAM
+        result = ctypes.c_size_t(0)
+        SMTO_ABORTIFHUNG = 0x0002
+        if not send_message(
+            hwnd,
+            WM_COPYDATA,
+            0,
+            ctypes.addressof(data),
+            SMTO_ABORTIFHUNG,
+            10000,
+            ctypes.byref(result),
+        ):
+            error = int(get_last_error())
+            return (
+                False,
+                f"OrcaSlicer main window did not accept the import message (Win32 error {error})",
+            )
         return True, ""
-    except Exception as exc:
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
         return False, f"Windows OrcaSlicer import handoff failed: {exc}"
 
 
@@ -1716,14 +2134,15 @@ def _load_in_orca(paths):
         return _send_windows_instance_message(executable, normalized)
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.run(  # nosec B603
             [executable, *normalized],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
             timeout=20,
+            check=False,
         )
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         return False, f"OrcaSlicer import handoff failed: {exc}"
     if proc.returncode != 0:
         detail = (proc.stderr or "").strip().replace("\n", " ")[:400]
@@ -1731,6 +2150,20 @@ def _load_in_orca(paths):
     return True, ""
 
 
+_LOADABLE_MODEL_EXTS = (
+    ".3mf",
+    ".stl",
+    ".obj",
+    ".step",
+    ".stp",
+    ".iges",
+    ".igs",
+    ".amf",
+    ".ply",
+    ".scad",
+    ".fcstd",
+    ".f3d",
+)
 
 
 def _expand_archives(paths, dest_dir):
@@ -1755,12 +2188,19 @@ def _expand_archives(paths, dest_dir):
                 member_ext = os.path.splitext(member.filename)[1].lower()
                 if member_ext not in _LOADABLE_MODEL_EXTS:
                     continue
-                if member.file_size > 500 * 1024 * 1024:
-                    raise RuntimeError("Archive contains a model file larger than 500 MB")
+                if member.file_size > _MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError(
+                        "Archive contains a model file larger than 500 MB"
+                    )
                 extracted_total += member.file_size
-                if extracted_total > 1024 * 1024 * 1024:
+                if extracted_total > _MAX_ARCHIVE_BYTES:
                     raise RuntimeError("Archive extraction exceeds 1 GB safety limit")
-                target = _unique_path(dest_dir, _safe_filename(os.path.basename(member.filename), "model" + member_ext))
+                target = _unique_path(
+                    dest_dir,
+                    _safe_filename(
+                        os.path.basename(member.filename), "model" + member_ext
+                    ),
+                )
                 with archive.open(member, "r") as src, open(target, "wb") as dst:
                     while True:
                         chunk = src.read(262144)
@@ -1770,6 +2210,31 @@ def _expand_archives(paths, dest_dir):
                 loadable.append(target)
     return loadable
 
+
+def _write_download_response(response, path):
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "text/html" in content_type or "application/xhtml" in content_type:
+        raise RuntimeError(
+            "Platform returned an HTML/login page instead of a model file"
+        )
+    declared_size = response.headers.get("content-length")
+    if declared_size:
+        try:
+            if int(declared_size) > _MAX_DOWNLOAD_BYTES:
+                raise RuntimeError("Download exceeds 500 MB safety limit")
+        except ValueError:
+            pass
+    total = 0
+    with open(path, "wb") as fh:
+        for chunk in response.iter_content(chunk_size=262144):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > _MAX_DOWNLOAD_BYTES:
+                raise RuntimeError("Download exceeds 500 MB safety limit")
+            fh.write(chunk)
+
+
 def _download_stream(url, name, dest_dir, auth, platform):
     import requests
 
@@ -1778,36 +2243,41 @@ def _download_stream(url, name, dest_dir, auth, platform):
     _reject_obvious_local_target(url)
     _ensure_private_dir(dest_dir)
     path = _unique_path(dest_dir, _safe_filename(name))
-    session = auth.session(platform) if platform in _PLATFORM_HOSTS else requests.Session()
-    response = auth.request(
-        platform, "GET", url, session=session, stream=True, timeout=180, allow_redirects=True
-    )
+    session = auth.session(platform)
+    response = None
     try:
-        if response.status_code in (401, 403) and platform in _PLATFORM_HOSTS:
-            raise AuthRequired(f"{_PLATFORM_DISPLAY.get(platform, platform)} session was rejected while downloading")
+        response = auth.request(
+            platform,
+            "GET",
+            url,
+            session=session,
+            stream=True,
+            timeout=180,
+            allow_redirects=True,
+        )
+        spec = _platform(platform)
+        if (
+            response.status_code in (401, 403)
+            and spec is not None
+            and spec.requires_auth
+        ):
+            raise AuthRequired(
+                f"{_display_name(platform)} session was rejected while downloading"
+            )
         response.raise_for_status()
-        content_type = (response.headers.get("content-type") or "").lower()
-        if "text/html" in content_type or "application/xhtml" in content_type:
-            raise RuntimeError("Platform returned an HTML/login page instead of a model file")
-        total = 0
-        with open(path, "wb") as fh:
-            for chunk in response.iter_content(chunk_size=262144):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > 500 * 1024 * 1024:
-                    raise RuntimeError("Download exceeds 500 MB safety limit")
-                fh.write(chunk)
-    except Exception:
-        with suppress(OSError):
+        _write_download_response(response, path)
+    except (OSError, RuntimeError, requests.RequestException):
+        try:
             os.remove(path)
+        except OSError:
+            pass
         raise
     finally:
-        response.close()
-        close_session = getattr(session, "close", None)
-        if callable(close_session):
-            close_session()
+        if response is not None:
+            response.close()
+        session.close()
     return path
+
 
 # ---------------------------------------------------------------------------
 # Web UI
@@ -1869,9 +2339,10 @@ button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search
 </div>
 <div id="status">Ready.</div>
 <script>
-var selectedModel=null, searching=false, authPlatform=null, authStates={}, pendingImport=null;
+var selectedModel=null, searching=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[];
 var $=function(id){return document.getElementById(id)};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
+function safeUrl(s){try{var u=new URL(String(s||''));return(u.protocol==='http:'||u.protocol==='https:')?u.href:''}catch(e){return''}}
 function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',MyMiniFactory:'myminifactory',Thangs:'thangs','Creality Cloud':'crealitycloud',GrabCAD:'grabcad'}[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
 function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
@@ -1884,9 +2355,9 @@ function setAllPortals(value){document.querySelectorAll('.portal-search').forEac
 $('search-portals').addEventListener('change',function(e){if(e.target&&e.target.classList.contains('portal-search')){updatePortalCount();savePortalSelection()}});
 function doSearch(){if(searching)return;var q=$('query').value.trim();if(!q)return;var ps=selectedPortals();if(!ps.length){$('status').textContent='Select at least one search portal.';return}searching=true;$('search-btn').disabled=true;$('search-btn').textContent='Searching...';$('status').textContent='Searching '+ps.length+' portal(s)...';closeDetail();orca.postMessage({action:'search',query:q,platforms:ps})}
 $('query').addEventListener('keydown',function(e){if(e.key==='Enter')doSearch()});
-function renderResults(models){window._results=models||[];var html='';window._results.forEach(function(m,i){html+='<div class="card" data-idx="'+i+'"><img src="'+esc(m.thumbnail_url||'')+'"><h3 title="'+esc(m.name)+'">'+esc(m.name)+'</h3><div class="author">'+esc(m.author)+' · '+esc(m.platform)+'</div><span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span></div>'});$('results').innerHTML=html;$('status').textContent=window._results.length+' result(s)'}
+function renderResults(models){window._results=models||[];var html='';window._results.forEach(function(m,i){html+='<div class="card" data-idx="'+i+'"><img src="'+esc(safeUrl(m.thumbnail_url))+'"><h3 title="'+esc(m.name)+'">'+esc(m.name)+'</h3><div class="author">'+esc(m.author)+' · '+esc(m.platform)+'</div><span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span></div>'});$('results').innerHTML=html;$('status').textContent=window._results.length+' result(s)'}
 $('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)showDetail(m,true)});
-function showDetail(m,open){selectedModel=m;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span>';$('det-summary').textContent=m.license_summary||'No license information available.';$('det-url').innerHTML=m.url?'<strong>Model page:</strong> <a href="'+esc(m.url)+'">'+esc(m.url)+'</a>':'';var b=$('det-import-btn');b.disabled=false;b.textContent=(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
+function showDetail(m,open){selectedModel=m;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span>';$('det-summary').textContent=m.license_summary||'No license information available.';var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=false;b.textContent=(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
 function closeDetail(){$('detail').classList.remove('active')}
 document.addEventListener('pointerdown',function(e){var d=$('detail');if(!d||!d.classList.contains('active'))return;if(d.contains(e.target))return;closeDetail()},true);
 $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;e.preventDefault();openExternal(a.getAttribute('href'))});
@@ -1897,10 +2368,10 @@ function doImport(){if(!selectedModel)return;if(selectedModel.requires_auth&&!is
 function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':'Session/access token (alternative)';$('auth-note').textContent=p==='makerworld'?'Use Bambu email/password or paste an existing Bambu Cloud access token. MFA verification codes are supported.':p==='nexprint'?'Sign in on the official Nexprint site, then paste the auth_token session cookie. The plugin never asks for or stores your Nexprint password.':p==='grabcad'?'GrabCAD Community Library downloads require membership. Sign in on the official GrabCAD page, then paste the Cookie request header (or the session cookie string). The plugin never asks for your GrabCAD password.':p==='cults3d'?'Cults3D requires an account even for free downloads. Sign in on the official Cults3D page, then paste the Cookie request header/session cookies. The plugin never asks for your Cults3D password.':'Makeronline no longer uses the legacy direct password endpoint. Sign in with Anycubic Slicer Next and click Import from Anycubic Slicer Next, or paste an existing access token.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
 function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
 function closeAuth(){$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
-function closeFilePicker(){$('file-modal').classList.remove('active');syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
+function closeFilePicker(){$('file-modal').classList.remove('active');pendingFiles=[];syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
 function closeTopModal(){if($('file-modal').classList.contains('active'))closeFilePicker();else closeAuth()}
 function updateFileCount(){var all=document.querySelectorAll('#file-list input[type=checkbox]');var checked=document.querySelectorAll('#file-list input[type=checkbox]:checked');$('file-count').textContent=checked.length+' / '+all.length+' selected';$('file-import').disabled=checked.length===0}
-function showFilePicker(files){var html='';(files||[]).forEach(function(f){html+='<label class="file-choice"><input type="checkbox" checked value="'+Number(f.index)+'" onchange="updateFileCount()"><span>'+esc(f.name||('File '+(Number(f.index)+1)))+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
+function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){html+='<label class="file-choice"><input type="checkbox" checked value="'+Number(f.index)+'" onchange="updateFileCount()"><span>'+esc(f.name||('File '+(Number(f.index)+1)))+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
 function setAllFiles(value){document.querySelectorAll('#file-list input[type=checkbox]').forEach(function(x){x.checked=!!value});updateFileCount()}
 function confirmFileImport(){var selected=[];document.querySelectorAll('#file-list input[type=checkbox]:checked').forEach(function(x){selected.push(parseInt(x.value,10))});if(!selected.length)return;$('file-import').disabled=true;$('status').textContent='Downloading selected files...';$('file-modal').classList.remove('active');syncBackdrop();orca.postMessage({action:'import_selected',indices:selected})}
 function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
@@ -1954,147 +2425,251 @@ if orca is not None:
                 self.win.post(msg)
 
         def _post_auth(self, action="auth_status", message=""):
-            self._post({"action": action, "states": self.auth.status(), "message": message})
+            self._post(
+                {"action": action, "states": self.auth.status(), "message": message}
+            )
 
         @staticmethod
-        def _spawn(target, *args):
+        def _start(target, *args):
             threading.Thread(target=target, args=args, daemon=True).start()
 
         def on_message(self, msg):
             msg = msg or {}
-            action = msg.get("action", "")
-            if action == "auth_status":
-                self._post_auth()
-                return
-            if action == "auth_logout":
-                self.auth.logout(msg.get("platform", ""))
-                self._post_auth("auth_changed", "Session removed.")
-                return
-            if action == "auth_open_login":
-                url = _AUTH_LOGIN_URL.get(msg.get("platform", ""), "")
-                if url:
-                    self._spawn(self._open_external, url)
-                return
+            handler = {
+                "search": self._handle_search,
+                "resolve_import": self._handle_resolve_import,
+                "import_selected": self._handle_import_selected,
+                "open_external": self._handle_open_external,
+                "auth_status": self._handle_auth_status,
+                "auth_login": self._handle_auth_login,
+                "auth_logout": self._handle_auth_logout,
+                "auth_open_login": self._handle_auth_open_login,
+                "auth_import_anycubic": self._handle_auth_import_anycubic,
+            }.get(msg.get("action", ""))
+            if handler is not None:
+                handler(msg)
 
-            background = {
-                "search": (self._do_search, msg),
-                "import_selected": (self._import_selected, msg.get("indices") or []),
-                "open_external": (self._open_external, msg.get("url", "")),
-                "auth_login": (self._do_auth_login, msg),
-                "auth_import_anycubic": (self._do_import_anycubic,),
+        def _handle_search(self, msg):
+            self._start(self._do_search, msg)
+
+        def _handle_resolve_import(self, msg):
+            model = msg.get("model") or {}
+            if model:
+                self._start(self._resolve_import, model)
+
+        def _handle_import_selected(self, msg):
+            self._start(self._import_selected, msg.get("indices") or [])
+
+        def _handle_open_external(self, msg):
+            self._start(self._open_external, msg.get("url", ""))
+
+        def _handle_auth_status(self, _msg):
+            self._post_auth()
+
+        def _handle_auth_login(self, msg):
+            self._start(self._do_auth_login, msg)
+
+        def _handle_auth_logout(self, msg):
+            platform = msg.get("platform", "")
+            spec = _platform(platform)
+            if spec is not None and spec.requires_auth:
+                self.auth.logout(platform)
+            self._post_auth("auth_changed", "Session removed.")
+
+        def _handle_auth_open_login(self, msg):
+            spec = _platform(msg.get("platform", ""))
+            if spec is not None and spec.login_url:
+                self._start(self._open_external, spec.login_url)
+
+        def _handle_auth_import_anycubic(self, _msg):
+            self._start(self._do_import_anycubic)
+
+        @staticmethod
+        def _token_login_error(platform):
+            messages = {
+                "makeronline": (
+                    "Makeronline direct email/password login is no longer supported. "
+                    "Import the Anycubic Slicer Next session or paste an access token."
+                ),
+                "nexprint": "Nexprint login requires auth_token from the official signed-in browser session",
+                "cults3d": "Cults3D requires session cookies from the official signed-in browser session",
+                "grabcad": "GrabCAD requires session cookies from the official signed-in browser session",
             }
-            if action == "resolve_import":
-                model = msg.get("model") or {}
-                if model:
-                    self._spawn(self._resolve_import, model)
+            return messages.get(platform, "Unknown platform")
+
+        def _save_login(self, msg):
+            platform = msg.get("platform", "")
+            token = (msg.get("token") or "").strip()
+            email = (msg.get("email") or "").strip()
+            if token:
+                self.auth.save_token(
+                    platform, token, label=email or "Connected session"
+                )
                 return
-            task = background.get(action)
-            if task:
-                self._spawn(*task)
+            if platform == "makerworld":
+                self.auth.login_makerworld(
+                    email,
+                    password=msg.get("password"),
+                    code=(msg.get("code") or "").strip(),
+                )
+                return
+            raise AuthError(self._token_login_error(platform))
 
         def _do_auth_login(self, msg):
+            import requests
+
             platform = msg.get("platform", "")
+            # Never log the incoming message: it may contain a password/token.
             try:
-                if platform not in _AUTH_TOKEN_FIELD:
-                    raise AuthError("Unknown platform")
-                token = (msg.get("token") or "").strip()
-                email = (msg.get("email") or "").strip()
-                code = (msg.get("code") or "").strip()
-                if token:
-                    self.auth.save_token(platform, token, label=email or "Connected session")
-                elif platform == "makerworld":
-                    self.auth.login_makerworld(email, password=msg.get("password") or "", code=code)
-                else:
-                    raise AuthError(_TOKEN_ONLY_AUTH_ERROR[platform])
+                self._save_login(msg)
             except VerificationRequired as exc:
-                self._post({"action": "auth_challenge", "platform": platform, "message": str(exc)})
+                self._post(
+                    {
+                        "action": "auth_challenge",
+                        "platform": platform,
+                        "message": str(exc),
+                    }
+                )
                 return
-            except Exception as exc:
+            except (AuthError, OSError, ValueError, requests.RequestException) as exc:
                 self._post({"action": "error", "message": str(exc)})
                 return
             finally:
-                msg["password"] = ""
-                msg["token"] = ""
-            self._post_auth("auth_changed", f"{_PLATFORM_DISPLAY.get(platform, platform)} session connected.")
+                # Drop references to secrets promptly.
+                msg.pop("password", None)
+                msg.pop("token", None)
+            self._post_auth(
+                "auth_changed", f"{_display_name(platform)} session connected."
+            )
 
         def _do_import_anycubic(self):
             try:
                 data = self.auth.import_anycubic_slicer_token()
-            except Exception as exc:
+            except (AuthError, OSError, ValueError) as exc:
                 self._post({"action": "error", "message": str(exc)})
                 return
-            self._post_auth("auth_changed", f"Imported Anycubic session from {data.get('source', 'Anycubic Slicer Next')}.")
+            self._post_auth(
+                "auth_changed",
+                f"Imported Anycubic session from {data.get('source', 'Anycubic Slicer Next')}.",
+            )
 
         def _do_search(self, msg):
             query = msg.get("query", "")
             results = []
             errors = []
             for platform in dict.fromkeys(msg.get("platforms", [])):
-                adapter = _SEARCHERS.get(platform)
-                if not adapter:
+                spec = _platform(platform)
+                if spec is None:
                     continue
                 try:
-                    items = adapter.search(query, self.auth)
+                    items = spec.adapter.search(query, self.auth)
                     for item in items:
-                        item["_platform_key"] = platform
-                        item["authenticated"] = (not item.get("requires_auth")) or self.auth.authenticated(platform)
-                        item["importable"] = callable(getattr(adapter, "get_files", None))
+                        item["_platform_key"] = spec.key
+                        item["authenticated"] = not item.get(
+                            "requires_auth"
+                        ) or self.auth.authenticated(spec.key)
+                        item["importable"] = callable(
+                            getattr(spec.adapter, "get_files", None)
+                        )
                     results.extend(items)
-                except Exception as exc:
+                except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
                     errors.append(f"{platform}: {exc}")
             self._post({"action": "results", "results": results})
             if errors:
                 self._post({"action": "status", "message": " | ".join(errors)})
 
-        def _resolver_for_model(self, model):
-            platform_key = _platform_key_for_model(model)
-            adapter = _SEARCHERS.get(platform_key)
-            resolver = getattr(adapter, "get_files", None) if adapter is not None else None
-            return platform_key, resolver if callable(resolver) else None
-
-        def _post_auth_required(self, platform_key, platform_name, model, message):
-            self._post({
-                "action": "auth_required",
-                "platform": platform_key,
-                "message": message,
-                "model": model,
-            })
-
         def _resolve_import(self, model):
-            platform_key, resolver = self._resolver_for_model(model)
-            platform_name = _PLATFORM_DISPLAY.get(platform_key, model.get("platform", ""))
-            if resolver is None:
-                self._post({"action": "error", "message": f"Import is not supported for {platform_name or 'this platform'}"})
+            platform_name = model.get("platform", "")
+            spec = _platform_for_model(model)
+            if spec is None:
+                self._post(
+                    {
+                        "action": "error",
+                        "message": f"Import is not supported for {platform_name or 'this platform'}",
+                    }
+                )
                 return
-            if model.get("requires_auth") and not self.auth.authenticated(platform_key):
-                self._post_auth_required(platform_key, platform_name, model, f"Log in to {platform_name} before importing.")
+            if model.get("requires_auth") and not self.auth.authenticated(spec.key):
+                self._post(
+                    {
+                        "action": "auth_required",
+                        "platform": spec.key,
+                        "message": f"Log in to {platform_name} before importing.",
+                        "model": model,
+                    }
+                )
                 return
-            try:
-                normalized = _normalize_download_files(resolver(model, self.auth))
-            except AuthRequired as exc:
-                self.auth.logout(platform_key)
-                self._post_auth("auth_changed", f"{platform_name} session expired.")
-                self._post_auth_required(platform_key, platform_name, model, str(exc))
+            files = self._list_model_files(spec, model)
+            if files is None:
                 return
-            except BrowserRequired as exc:
-                self._post({"action": "browser_required", "message": str(exc), "url": exc.url or model.get("url", "")})
-                return
-            except Exception as exc:
-                self._post({"action": "error", "message": f"Could not list files: {exc}"})
-                return
+            normalized = _normalize_download_files(files)
             if not normalized:
-                self._post({"action": "error", "message": "The platform returned no valid downloadable file URLs."})
+                self._post(
+                    {
+                        "action": "error",
+                        "message": "The platform returned no valid downloadable file URLs.",
+                    }
+                )
                 return
+            self._begin_import(model, normalized)
+
+        def _list_model_files(self, spec, model):
+            platform_name = spec.display
+            try:
+                files = spec.adapter.get_files(model, self.auth)
+            except AuthRequired as exc:
+                self.auth.logout(spec.key)
+                self._post_auth("auth_changed", f"{platform_name} session expired.")
+                self._post(
+                    {
+                        "action": "auth_required",
+                        "platform": spec.key,
+                        "message": str(exc),
+                        "model": model,
+                    }
+                )
+                return None
+            except BrowserRequired as exc:
+                self._post(
+                    {
+                        "action": "browser_required",
+                        "message": str(exc),
+                        "url": exc.url or model.get("url", ""),
+                    }
+                )
+                return None
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+                self._post(
+                    {"action": "error", "message": f"Could not list files: {exc}"}
+                )
+                return None
+            if not files:
+                self._post(
+                    {
+                        "action": "error",
+                        "message": "No downloadable files were returned by the platform.",
+                    }
+                )
+                return None
+            return files
+
+        def _begin_import(self, model, normalized):
             if len(normalized) == 1:
                 self._download_and_import(model, normalized)
                 return
+
             with self._pending_import_lock:
                 self._pending_import_model = dict(model)
                 self._pending_import_files = normalized
-            self._post({
-                "action": "file_choices",
-                "files": [{"index": index, "name": item["name"]} for index, item in enumerate(normalized)],
-            })
+            self._post(
+                {
+                    "action": "file_choices",
+                    "files": [
+                        {"index": i, "name": item["name"]}
+                        for i, item in enumerate(normalized)
+                    ],
+                }
+            )
 
         def _import_selected(self, indices):
             try:
@@ -2102,76 +2677,141 @@ if orca is not None:
             except (TypeError, ValueError):
                 self._post({"action": "error", "message": "Invalid file selection."})
                 return
+
             with self._pending_import_lock:
                 model = self._pending_import_model
                 files = list(self._pending_import_files)
                 self._pending_import_model = None
                 self._pending_import_files = []
             if not model or not files:
-                self._post({"action": "error", "message": "File selection expired. Press Import again to refresh the file list."})
+                self._post(
+                    {
+                        "action": "error",
+                        "message": "File selection expired. Press Import again to refresh the file list.",
+                    }
+                )
                 return
-            selected = [files[index] for index in selected_indices if index < len(files)]
+            selected = [files[i] for i in selected_indices if i < len(files)]
             if not selected:
-                self._post({"action": "error", "message": "Select at least one file to import."})
+                self._post(
+                    {
+                        "action": "error",
+                        "message": "Select at least one file to import.",
+                    }
+                )
                 return
             self._download_and_import(model, selected)
 
         def _download_and_import(self, model, files):
+            import requests
+
             platform_name = model.get("platform", "")
-            platform_key = _platform_key_for_model(model)
+            spec = _platform_for_model(model)
+            platform_key = spec.key if spec is not None else ""
             dest_dir = _download_dir()
             try:
                 _ensure_private_dir(dest_dir)
             except OSError as exc:
-                self._post({"action": "error", "message": f"Cannot create download directory {dest_dir}: {exc}"})
+                self._post(
+                    {
+                        "action": "error",
+                        "message": f"Cannot create download directory {dest_dir}: {exc}",
+                    }
+                )
                 return
 
             paths = []
             for index, item in enumerate(files, 1):
                 name = item.get("name") or f"model_{index}.3mf"
-                self._post({"action": "status", "message": f"Downloading {index}/{len(files)}: {name}"})
+                self._post(
+                    {
+                        "action": "status",
+                        "message": f"Downloading {index}/{len(files)}: {name}",
+                    }
+                )
                 try:
-                    paths.append(_download_stream(item.get("url", ""), name, dest_dir, self.auth, platform_key))
+                    paths.append(
+                        _download_stream(
+                            item.get("url", ""), name, dest_dir, self.auth, platform_key
+                        )
+                    )
                 except AuthRequired as exc:
                     self.auth.logout(platform_key)
                     self._post_auth("auth_changed", f"{platform_name} session expired.")
-                    self._post({"action": "auth_required", "platform": platform_key, "message": str(exc), "model": model})
+                    self._post(
+                        {
+                            "action": "auth_required",
+                            "platform": platform_key,
+                            "message": str(exc),
+                            "model": model,
+                        }
+                    )
                     return
-                except Exception as exc:
+                except (
+                    OSError,
+                    ValueError,
+                    RuntimeError,
+                    requests.RequestException,
+                ) as exc:
                     self._post({"action": "error", "message": f"{name}: {exc}"})
                     return
 
             try:
                 load_paths = _expand_archives(paths, dest_dir)
-            except Exception as exc:
-                self._post({"action": "error", "message": f"Downloaded files, but archive extraction failed: {exc}"})
+            except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+                self._post(
+                    {
+                        "action": "error",
+                        "message": f"Downloaded files, but archive extraction failed: {exc}",
+                    }
+                )
                 return
             if not load_paths:
-                self._post({"action": "downloaded_only", "count": len(paths), "dir": dest_dir,
-                            "message": "No directly loadable STL/3MF/CAD file was found in the download."})
+                self._post(
+                    {
+                        "action": "downloaded_only",
+                        "count": len(paths),
+                        "dir": dest_dir,
+                        "message": "No directly loadable STL/3MF/CAD file was found in the download.",
+                    }
+                )
                 return
 
-            self._post({"action": "status", "message": f"Adding {len(load_paths)} file(s) to the current OrcaSlicer project..."})
+            self._post(
+                {
+                    "action": "status",
+                    "message": f"Adding {len(load_paths)} file(s) to the current OrcaSlicer project...",
+                }
+            )
             ok, detail = _load_in_orca(load_paths)
             if ok:
-                self._post({"action": "imported", "count": len(load_paths), "dir": dest_dir})
+                self._post(
+                    {"action": "imported", "count": len(load_paths), "dir": dest_dir}
+                )
             else:
-                self._post({"action": "downloaded_only", "count": len(load_paths), "dir": dest_dir, "message": detail})
+                self._post(
+                    {
+                        "action": "downloaded_only",
+                        "count": len(load_paths),
+                        "dir": dest_dir,
+                        "message": detail,
+                    }
+                )
 
         def _open_external(self, url):
             if not _is_http_url(url):
-                self._post({"action": "error", "message": "Refusing to open non-HTTP URL."})
+                self._post(
+                    {"action": "error", "message": "Refusing to open non-HTTP URL."}
+                )
                 return
             try:
-                if sys.platform == "darwin":
-                    subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                elif os.name == "nt":
-                    os.startfile(url)
-                else:
-                    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if not webbrowser.open(url, new=2):
+                    raise RuntimeError("No system browser accepted the URL")
                 self._post({"action": "opened", "url": url})
-            except Exception as exc:
-                self._post({"action": "error", "message": f"Could not open browser: {exc}"})
+            except (OSError, RuntimeError) as exc:
+                self._post(
+                    {"action": "error", "message": f"Could not open browser: {exc}"}
+                )
 
     @_orca.plugin
     class SearchEnginePlugin(_orca.base):

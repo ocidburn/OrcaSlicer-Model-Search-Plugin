@@ -44,7 +44,9 @@ def load_module():
         def success():
             return "success"
 
-    fake.script = types.SimpleNamespace(ScriptPluginCapabilityBase=ScriptPluginCapabilityBase)
+    fake.script = types.SimpleNamespace(
+        ScriptPluginCapabilityBase=ScriptPluginCapabilityBase
+    )
     fake.base = Base
     fake.ExecutionResult = ExecutionResult
     fake.host = types.SimpleNamespace(ui=FakeUI())
@@ -53,7 +55,9 @@ def load_module():
     previous = sys.modules.get("orca")
     sys.modules["orca"] = fake
     try:
-        spec = importlib.util.spec_from_file_location("search_engine_import_flow", os.path.join(HERE, "search_engine.py"))
+        spec = importlib.util.spec_from_file_location(
+            "search_engine_import_flow", os.path.join(HERE, "search_engine.py")
+        )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     finally:
@@ -69,9 +73,13 @@ class ImportHandoffTests(unittest.TestCase):
         mod = load_module()
         with tempfile.NamedTemporaryFile(suffix=".stl") as fh:
             completed = types.SimpleNamespace(returncode=0, stderr="")
-            with mock.patch.object(mod, "_current_orca_executable", return_value="/opt/OrcaSlicer"), \
-                 mock.patch.object(mod.os, "name", "posix"), \
-                 mock.patch.object(mod.subprocess, "run", return_value=completed) as run:
+            with (
+                mock.patch.object(
+                    mod, "_current_orca_executable", return_value="/opt/OrcaSlicer"
+                ),
+                mock.patch.object(mod.os, "name", "posix"),
+                mock.patch.object(mod.subprocess, "run", return_value=completed) as run,
+            ):
                 ok, detail = mod._load_in_orca([fh.name])
         self.assertTrue(ok)
         self.assertEqual(detail, "")
@@ -82,11 +90,19 @@ class ImportHandoffTests(unittest.TestCase):
 
     def test_windows_handoff_uses_native_ipc_without_spawning_orca(self):
         mod = load_module()
-        with tempfile.NamedTemporaryFile(suffix=".stl") as fh, \
-             mock.patch.object(mod, "_current_orca_executable", return_value=r"C:\Program Files\OrcaSlicer\OrcaSlicer.exe"), \
-             mock.patch.object(mod.os, "name", "nt"), \
-             mock.patch.object(mod, "_send_windows_instance_message", return_value=(True, "")) as send, \
-             mock.patch.object(mod.subprocess, "run") as run:
+        with (
+            tempfile.NamedTemporaryFile(suffix=".stl") as fh,
+            mock.patch.object(
+                mod,
+                "_current_orca_executable",
+                return_value=r"C:\Program Files\OrcaSlicer\OrcaSlicer.exe",
+            ),
+            mock.patch.object(mod.os, "name", "nt"),
+            mock.patch.object(
+                mod, "_send_windows_instance_message", return_value=(True, "")
+            ) as send,
+            mock.patch.object(mod.subprocess, "run") as run,
+        ):
             ok, detail = mod._load_in_orca([fh.name])
         self.assertTrue(ok)
         self.assertEqual(detail, "")
@@ -95,12 +111,18 @@ class ImportHandoffTests(unittest.TestCase):
 
     def test_escape_strings_cstyle_matches_orca_argv_format(self):
         mod = load_module()
-        payload = mod._escape_strings_cstyle([r"C:\Program Files\OrcaSlicer.exe", r"C:\Models\part one.stl"])
-        self.assertEqual(payload, r'"C:\\Program Files\\OrcaSlicer.exe";"C:\\Models\\part one.stl"')
+        payload = mod._escape_strings_cstyle(
+            [r"C:\Program Files\OrcaSlicer.exe", r"C:\Models\part one.stl"]
+        )
+        self.assertEqual(
+            payload, r'"C:\\Program Files\\OrcaSlicer.exe";"C:\\Models\\part one.stl"'
+        )
 
     def test_load_in_orca_rejects_missing_file(self):
         mod = load_module()
-        ok, detail = mod._load_in_orca([os.path.join(tempfile.gettempdir(), "definitely-missing-model.stl")])
+        ok, detail = mod._load_in_orca(
+            [os.path.join(tempfile.gettempdir(), "definitely-missing-model.stl")]
+        )
         self.assertFalse(ok)
         self.assertIn("no longer exists", detail)
 
@@ -112,10 +134,6 @@ class MultiFileSelectionTests(unittest.TestCase):
         action.win = FakeWindow()
         return mod, action
 
-    @staticmethod
-    def adapter(resolver):
-        return types.SimpleNamespace(get_files=resolver)
-
     def test_multiple_resolved_files_show_checkbox_choices_before_download(self):
         mod, action = self.make_action()
         model = {"platform": "Printables", "name": "Demo", "requires_auth": False}
@@ -123,22 +141,31 @@ class MultiFileSelectionTests(unittest.TestCase):
             {"name": "part-a.stl", "url": "https://cdn.example/a.stl"},
             {"name": "part-b.stl", "url": "https://cdn.example/b.stl"},
         ]
-        with mock.patch.dict(mod._SEARCHERS, {"printables": self.adapter(resolver)}, clear=False), \
-             mock.patch.object(action, "_download_and_import") as download:
+        with (
+            mock.patch.object(
+                mod._PLATFORMS["printables"].adapter, "get_files", side_effect=resolver
+            ),
+            mock.patch.object(action, "_download_and_import") as download,
+        ):
             action._resolve_import(model)
         download.assert_not_called()
         msg = action.win.posts[-1]
         self.assertEqual(msg["action"], "file_choices")
-        self.assertEqual([x["name"] for x in msg["files"]], ["part-a.stl", "part-b.stl"])
+        self.assertEqual(
+            [x["name"] for x in msg["files"]], ["part-a.stl", "part-b.stl"]
+        )
         self.assertEqual([x["index"] for x in msg["files"]], [0, 1])
 
     def test_single_resolved_file_imports_immediately(self):
         mod, action = self.make_action()
         model = {"platform": "Printables", "name": "Demo", "requires_auth": False}
         files = [{"name": "only.stl", "url": "https://cdn.example/only.stl"}]
-        resolver = lambda model, auth: files
-        with mock.patch.dict(mod._SEARCHERS, {"printables": self.adapter(resolver)}, clear=False), \
-             mock.patch.object(action, "_download_and_import") as download:
+        with (
+            mock.patch.object(
+                mod._PLATFORMS["printables"].adapter, "get_files", return_value=files
+            ),
+            mock.patch.object(action, "_download_and_import") as download,
+        ):
             action._resolve_import(model)
         download.assert_called_once()
         self.assertEqual(download.call_args.args[1], files)

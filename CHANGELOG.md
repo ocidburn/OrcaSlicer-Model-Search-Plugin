@@ -1,52 +1,41 @@
 # Changelog
 
-## v0.4.0
+## 0.4.0
 
-- Deep code review and structural refactor of authentication, catalog resolution, download probing, import dispatch, and adapter registration.
-- Fixed cross-host redirect handling so Makeronline `XX-Token` / Bearer credentials are rebuilt per redirect hop and cannot be forwarded to an untrusted CDN host.
-- Removed the legacy `enabled()` adapter hook, development `SEARCH_ENGINE_AUTORUN`, duplicate resolver registry, unused embedded-UI state, legacy AWS `urllib` download path, and duplicated AuthStore write logic.
-- Unified platform/resolver lookup around `_SEARCHERS` and derived platform metadata.
-- Split MakerWorld design/profile/download resolution into explicit stages; reduced `MakerWorldSearcher.get_files` cyclomatic complexity from E(36) to A(5).
-- Split public catalog probing/resolution into smaller helpers; reduced `_probe_download` from D(25) to B(10) and `_public_page_files` from D(26) to B(10).
-- Consolidated Makeronline/Nexprint API file parsing.
-- Restricted downloadable archive discovery to formats the plugin actually handles; RAR/7z/G-code are no longer falsely advertised as importable.
-- Fixed Windows `GetLastError` usage around `EnumWindows`.
-- Added a regression test proving Makeronline credentials are dropped after a cross-host redirect.
-- Updated import-flow tests to the unified adapter registry.
-- Removed one-off legacy tests, scratchpad probes, deployment scripts, obsolete planning/handoff docs, version-specific README fragments, review transformation scripts, reports, and staging workflows.
-- Added permanent multi-OS CI for Linux, Windows, and macOS.
+- Replaced five parallel platform maps with one `PlatformSpec` registry covering search, import, authentication hosts, cookie scope, login URL, and referer behavior.
+- Removed the redundant always-true adapter `enabled()` hook and development-only autorun path.
+- Rebuilt authorization headers on every redirect so MakerWorld and Anycubic credentials cannot follow a cross-host redirect to a CDN.
+- Unified signed and ordinary downloads on the same bounded streaming path; removed the legacy `urllib`/Amazon S3 special case.
+- Added a bounded Windows IPC timeout so an unresponsive OrcaSlicer window cannot hang the plugin worker indefinitely.
+- Fixed Win32 error capture to read `GetLastError` after `EnumWindows`, and stopped advertising RAR/7z/G-code as directly importable formats.
+- Consolidated size limits and hardened download cleanup and HTML-response rejection.
+- Removed obsolete development probes, machine-specific deployment scripts, live-network pseudo-tests, handoff notes, plans, and superseded documentation.
+- Consolidated versioned changelog fragments into this file and expanded registry/security regression coverage.
+- Reduced complexity in authentication, resolver, download, and UI dispatch paths.
 
-## v0.3.4
+## 0.3.4
 
-- Fixed Windows import failure caused by `Invalid option --single-instance`.
-- Windows sends OrcaSlicer's native `WM_COPYDATA` single-instance payload directly to the current OrcaSlicer main window.
-- macOS/Linux handoff no longer passes `--single-instance`; only downloaded file paths are supplied.
-- The model detail/import panel closes when the user clicks elsewhere in the search window.
-- Added regression tests for native Windows routing, Orca argv serialization, and click-outside closing.
+- Fixed Windows import by sending OrcaSlicer's native `WM_COPYDATA` payload directly to the current main window.
+- Removed the unsupported `--single-instance` flag from all platforms.
+- Closed the model detail panel when clicking elsewhere in the search window.
 
-## v0.3.3
+## 0.3.3
 
-- Added a dedicated search checkbox for every supported portal.
-- Added Select all / Select none controls and a selected-source counter.
-- Search is blocked with a clear message when no portal is selected.
-- Portal selection is persisted in the embedded UI.
-- Added a regression test requiring UI portals to match `_SEARCHERS`.
+- Added per-portal search checkboxes, select-all/select-none controls, a selected-source counter, and persisted selection.
 
-## v0.3.2
+## 0.3.2
 
-- Fixed model handoff to the already-running OrcaSlicer instance.
-- Added multi-file selection with checkboxes, Select all / Select none, and single-file fast path.
-- Added regression tests for handoff, missing files, and multi-file selection.
+- Added current-project import and a checkbox picker for models with multiple downloadable files.
 
-## v0.3.1
+## 0.3.1
 
-- Renamed the action to `Search 3D Models`.
-- Reuses an existing non-modal search window and restores focus to the search field.
-- Added Speed Dial/window lifecycle regression tests.
+- Renamed the action to `Search 3D Models` and reused the existing non-modal search window.
 
-## v0.3.0
+## 0.3.0
 
-- Added Thingiverse, Cults3D, MyMiniFactory, Thangs, Creality Cloud, and GrabCAD support.
-- Hardened Makeronline and Nexprint authenticated import.
-- Added generic HTML/SSR discovery, download probing, stale-session detection, safe ZIP extraction, and browser fallback for gated flows.
-- Expanded per-platform UI/auth behavior and catalog/security regression tests.
+- Expanded search/import support to Thingiverse, Cults3D, MyMiniFactory, Thangs, Creality Cloud, and GrabCAD.
+- Added browser-session authentication, validated download probing, safe ZIP extraction, and browser fallbacks for gated content.
+
+## 0.2.2
+
+- Removed the legacy Anycubic password endpoint and added Anycubic Slicer Next token import.

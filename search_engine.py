@@ -4,9 +4,9 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "3D Model Search Engine"
-# description = "Search and import 3D models from MakerWorld, Nexprint, Makeronline, and Printables with per-portal authenticated sessions."
+# description = "Search and import 3D models from MakerWorld, Printables, Thingiverse, Cults3D, MyMiniFactory, Thangs, Makeronline, Creality Cloud, Nexprint, and GrabCAD."
 # author = "Tommaso Bianchi"
-# version = "0.2.2"
+# version = "0.3.0"
 # ///
 
 try:
@@ -14,6 +14,7 @@ try:
 except ImportError:
     orca = None
 
+import html
 import ipaddress
 import json
 import os
@@ -24,10 +25,12 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
+from html.parser import HTMLParser
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.2.2 "
+    "OrcaSlicer-Model-Search-Plugin/0.3.0 "
     "(+https://github.com/tommasobbianchi/OrcaSlicer-Model-Search-Plugin)"
 )
 
@@ -136,6 +139,14 @@ class AuthRequired(AuthError):
     pass
 
 
+class BrowserRequired(RuntimeError):
+    """The platform requires its own browser flow for this model/file."""
+
+    def __init__(self, message, url=""):
+        super().__init__(message)
+        self.url = url
+
+
 class VerificationRequired(AuthError):
     def __init__(self, message="Verification code required"):
         super().__init__(message)
@@ -210,6 +221,8 @@ _PLATFORM_HOSTS = {
     "makerworld": ("api.bambulab.com", "makerworld.com"),
     "nexprint": ("nexprint.com",),
     "makeronline": ("makeronline.com", "anycubic.com"),
+    "grabcad": ("grabcad.com",),
+    "cults3d": ("cults3d.com",),
 }
 
 _PLATFORM_DISPLAY = {
@@ -217,6 +230,12 @@ _PLATFORM_DISPLAY = {
     "nexprint": "Nexprint",
     "makeronline": "Makeronline",
     "printables": "Printables",
+    "thingiverse": "Thingiverse",
+    "cults3d": "Cults3D",
+    "myminifactory": "MyMiniFactory",
+    "thangs": "Thangs",
+    "crealitycloud": "Creality Cloud",
+    "grabcad": "GrabCAD",
 }
 
 
@@ -272,7 +291,7 @@ class AuthManager:
 
     def status(self):
         out = {}
-        for platform in ("makerworld", "nexprint", "makeronline"):
+        for platform in ("makerworld", "nexprint", "makeronline", "cults3d", "grabcad"):
             data = self.credential(platform)
             configured = bool(data.get("access_token") or data.get("auth_token") or data.get("token"))
             out[platform] = {
@@ -295,6 +314,10 @@ class AuthManager:
             m = re.search(r"(?:^|[;\s])auth_token=([^;\s]+)", token)
             if m:
                 token = m.group(1).strip()
+        if platform in ("grabcad", "cults3d"):
+            # Accept either a raw Cookie header value or a copied "Cookie: ..." header.
+            if token.lower().startswith("cookie:"):
+                token = token.split(":", 1)[1].strip()
         if platform == "makeronline":
             m = re.match(r"(?i)^(?:XX-Token|Authorization)\s*:\s*(?:Bearer\s+)?(.+)$", token)
             if m:
@@ -305,9 +328,15 @@ class AuthManager:
         token = self.normalize_token(platform, token)
         if not token:
             raise AuthError("Token is empty")
+        if platform in ("cults3d", "grabcad") and "=" not in token:
+            raise AuthError("Paste browser session cookies in name=value form (or the full Cookie request header)")
         data = {"access_token": token, "label": (label or "").strip(), "saved_at": int(time.time())}
         if platform == "nexprint":
             data = {"auth_token": token, "label": (label or "").strip(), "saved_at": int(time.time())}
+        elif platform == "grabcad":
+            data = {"auth_token": token, "label": (label or "GrabCAD browser session").strip(), "saved_at": int(time.time())}
+        elif platform == "cults3d":
+            data = {"auth_token": token, "label": (label or "Cults3D browser session").strip(), "saved_at": int(time.time())}
         if refresh_token:
             data["refresh_token"] = refresh_token
         if expires_in:
@@ -341,6 +370,10 @@ class AuthManager:
             headers["Referer"] = "https://www.makeronline.com/"
         elif platform == "nexprint":
             headers["Referer"] = "https://www.nexprint.com/"
+        elif platform == "grabcad":
+            headers["Referer"] = "https://grabcad.com/library"
+        elif platform == "cults3d":
+            headers["Referer"] = "https://cults3d.com/"
         return headers
 
     def session(self, platform):
@@ -355,6 +388,20 @@ class AuthManager:
                 # to authenticate API requests. Domain scoping prevents it from
                 # being sent to model CDN hosts.
                 session.cookies.set("auth_token", token, domain=".nexprint.com", path="/")
+        elif platform in ("cults3d", "grabcad"):
+            token = self.token(platform)
+            domain = ".cults3d.com" if platform == "cults3d" else ".grabcad.com"
+            if token:
+                # Parse a copied Cookie header into a domain-scoped cookie jar.
+                # This prevents session cookies from following redirects to CDNs.
+                for part in token.split(";"):
+                    part = part.strip()
+                    if not part or "=" not in part:
+                        continue
+                    name, value = part.split("=", 1)
+                    name, value = name.strip(), value.strip()
+                    if name and value:
+                        session.cookies.set(name, value, domain=domain, path="/")
         return session
 
     def request(self, platform, method, url, session=None, **kwargs):
@@ -487,6 +534,317 @@ class AuthManager:
             "Newer builds may encrypt it; paste the token from the authenticated web/slicer session instead."
         )
 
+
+
+# ---------------------------------------------------------------------------
+# Public web-catalog helpers
+# ---------------------------------------------------------------------------
+
+_MODEL_FILE_EXTS = (
+    ".3mf", ".stl", ".obj", ".step", ".stp", ".iges", ".igs", ".amf",
+    ".ply", ".scad", ".fcstd", ".f3d", ".gcode", ".zip", ".rar", ".7z",
+)
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".mp4", ".webm")
+
+
+def _clean_web_text(value):
+    value = html.unescape(str(value or ""))
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _decode_embedded_url(value):
+    value = html.unescape(str(value or "")).strip().strip('"\'')
+    value = value.replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    value = value.replace("\\u003A", ":").replace("\\u003a", ":")
+    value = value.replace("\\u0026", "&")
+    return value
+
+
+def _slug_title(url):
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rstrip("/").split("/")[-1])
+    path = re.sub(r"-\d+$", "", path)
+    path = re.sub(r"[-_]+", " ", path).strip()
+    return path[:120] or "Untitled"
+
+
+class _CatalogHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.anchors = []
+        self._anchor = None
+        self._text = []
+        self.meta = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "a" and attrs.get("href"):
+            self._anchor = {
+                "href": attrs.get("href", ""),
+                "title": attrs.get("title", ""),
+                "aria": attrs.get("aria-label", ""),
+                "img": "",
+            }
+            self._text = []
+        elif tag == "img" and self._anchor is not None:
+            self._anchor["img"] = attrs.get("src") or attrs.get("data-src") or attrs.get("data-lazy-src") or ""
+            if not self._anchor.get("title"):
+                self._anchor["title"] = attrs.get("alt", "")
+        elif tag == "meta":
+            key = attrs.get("property") or attrs.get("name")
+            content = attrs.get("content")
+            if key and content:
+                self.meta[str(key).lower()] = content
+
+    def handle_data(self, data):
+        if self._anchor is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._anchor is not None:
+            self._anchor["text"] = _clean_web_text(" ".join(self._text))
+            self.anchors.append(self._anchor)
+            self._anchor = None
+            self._text = []
+
+
+def _parse_catalog_html(raw):
+    parser = _CatalogHTMLParser()
+    try:
+        parser.feed(raw or "")
+    except Exception:
+        pass
+    return parser
+
+
+def _fetch_html(url, auth=None, platform="", timeout=30):
+    import requests
+    session = auth.session(platform) if auth is not None and platform else requests.Session()
+    if auth is not None and platform:
+        response = auth.request(platform, "GET", url, session=session, timeout=timeout, allow_redirects=True,
+                                headers={"Accept": "text/html,application/xhtml+xml"})
+    else:
+        response = session.get(url, timeout=timeout, allow_redirects=True,
+                               headers={"User-Agent": _BROWSER_UA, "Accept": "text/html,application/xhtml+xml"})
+    if response.status_code in (401, 403) and platform in ("grabcad", "cults3d"):
+        display = _PLATFORM_DISPLAY.get(platform, platform)
+        raise AuthRequired(f"{display} rejected the browser session. Sign in again and paste a fresh Cookie header.")
+    response.raise_for_status()
+    return response.text, response.url
+
+
+def _looks_like_login_page(raw, platform=""):
+    sample = (raw or "")[:300000].lower()
+    if platform == "grabcad":
+        return ("sign in or create account" in sample or "sign in with email" in sample or
+                ('action="/login"' in sample and "forgot password" in sample))
+    if platform == "cults3d":
+        return ("/users/sign_in" in sample or "/en/users/sign_in" in sample or
+                ("sign in" in sample and "forgot your password" in sample))
+    return False
+
+
+def _extract_catalog_models(raw, base_url, path_pattern, platform, requires_auth=False, limit=30):
+    parser = _parse_catalog_html(raw)
+    regex = re.compile(path_pattern, re.I)
+    found = []
+    seen = set()
+
+    def add(href, title="", img=""):
+        href = _decode_embedded_url(href)
+        if not href:
+            return
+        absolute = urllib.parse.urljoin(base_url, href)
+        parsed = urllib.parse.urlsplit(absolute)
+        canonical = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        if not regex.search(parsed.path):
+            return
+        if canonical in seen:
+            return
+        seen.add(canonical)
+        found.append({
+            "name": _clean_web_text(title) or _slug_title(canonical),
+            "author": "Unknown",
+            "platform": platform,
+            "thumbnail_url": urllib.parse.urljoin(base_url, _decode_embedded_url(img)) if img else "",
+            "license": "Unknown",
+            "license_url": "",
+            "license_summary": "Open the model page to review the exact license before importing.",
+            "download_url": canonical,
+            "url": canonical,
+            "requires_auth": requires_auth,
+        })
+
+    for a in parser.anchors:
+        add(a.get("href"), a.get("text") or a.get("title") or a.get("aria"), a.get("img"))
+        if len(found) >= limit:
+            return found
+
+    # SSR/Next/Vue pages frequently put model paths in JSON rather than anchors.
+    normalized = (raw or "").replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    for match in regex.finditer(normalized):
+        path = match.group(0)
+        add(path)
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _catalog_search(query, url_templates, path_pattern, platform, auth=None, requires_auth=False):
+    last_error = None
+    for template in url_templates:
+        url = template.format(query=urllib.parse.quote(query.strip(), safe=""))
+        try:
+            raw, final_url = _fetch_html(url, auth=auth if requires_auth else None,
+                                         platform="grabcad" if requires_auth else "")
+            if requires_auth and _looks_like_login_page(raw, "grabcad"):
+                raise AuthRequired("GrabCAD search requires a signed-in GrabCAD browser session.")
+            models = _extract_catalog_models(raw, final_url, path_pattern, platform, requires_auth=requires_auth)
+            if models:
+                return models
+        except AuthRequired:
+            raise
+        except Exception as exc:
+            last_error = exc
+    if last_error:
+        raise RuntimeError(f"{platform} search failed: {last_error}")
+    return []
+
+
+def _extract_download_candidates(raw, base_url):
+    parser = _parse_catalog_html(raw)
+    candidates = []
+    seen = set()
+
+    def add(value, label=""):
+        value = _decode_embedded_url(value)
+        if not value or value.startswith(("javascript:", "data:", "mailto:")):
+            return
+        url = urllib.parse.urljoin(base_url, value)
+        if not _is_http_url(url):
+            return
+        low_url = urllib.parse.unquote(url).lower()
+        path = urllib.parse.urlsplit(low_url).path
+        if path.endswith(_IMAGE_EXTS):
+            return
+        low_label = (label or "").lower()
+        direct = path.endswith(_MODEL_FILE_EXTS)
+        action = "download" in low_label or "download" in low_url or "/files/" in low_url or "/file/" in low_url
+        if not (direct or action):
+            return
+        if url in seen:
+            return
+        seen.add(url)
+        candidates.append((url, _clean_web_text(label)))
+
+    for a in parser.anchors:
+        add(a.get("href"), a.get("text") or a.get("title") or a.get("aria"))
+
+    normalized = (raw or "").replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    normalized = normalized.replace("\\u003A", ":").replace("\\u003a", ":")
+    for match in re.finditer(r'https?://[^"\'<>\\\s]+', normalized, re.I):
+        add(match.group(0))
+    for match in re.finditer(r'(?P<q>["\'])(?P<path>/[^"\']{1,700}(?:download|files?)[^"\']*)(?P=q)', normalized, re.I):
+        add(match.group("path"))
+    return candidates
+
+
+def _probe_download(url, auth=None, platform=""):
+    """Validate a candidate without downloading the full file."""
+    import requests
+    if not _is_http_url(url):
+        return None
+    _reject_obvious_local_target(url)
+    session = auth.session(platform) if auth is not None and platform else requests.Session()
+    headers = {"Range": "bytes=0-0", "Accept": "*/*"}
+    try:
+        if auth is not None and platform:
+            response = auth.request(platform, "GET", url, session=session, stream=True, timeout=25,
+                                    allow_redirects=True, headers=headers)
+        else:
+            response = session.get(url, stream=True, timeout=25, allow_redirects=True,
+                                   headers={"User-Agent": _BROWSER_UA, **headers})
+    except requests.RequestException:
+        return None
+    try:
+        if response.status_code in (405, 416):
+            response.close()
+            # Some CDNs reject Range probes. A streaming GET still lets us inspect
+            # the final URL/headers without consuming the response body.
+            try:
+                if auth is not None and platform:
+                    response = auth.request(platform, "GET", url, session=session, stream=True, timeout=25,
+                                            allow_redirects=True, headers={"Accept": "*/*"})
+                else:
+                    response = session.get(url, stream=True, timeout=25, allow_redirects=True,
+                                           headers={"User-Agent": _BROWSER_UA, "Accept": "*/*"})
+            except requests.RequestException:
+                return None
+        if response.status_code in (401, 403) and platform in ("grabcad", "cults3d"):
+            display = _PLATFORM_DISPLAY.get(platform, platform)
+            raise AuthRequired(f"{display} session was rejected while resolving files.")
+        if response.status_code >= 400:
+            return None
+        content_type = (response.headers.get("content-type") or "").lower()
+        disposition = response.headers.get("content-disposition") or ""
+        final_url = response.url
+        final_path = urllib.parse.urlsplit(final_url).path.lower()
+        if "text/html" in content_type or "application/xhtml" in content_type:
+            return None
+        if not (final_path.endswith(_MODEL_FILE_EXTS) or "attachment" in disposition.lower() or
+                any(t in content_type for t in ("zip", "octet-stream", "model/", "3mf", "stl"))):
+            return None
+        filename = ""
+        m = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", disposition, re.I)
+        if m:
+            filename = urllib.parse.unquote(m.group(1).strip().strip('"'))
+        if not filename:
+            filename = os.path.basename(urllib.parse.urlsplit(final_url).path) or "model_download"
+        return {"url": final_url, "name": _safe_filename(filename, "model_download")}
+    finally:
+        response.close()
+
+
+def _public_page_files(model, auth=None, platform_key="", extra_urls=(), restricted_markers=(), no_direct_message=""):
+    page_url = model.get("url") or model.get("download_url") or ""
+    if not page_url:
+        raise ValueError("Model page URL is missing")
+    urls = [page_url] + [u for u in extra_urls if u]
+    all_candidates = []
+    body = ""
+    final_url = page_url
+    for url in urls:
+        try:
+            raw, fetched = _fetch_html(url, auth=auth if platform_key else None, platform=platform_key)
+        except AuthRequired:
+            raise
+        except Exception:
+            continue
+        if platform_key in ("cults3d", "grabcad") and _looks_like_login_page(raw, platform_key):
+            display = _PLATFORM_DISPLAY.get(platform_key, platform_key)
+            raise AuthRequired(f"{display} browser session is no longer signed in. Refresh the saved Cookie header.")
+        body += "\n" + raw
+        final_url = fetched or final_url
+        all_candidates.extend(_extract_download_candidates(raw, fetched))
+    low = body.lower()
+    if restricted_markers and any(marker.lower() in low for marker in restricted_markers):
+        raise BrowserRequired("This model is paid, membership-gated, or requires the platform checkout/download page.", page_url)
+    # Prefer actual model formats over generic download actions.
+    all_candidates.sort(key=lambda item: 0 if urllib.parse.urlsplit(item[0]).path.lower().endswith(_MODEL_FILE_EXTS) else 1)
+    files = []
+    seen = set()
+    for candidate, label in all_candidates[:30]:
+        probed = _probe_download(candidate, auth=auth if platform_key else None, platform=platform_key)
+        if not probed or probed["url"] in seen:
+            continue
+        seen.add(probed["url"])
+        if not os.path.splitext(probed["name"])[1]:
+            ext = ".3mf" if "3mf" in (label or "").lower() else ".zip"
+            probed["name"] += ext
+        files.append(probed)
+    if files:
+        return files
+    raise BrowserRequired(no_direct_message or "The platform did not expose a direct downloadable model file to this session.", page_url)
 
 # ---------------------------------------------------------------------------
 # Search adapters
@@ -892,59 +1250,178 @@ class MakerWorldSearcher:
 
 
 class ThingiverseSearcher:
-    """Compatibility placeholder.
-
-    Thingiverse remains disabled because the plugin has no application token
-    provisioning flow. Kept so existing development scripts importing this
-    class continue to work.
-    """
-    BASE = "https://api.thingiverse.com"
-
-    @staticmethod
-    def enabled(tokens):
-        return bool((tokens or {}).get("thingiverse_token"))
+    BASE = "https://www.thingiverse.com"
+    SEARCH_URLS = (
+        BASE + "/search?q={query}&page=1&type=things&sort=relevant",
+        BASE + "/search?type=things&q={query}",
+    )
+    PATH_RE = r"/thing(?::|%3A)\d+"
 
     @staticmethod
-    def search(query, tokens):
-        import requests
-        token = (tokens or {}).get("thingiverse_token", "")
-        if not token:
-            return []
-        response = requests.get(
-            f"{ThingiverseSearcher.BASE}/search/{urllib.parse.quote(query)}",
-            params={"type": "things", "per_page": 20, "access_token": token},
-            headers={"User-Agent": _BROWSER_UA}, timeout=30,
+    def enabled(context):
+        return True
+
+    @staticmethod
+    def search(query, context):
+        return _catalog_search(query, ThingiverseSearcher.SEARCH_URLS, ThingiverseSearcher.PATH_RE, "Thingiverse")
+
+    @staticmethod
+    def get_files(model, auth=None):
+        url = (model.get("url") or "").rstrip("/")
+        if not url:
+            raise ValueError("Thingiverse model URL is missing")
+        # Current Thingiverse exposes a public Download All Files action. Try the
+        # traditional zip route first; if the site changes it, fall back to
+        # parsing the model and Files pages for individual public file links.
+        zip_candidate = _probe_download(url + "/zip")
+        if zip_candidate:
+            m = re.search(r"thing(?::|%3A)(\d+)", url, re.I)
+            zip_candidate["name"] = f"thingiverse_{m.group(1) if m else 'model'}.zip"
+            return [zip_candidate]
+        return _public_page_files(
+            model,
+            extra_urls=(url + "/files",),
+            no_direct_message="Thingiverse did not expose a public file URL for this model; open the model page in the browser.",
         )
-        response.raise_for_status()
-        results = []
-        for hit in response.json().get("hits") or []:
-            lic = _parse_license(hit.get("license", ""))
-            public_url = hit.get("public_url", "")
-            results.append({
-                "name": hit.get("name", "Untitled"),
-                "author": (hit.get("creator") or {}).get("name", "Unknown"),
-                "platform": "Thingiverse",
-                "thumbnail_url": hit.get("thumbnail", ""),
-                "license": lic["name"] or "Unknown",
-                "license_url": lic["url"],
-                "license_summary": lic["summary"],
-                "download_url": public_url + "/zip" if public_url else "",
-                "url": public_url,
-            })
-        return results
+
+
+class Cults3DSearcher:
+    BASE = "https://cults3d.com"
+    SEARCH_URLS = (
+        BASE + "/en/tags/{query}",
+        BASE + "/en/tags/{query}?only_free=true",
+    )
+    PATH_RE = r"/en/3d-model/[a-z0-9_-]+/[a-z0-9%._~+()-]+"
+
+    @staticmethod
+    def enabled(context):
+        return True
+
+    @staticmethod
+    def search(query, context):
+        items = _catalog_search(query, Cults3DSearcher.SEARCH_URLS, Cults3DSearcher.PATH_RE, "Cults3D")
+        for item in items:
+            item["requires_auth"] = True
+        return items
+
+    @staticmethod
+    def get_files(model, auth=None):
+        # Cults requires an account even for free-file downloads, while its
+        # documented API intentionally does not expose other users' 3D files.
+        # Use the user's browser session only against cults3d.com.
+        if auth is None or not auth.authenticated("cults3d"):
+            raise AuthRequired("Cults3D requires a signed-in Cults account before downloading files")
+        return _public_page_files(
+            model, auth=auth, platform_key="cults3d",
+            no_direct_message="Cults3D did not expose a direct file to this signed-in session. Use Open in browser for the official download/checkout flow.",
+        )
+
+
+class MyMiniFactorySearcher:
+    BASE = "https://www.myminifactory.com"
+    SEARCH_URLS = (
+        BASE + "/search/query/?query={query}",
+        BASE + "/search/?query={query}",
+        BASE + "/search/?q={query}",
+        BASE + "/search/{query}",
+    )
+    PATH_RE = r"/object/3d-print-[a-z0-9%._~+()-]+-\d+"
+
+    @staticmethod
+    def enabled(context):
+        return True
+
+    @staticmethod
+    def search(query, context):
+        return _catalog_search(query, MyMiniFactorySearcher.SEARCH_URLS, MyMiniFactorySearcher.PATH_RE, "MyMiniFactory")
+
+    @staticmethod
+    def get_files(model, auth=None):
+        return _public_page_files(
+            model,
+            restricted_markers=("Add Files To Cart",),
+            no_direct_message="MyMiniFactory did not expose a public direct file for this object. Paid/member-only objects must be downloaded in the browser.",
+        )
+
+
+class ThangsSearcher:
+    BASE = "https://thangs.com"
+    SEARCH_URLS = (
+        BASE + "/search/{query}?scope=thangs&view=list",
+        BASE + "/digital/search/{query}?scope=thangs&view=list",
+    )
+    PATH_RE = r"/designer/[^\"'<>?#]+/3d-model/[^\"'<>?#]+"
+
+    @staticmethod
+    def enabled(context):
+        return True
+
+    @staticmethod
+    def search(query, context):
+        return _catalog_search(query, ThangsSearcher.SEARCH_URLS, ThangsSearcher.PATH_RE, "Thangs")
+
+    @staticmethod
+    def get_files(model, auth=None):
+        return _public_page_files(
+            model,
+            restricted_markers=("Become a member to download", "Add download to cart", "Purchase model for"),
+            no_direct_message="Thangs did not expose a public direct file for this free model. Use Open in browser for member/paid or interactive downloads.",
+        )
+
+
+class CrealityCloudSearcher:
+    BASE = "https://www.crealitycloud.com"
+    SEARCH_URLS = (BASE + "/search/model?q={query}",)
+    PATH_RE = r"/model-detail/[a-z0-9%._~+()-]+"
+
+    @staticmethod
+    def enabled(context):
+        return True
+
+    @staticmethod
+    def search(query, context):
+        return _catalog_search(query, CrealityCloudSearcher.SEARCH_URLS, CrealityCloudSearcher.PATH_RE, "Creality Cloud")
+
+    @staticmethod
+    def get_files(model, auth=None):
+        return _public_page_files(
+            model,
+            restricted_markers=("Buy now", "Purchase", "Subscribe to download"),
+            no_direct_message="Creality Cloud did not expose a public direct 3MF/STL URL for this model. Use Open in browser for its official download flow.",
+        )
 
 
 class GrabcadSearcher:
-    """Compatibility placeholder for the retired GrabCAD public API."""
-    BASE = "https://api.grabcad.com/api/v1"
+    BASE = "https://grabcad.com"
+    SEARCH_URLS = (
+        BASE + "/library?query={query}",
+        BASE + "/library?utf8=%E2%9C%93&query={query}",
+    )
+    PATH_RE = r"/library/[a-z0-9%._~+()-]+"
 
     @staticmethod
-    def enabled(tokens):
-        return False
+    def enabled(context):
+        return True
 
     @staticmethod
-    def search(query, tokens):
-        return []
+    def search(query, context):
+        if not isinstance(context, AuthManager) or not context.authenticated("grabcad"):
+            raise AuthRequired("GrabCAD requires a free member account to access/download Community Library models. Connect a browser session first.")
+        return _catalog_search(
+            query, GrabcadSearcher.SEARCH_URLS, GrabcadSearcher.PATH_RE,
+            "GrabCAD", auth=context, requires_auth=True,
+        )
+
+    @staticmethod
+    def get_files(model, auth):
+        if not auth.authenticated("grabcad"):
+            raise AuthRequired("GrabCAD requires a signed-in browser session")
+        return _public_page_files(
+            model,
+            auth=auth,
+            platform_key="grabcad",
+            no_direct_message="GrabCAD did not expose a downloadable CAD file to this browser session. Open the model page and refresh the saved Cookie header if necessary.",
+        )
 
 
 _SEARCHERS = {
@@ -953,6 +1430,10 @@ _SEARCHERS = {
     "makeronline": MakeronlineSearcher,
     "makerworld": MakerWorldSearcher,
     "thingiverse": ThingiverseSearcher,
+    "cults3d": Cults3DSearcher,
+    "myminifactory": MyMiniFactorySearcher,
+    "thangs": ThangsSearcher,
+    "crealitycloud": CrealityCloudSearcher,
     "grabcad": GrabcadSearcher,
 }
 
@@ -961,6 +1442,12 @@ _FILE_RESOLVERS = {
     "Nexprint": NexprintSearcher.get_files,
     "Makeronline": MakeronlineSearcher.get_files,
     "MakerWorld": MakerWorldSearcher.get_files,
+    "Thingiverse": ThingiverseSearcher.get_files,
+    "Cults3D": Cults3DSearcher.get_files,
+    "MyMiniFactory": MyMiniFactorySearcher.get_files,
+    "Thangs": ThangsSearcher.get_files,
+    "Creality Cloud": CrealityCloudSearcher.get_files,
+    "GrabCAD": GrabcadSearcher.get_files,
 }
 
 _PLATFORM_KEY_BY_DISPLAY = {
@@ -968,6 +1455,12 @@ _PLATFORM_KEY_BY_DISPLAY = {
     "Nexprint": "nexprint",
     "Makeronline": "makeronline",
     "Printables": "printables",
+    "Thingiverse": "thingiverse",
+    "Cults3D": "cults3d",
+    "MyMiniFactory": "myminifactory",
+    "Thangs": "thangs",
+    "Creality Cloud": "crealitycloud",
+    "GrabCAD": "grabcad",
 }
 
 
@@ -1013,6 +1506,47 @@ def _load_in_orca(paths):
         return False, (proc.stderr or "").strip()[:300]
     return True, ""
 
+
+
+_LOADABLE_MODEL_EXTS = (".3mf", ".stl", ".obj", ".step", ".stp", ".iges", ".igs", ".amf", ".ply", ".scad", ".fcstd", ".f3d")
+
+
+def _expand_archives(paths, dest_dir):
+    """Safely expand ZIP downloads and return files Orca can actually open."""
+    loadable = []
+    extracted_total = 0
+    for path in paths:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _LOADABLE_MODEL_EXTS:
+            loadable.append(path)
+            continue
+        if ext != ".zip":
+            continue
+        try:
+            archive = zipfile.ZipFile(path, "r")
+        except (OSError, zipfile.BadZipFile):
+            continue
+        with archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+                member_ext = os.path.splitext(member.filename)[1].lower()
+                if member_ext not in _LOADABLE_MODEL_EXTS:
+                    continue
+                if member.file_size > 500 * 1024 * 1024:
+                    raise RuntimeError("Archive contains a model file larger than 500 MB")
+                extracted_total += member.file_size
+                if extracted_total > 1024 * 1024 * 1024:
+                    raise RuntimeError("Archive extraction exceeds 1 GB safety limit")
+                target = _unique_path(dest_dir, _safe_filename(os.path.basename(member.filename), "model" + member_ext))
+                with archive.open(member, "r") as src, open(target, "wb") as dst:
+                    while True:
+                        chunk = src.read(262144)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                loadable.append(target)
+    return loadable
 
 def _download_stream(url, name, dest_dir, auth, platform):
     if not _is_http_url(url):
@@ -1085,7 +1619,7 @@ PAGE = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box} body{font-family:var(--orca-font,sans-serif);background:var(--orca-bg,#1e1e1e);color:var(--orca-fg,#eee);padding:16px;margin:0}
 button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search-row input{flex:1;padding:8px 12px;border:1px solid var(--orca-border,#444);border-radius:6px;background:var(--orca-bg,#1e1e1e);color:inherit}.btn,button{padding:7px 12px;border:0;border-radius:6px;background:var(--orca-accent,#4a9eff);color:var(--orca-accent-fg,#fff);cursor:pointer}.secondary{background:transparent!important;border:1px solid var(--orca-border,#555)!important;color:var(--orca-fg,#eee)!important}.danger{background:#7a3030!important}.muted{color:var(--orca-muted,#999)}
-.accounts{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account strong{display:block;font-size:.86em}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.platforms{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px}.platforms label{font-size:.84em;color:var(--orca-muted,#aaa)}
+.accounts{display:grid;grid-template-columns:repeat(5,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account strong{display:block;font-size:.86em}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.platforms{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px}.platforms label{font-size:.84em;color:var(--orca-muted,#aaa)}
 #results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
 .panel{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(650px,calc(100% - 32px));max-height:70vh;overflow:auto;z-index:20;padding:14px 34px 14px 14px;border:1px solid var(--orca-border,#444);border-radius:8px;background:var(--orca-bg,#1e1e1e);box-shadow:0 6px 28px rgba(0,0,0,.55);display:none}.panel.active{display:block}.close{position:absolute;right:8px;top:6px;background:none!important;font-size:1.35em;padding:2px 6px}.panel p{font-size:.86em;color:var(--orca-muted,#aaa);margin:6px 0}.panel a{color:var(--orca-accent,#4a9eff)}.responsibility{border-left:3px solid var(--orca-border,#444);padding:8px 10px;margin:10px 0;font-size:.78em;color:var(--orca-muted,#888)}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
@@ -1096,12 +1630,20 @@ button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search
   <div class="account"><strong>MakerWorld (Bambu)</strong><span id="auth-makerworld" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('makerworld')">Account</button></div>
   <div class="account"><strong>Nexprint (Elegoo)</strong><span id="auth-nexprint" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('nexprint')">Account</button></div>
   <div class="account"><strong>Makeronline (Anycubic)</strong><span id="auth-makeronline" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('makeronline')">Account</button></div>
+  <div class="account"><strong>Cults3D</strong><span id="auth-cults3d" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('cults3d')">Account</button></div>
+  <div class="account"><strong>GrabCAD</strong><span id="auth-grabcad" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('grabcad')">Account</button></div>
 </div>
 <div class="search-row"><input id="query" placeholder="Search for 3D models..."><button id="search-btn" onclick="doSearch()">Search</button></div>
 <div class="platforms">
-<label><input type="checkbox" checked data-platform="nexprint"> Nexprint</label>
-<label><input type="checkbox" checked data-platform="printables"> Printables</label>
+<label><input type="checkbox" checked data-platform="thingiverse"> Thingiverse</label>
+<label><input type="checkbox" checked data-platform="cults3d"> Cults3D</label>
+<label><input type="checkbox" checked data-platform="myminifactory"> MyMiniFactory</label>
+<label><input type="checkbox" checked data-platform="thangs"> Thangs</label>
 <label><input type="checkbox" checked data-platform="makeronline"> Makeronline</label>
+<label><input type="checkbox" checked data-platform="crealitycloud"> Creality Cloud</label>
+<label><input type="checkbox" checked data-platform="nexprint"> Nexprint</label>
+<label><input type="checkbox" checked data-platform="grabcad"> GrabCAD</label>
+<label><input type="checkbox" checked data-platform="printables"> Printables</label>
 <label><input type="checkbox" checked data-platform="makerworld"> MakerWorld</label>
 </div>
 <div id="results"></div>
@@ -1121,9 +1663,9 @@ button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search
 var selectedModel=null, searching=false, authPlatform=null, authStates={}, pendingImport=null;
 var $=function(id){return document.getElementById(id)};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
-function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables'}[display]||String(display||'').toLowerCase()}
+function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',MyMiniFactory:'myminifactory',Thangs:'thangs','Creality Cloud':'crealitycloud',GrabCAD:'grabcad'}[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
-function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
+function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
 function doSearch(){if(searching)return;var q=$('query').value.trim();if(!q)return;searching=true;$('search-btn').disabled=true;$('search-btn').textContent='Searching...';var ps=[];document.querySelectorAll('.platforms input:checked').forEach(function(x){ps.push(x.dataset.platform)});$('status').textContent='Searching...';closeDetail();orca.postMessage({action:'search',query:q,platforms:ps})}
 $('query').addEventListener('keydown',function(e){if(e.key==='Enter')doSearch()});
 function renderResults(models){window._results=models||[];var html='';window._results.forEach(function(m,i){html+='<div class="card" data-idx="'+i+'"><img src="'+esc(m.thumbnail_url||'')+'"><h3 title="'+esc(m.name)+'">'+esc(m.name)+'</h3><div class="author">'+esc(m.author)+' · '+esc(m.platform)+'</div><span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span></div>'});$('results').innerHTML=html;$('status').textContent=window._results.length+' result(s)'}
@@ -1135,13 +1677,13 @@ function licenseClass(l){if(/CC|Creative Commons|CC0|Public Domain/i.test(l||'')
 function openExternal(url){orca.postMessage({action:'open_external',url:url})}
 function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedModel.download_url)}
 function doImport(){if(!selectedModel)return;if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var b=$('det-import-btn');b.disabled=true;b.textContent='Importing...';$('status').textContent='Resolving files...';orca.postMessage({action:'import',model:selectedModel})}
-function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';$('password-field').style.display=(p==='nexprint'||p==='makeronline')?'none':'';$('email-field').style.display=(p==='nexprint'||p==='makeronline')?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account'}[p];$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':'Session/access token (alternative)';$('auth-note').textContent=p==='makerworld'?'Use Bambu email/password or paste an existing Bambu Cloud access token. MFA verification codes are supported.':p==='nexprint'?'Sign in on the official Nexprint site, then paste the auth_token session cookie. The plugin never asks for or stores your Nexprint password.':'Makeronline no longer uses the legacy direct password endpoint. Sign in with Anycubic Slicer Next and click Import from Anycubic Slicer Next, or paste an existing access token.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
+function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':'Session/access token (alternative)';$('auth-note').textContent=p==='makerworld'?'Use Bambu email/password or paste an existing Bambu Cloud access token. MFA verification codes are supported.':p==='nexprint'?'Sign in on the official Nexprint site, then paste the auth_token session cookie. The plugin never asks for or stores your Nexprint password.':p==='grabcad'?'GrabCAD Community Library downloads require membership. Sign in on the official GrabCAD page, then paste the Cookie request header (or the session cookie string). The plugin never asks for your GrabCAD password.':p==='cults3d'?'Cults3D requires an account even for free downloads. Sign in on the official Cults3D page, then paste the Cookie request header/session cookies. The plugin never asks for your Cults3D password.':'Makeronline no longer uses the legacy direct password endpoint. Sign in with Anycubic Slicer Next and click Import from Anycubic Slicer Next, or paste an existing access token.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
 function closeAuth(){$('auth-modal').classList.remove('active');$('modal-bg').classList.remove('active');$('auth-password').value='';$('auth-token').value=''}
-function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Signing in...'}
+function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform})}
 function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('status').textContent='Looking for Anycubic Slicer Next session...'}
-orca.onMessage(function(msg){msg=msg||{};if(msg.action==='results'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[])}else if(msg.action==='auth_status'||msg.action==='auth_changed'){updateAuth(msg.states||{});$('auth-submit').disabled=false;if(msg.action==='auth_changed'){closeAuth();$('status').textContent=msg.message||'Account session updated.';if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}}}else if(msg.action==='auth_challenge'){$('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.'}else if(msg.action==='auth_required'){$('det-import-btn').disabled=false;$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform)}else if(msg.action==='status'){$('status').textContent=msg.message}else if(msg.action==='imported'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Imported '+msg.count+' file(s) into OrcaSlicer.'}else if(msg.action==='downloaded_only'){$('det-import-btn').disabled=false;$('status').textContent='Downloaded '+msg.count+' file(s) to '+msg.dir+'. '+msg.message}else if(msg.action==='opened'){$('status').textContent='Opened in your browser.'}else if(msg.action==='error'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;if($('det-import-btn'))$('det-import-btn').disabled=false;$('status').textContent='Error: '+msg.message}});
+orca.onMessage(function(msg){msg=msg||{};if(msg.action==='results'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[])}else if(msg.action==='auth_status'||msg.action==='auth_changed'){updateAuth(msg.states||{});$('auth-submit').disabled=false;if(msg.action==='auth_changed'){closeAuth();$('status').textContent=msg.message||'Account session updated.';if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}}}else if(msg.action==='auth_challenge'){$('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.'}else if(msg.action==='auth_required'){$('det-import-btn').disabled=false;$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform)}else if(msg.action==='status'){$('status').textContent=msg.message}else if(msg.action==='imported'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Imported '+msg.count+' file(s) into OrcaSlicer.'}else if(msg.action==='downloaded_only'){$('det-import-btn').disabled=false;$('status').textContent='Downloaded '+msg.count+' file(s) to '+msg.dir+'. '+msg.message}else if(msg.action==='browser_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'This model must be downloaded in the browser.';if(msg.url)openExternal(msg.url)}else if(msg.action==='opened'){$('status').textContent='Opened in your browser.'}else if(msg.action==='error'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;if($('det-import-btn'))$('det-import-btn').disabled=false;$('status').textContent='Error: '+msg.message}});
 orca.postMessage({action:'auth_status'});
 </script></body></html>"""
 
@@ -1207,6 +1749,8 @@ if orca is not None:
                     "makerworld": "https://makerworld.com/en/sign-in",
                     "nexprint": "https://www.nexprint.com/en/account/login",
                     "makeronline": "https://uc.makeronline.com/",
+                    "cults3d": "https://cults3d.com/en/users/sign_in",
+                    "grabcad": "https://login.grabcad.com/login",
                 }.get(platform, "")
                 if url:
                     threading.Thread(target=self._open_external, args=(url,), daemon=True).start()
@@ -1232,6 +1776,10 @@ if orca is not None:
                     )
                 elif platform == "nexprint":
                     raise AuthError("Nexprint login requires auth_token from the official signed-in browser session")
+                elif platform == "cults3d":
+                    raise AuthError("Cults3D requires a Cookie header/session cookies from the official signed-in browser session")
+                elif platform == "grabcad":
+                    raise AuthError("GrabCAD requires a Cookie header/session cookie from the official signed-in browser session")
                 else:
                     raise AuthError("Unknown platform")
             except VerificationRequired as exc:
@@ -1260,13 +1808,13 @@ if orca is not None:
             errors = []
             for platform in msg.get("platforms", []):
                 adapter = _SEARCHERS.get(platform)
-                if not adapter or not adapter.enabled({}):
+                if not adapter or not adapter.enabled(self.auth):
                     continue
                 try:
-                    items = adapter.search(query, {})
+                    items = adapter.search(query, self.auth)
                     for item in items:
                         key = _PLATFORM_KEY_BY_DISPLAY.get(item.get("platform", ""), "")
-                        item["authenticated"] = key == "printables" or self.auth.authenticated(key)
+                        item["authenticated"] = (not item.get("requires_auth")) or self.auth.authenticated(key)
                         item["importable"] = item.get("platform") in _FILE_RESOLVERS
                     results.extend(items)
                 except Exception as exc:
@@ -1297,6 +1845,9 @@ if orca is not None:
                 self._post_auth("auth_changed", f"{platform_name} session expired.")
                 self._post({"action": "auth_required", "platform": platform_key, "message": str(exc), "model": model})
                 return
+            except BrowserRequired as exc:
+                self._post({"action": "browser_required", "message": str(exc), "url": exc.url or model.get("url", "")})
+                return
             except Exception as exc:
                 self._post({"action": "error", "message": f"Could not list files: {exc}"})
                 return
@@ -1325,11 +1876,20 @@ if orca is not None:
                     self._post({"action": "error", "message": f"{name}: {exc}"})
                     return
 
-            ok, detail = _load_in_orca(paths)
+            try:
+                load_paths = _expand_archives(paths, dest_dir)
+            except Exception as exc:
+                self._post({"action": "error", "message": f"Downloaded files, but archive extraction failed: {exc}"})
+                return
+            if not load_paths:
+                self._post({"action": "downloaded_only", "count": len(paths), "dir": dest_dir,
+                            "message": "No directly loadable STL/3MF/CAD file was found in the download."})
+                return
+            ok, detail = _load_in_orca(load_paths)
             if ok:
-                self._post({"action": "imported", "count": len(paths), "dir": dest_dir})
+                self._post({"action": "imported", "count": len(load_paths), "dir": dest_dir})
             else:
-                self._post({"action": "downloaded_only", "count": len(paths), "dir": dest_dir, "message": detail})
+                self._post({"action": "downloaded_only", "count": len(load_paths), "dir": dest_dir, "message": detail})
 
         def _open_external(self, url):
             if not _is_http_url(url):

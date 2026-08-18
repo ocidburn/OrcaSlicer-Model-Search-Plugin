@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community, museum, scientific, and space catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.5.0"
+# version = "0.5.1"
 # ///
 
 import html
@@ -34,7 +34,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.5.0 "
+    "OrcaSlicer-Model-Search-Plugin/0.5.1 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -54,6 +54,26 @@ LICENSE_DESCRIPTIONS = {
     "Standard Digital File License": "Platform standard license. Check the model page for exact terms.",
     "MakerWorld Exclusive License": "MakerWorld exclusive license. Check the model page for exact terms.",
     "Exclusive": "Platform exclusive license. Check the model page for exact terms.",
+}
+
+_CC_LICENSE_URLS = {
+    "CC BY": "https://creativecommons.org/licenses/by/4.0/",
+    "CC BY-SA": "https://creativecommons.org/licenses/by-sa/4.0/",
+    "CC BY-NC": "https://creativecommons.org/licenses/by-nc/4.0/",
+    "CC BY-NC-SA": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+    "CC BY-ND": "https://creativecommons.org/licenses/by-nd/4.0/",
+    "CC BY-NC-ND": "https://creativecommons.org/licenses/by-nc-nd/4.0/",
+    "CC0": "https://creativecommons.org/publicdomain/zero/1.0/",
+}
+
+_LICENSE_ALIASES = {
+    "creative commons - attribution": "CC BY",
+    "creative commons - attribution - share alike": "CC BY-SA",
+    "creative commons - attribution - non-commercial": "CC BY-NC",
+    "creative commons - attribution - non-commercial - share alike": "CC BY-NC-SA",
+    "creative commons - attribution - no derivatives": "CC BY-ND",
+    "creative commons - attribution - non-commercial - no derivatives": "CC BY-NC-ND",
+    "creative commons - public domain dedication": "CC0",
 }
 
 
@@ -121,6 +141,8 @@ def _unique_path(directory, name):
 
 def _parse_license(name, url=""):
     name = (name or "").strip()
+    name = _LICENSE_ALIASES.get(name.casefold(), name)
+    url = url or _CC_LICENSE_URLS.get(name, "")
     summary = LICENSE_DESCRIPTIONS.get(name, "")
     if not summary:
         upper = name.upper()
@@ -1918,6 +1940,7 @@ def _thingiverse_result(item):
         "downloads": item.get("download_count"),
         "likes": item.get("like_count"),
         "views": item.get("view_count"),
+        "makes": item.get("make_count"),
         "published_at": _coalesce(item.get("added"), item.get("created_at")),
         "is_free": True,
     }
@@ -1947,7 +1970,42 @@ class ThingiverseSearcher:
         response.raise_for_status()
         payload = response.json()
         items = payload if isinstance(payload, list) else payload.get("hits") or []
-        return [_thingiverse_result(item) for item in items]
+        results = [_thingiverse_result(item) for item in items]
+        for result in results:
+            # Search hits are intentionally compact and omit the license and
+            # complete counters. Load them from /things/{id} only when the user
+            # opens a card, avoiding one API request per search result.
+            result["_details_available"] = True
+            result["_details_loaded"] = False
+        return results
+
+    @staticmethod
+    def get_details(model, auth):
+        if not auth.authenticated("thingiverse"):
+            raise AuthRequired("Thingiverse requires an API access token")
+        thing_id = _model_identifier(
+            model,
+            "_thing_id",
+            r"thing(?::|%3A)(\d+)",
+            "Thingiverse model id is missing",
+        )
+        response = auth.request(
+            "thingiverse",
+            "GET",
+            f"{ThingiverseSearcher.API}/things/{thing_id}",
+            timeout=30,
+        )
+        if response.status_code in (401, 403):
+            raise AuthRequired("Thingiverse rejected the saved API access token")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise TypeError("Thingiverse returned invalid model details")
+        result = dict(model)
+        result.update(_thingiverse_result(payload))
+        result["_details_available"] = True
+        result["_details_loaded"] = True
+        return result
 
     @staticmethod
     def get_files(model, auth):
@@ -3058,8 +3116,11 @@ $('query').addEventListener('keydown',function(e){if(e.key==='Enter')doSearch()}
 function compactNumber(v){v=Number(v);if(!isFinite(v))return'';if(v>=1000000)return(v/1000000).toFixed(v>=10000000?0:1)+'M';if(v>=1000)return(v/1000).toFixed(v>=10000?0:1)+'K';return String(Math.round(v))}
 function metricText(m){var p=[];if(m.downloads!=null)p.push('Downloads '+compactNumber(m.downloads));if(m.likes!=null)p.push('Likes '+compactNumber(m.likes));if(m.rating!=null)p.push('Rating '+Number(m.rating).toFixed(1));if(m.views!=null)p.push('Views '+compactNumber(m.views));if(m.makes!=null)p.push('Prints '+compactNumber(m.makes));return p.join(' / ')}
 function renderResults(models){window._results=models||[];var html='';window._results.forEach(function(m,i){html+='<div class="card" data-idx="'+i+'"><img src="'+esc(safeUrl(m.thumbnail_url))+'"><h3 title="'+esc(m.name)+'">'+esc(m.name)+'</h3><div class="author">'+esc(m.author)+' · '+esc(m.platform)+'</div><div class="metrics">'+esc(metricText(m))+'</div><span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span></div>'});$('results').innerHTML=html;$('status').textContent=window._results.length+' result(s)'}
-$('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)showDetail(m,true)});
-function showDetail(m,open){selectedModel=m;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-metrics').innerHTML=metricText(m)?'<strong>Metrics:</strong> '+esc(metricText(m)):'';$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span>';$('det-summary').textContent=m.license_summary||'No license information available.';var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=m.result_type==='search_link';b.textContent=m.result_type==='search_link'?'Browser search only':(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
+function modelIdentity(m){return String((m&&m._platform_key)||'')+'|'+String((m&&m._thing_id)||(m&&m.url)||'')}
+function openModelDetail(m){var load=m._details_available&&!m._details_loaded&&!m._details_loading;if(load)m._details_loading=true;showDetail(m,true);if(load)orca.postMessage({action:'model_details',model:m})}
+$('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)openModelDetail(m)});
+function showDetail(m,open){selectedModel=m;var loading=!!m._details_loading;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-metrics').innerHTML=metricText(m)?'<strong>Metrics:</strong> '+esc(metricText(m)):'';$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(loading?'Loading...':(m.license||'Unknown'))+'</span>';$('det-summary').textContent=loading?'Loading the official license and complete metrics...':(m.license_summary||'No license information available.');var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=m.result_type==='search_link';b.textContent=m.result_type==='search_link'?'Browser search only':(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
+function applyModelDetails(m){m._details_loading=false;var idx=-1;for(var i=0;i<(window._results||[]).length;i++){if(modelIdentity(window._results[i])===modelIdentity(m)){idx=i;break}}if(idx>=0){window._results[idx]=m;renderResults(window._results)}if(selectedModel&&modelIdentity(selectedModel)===modelIdentity(m))showDetail(m,false);if(m._details_error)$('status').textContent='Could not load model details: '+m._details_error}
 function closeDetail(){$('detail').classList.remove('active')}
 document.addEventListener('pointerdown',function(e){var d=$('detail');if(!d||!d.classList.contains('active'))return;if(d.contains(e.target))return;closeDetail()},true);
 $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;e.preventDefault();openExternal(a.getAttribute('href'))});
@@ -3080,7 +3141,7 @@ function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform})}
 function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('status').textContent='Looking for Anycubic Slicer Next session...'}
-orca.onMessage(function(msg){msg=msg||{};if(msg.action==='results'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[])}else if(msg.action==='auth_status'||msg.action==='auth_changed'){updateAuth(msg.states||{});$('auth-submit').disabled=false;if(msg.action==='auth_changed'){closeAuth();$('status').textContent=msg.message||'Account session updated.';if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}}}else if(msg.action==='auth_challenge'){$('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.'}else if(msg.action==='auth_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform)}else if(msg.action==='file_choices'){showFilePicker(msg.files||[]);$('status').textContent='Select one or more files to import.'}else if(msg.action==='status'){$('status').textContent=msg.message}else if(msg.action==='imported'){closeFilePicker();$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Imported '+msg.count+' file(s) into the current OrcaSlicer project.'}else if(msg.action==='downloaded_only'){closeFilePicker();$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Downloaded '+msg.count+' file(s) to '+msg.dir+'. '+msg.message}else if(msg.action==='browser_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'This model must be downloaded in the browser.';if(msg.url)openExternal(msg.url)}else if(msg.action==='opened'){$('status').textContent='Opened in your browser.'}else if(msg.action==='activate_search'){var q=$('query');if(q){q.focus();q.select()}}else if(msg.action==='error'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;if($('det-import-btn')){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer'}if($('file-import'))$('file-import').disabled=false;$('status').textContent='Error: '+msg.message}});
+orca.onMessage(function(msg){msg=msg||{};if(msg.action==='results'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[])}else if(msg.action==='model_details'){applyModelDetails(msg.model||{})}else if(msg.action==='auth_status'||msg.action==='auth_changed'){updateAuth(msg.states||{});$('auth-submit').disabled=false;if(msg.action==='auth_changed'){closeAuth();$('status').textContent=msg.message||'Account session updated.';if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}}}else if(msg.action==='auth_challenge'){$('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.'}else if(msg.action==='auth_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform)}else if(msg.action==='file_choices'){showFilePicker(msg.files||[]);$('status').textContent='Select one or more files to import.'}else if(msg.action==='status'){$('status').textContent=msg.message}else if(msg.action==='imported'){closeFilePicker();$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Imported '+msg.count+' file(s) into the current OrcaSlicer project.'}else if(msg.action==='downloaded_only'){closeFilePicker();$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent='Downloaded '+msg.count+' file(s) to '+msg.dir+'. '+msg.message}else if(msg.action==='browser_required'){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'This model must be downloaded in the browser.';if(msg.url)openExternal(msg.url)}else if(msg.action==='opened'){$('status').textContent='Opened in your browser.'}else if(msg.action==='activate_search'){var q=$('query');if(q){q.focus();q.select()}}else if(msg.action==='error'){searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;if($('det-import-btn')){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer'}if($('file-import'))$('file-import').disabled=false;$('status').textContent='Error: '+msg.message}});
 orca.postMessage({action:'auth_status'});
 restorePortalSelection();
 setTimeout(function(){var q=$('query');if(q)q.focus()},0);
@@ -3139,6 +3200,7 @@ if orca is not None:
             msg = msg or {}
             handler = {
                 "search": self._handle_search,
+                "model_details": self._handle_model_details,
                 "resolve_import": self._handle_resolve_import,
                 "import_selected": self._handle_import_selected,
                 "open_external": self._handle_open_external,
@@ -3153,6 +3215,11 @@ if orca is not None:
 
         def _handle_search(self, msg):
             self._start(self._do_search, msg)
+
+        def _handle_model_details(self, msg):
+            model = msg.get("model") or {}
+            if model:
+                self._start(self._do_model_details, model)
 
         def _handle_resolve_import(self, msg):
             model = msg.get("model") or {}
@@ -3285,6 +3352,24 @@ if orca is not None:
             )
             if errors:
                 self._post({"action": "status", "message": " | ".join(errors)})
+
+        def _do_model_details(self, model):
+            result = dict(model)
+            spec = _platform_for_model(model)
+            loader = getattr(spec.adapter, "get_details", None) if spec else None
+            if not callable(loader):
+                result["_details_loaded"] = True
+            else:
+                try:
+                    loaded = loader(model, self.auth)
+                    if not isinstance(loaded, dict):
+                        raise TypeError("Model detail loader returned invalid data")
+                    result = loaded
+                except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+                    result["_details_loaded"] = True
+                    result["_details_error"] = str(exc)
+            result["_details_loading"] = False
+            self._post({"action": "model_details", "model": result})
 
         def _resolve_import(self, model):
             platform_name = model.get("platform", "")

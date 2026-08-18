@@ -5,6 +5,13 @@
 - Organized the repository into `src/`, `tests/`, `scripts/`, `docs/`, and `typings/` while keeping the plugin itself as one downloadable Python file.
 - Centralized test-module loading and reusable JavaScript/Windows IPC validation helpers.
 
+## 0.5.1
+
+- Fixed Thingiverse results showing `Unknown` when the compact search response omits the model license.
+- Added lazy official Thingiverse detail loading when a result card opens, avoiding an extra API request for every search hit.
+- Canonicalized Thingiverse Creative Commons names such as `Creative Commons - Attribution` to `CC BY` with the official license URL and summary.
+- Added Thingiverse download, view, and print counters from the detail response plus regression coverage for the real response shape.
+
 ## 0.5.0
 
 - Added a common nullable metrics schema and merged-result sorting by relevance, normalized popularity, downloads, likes, rating, publication date, print count, name, and platform.

@@ -43,6 +43,40 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertTrue(rows[0]["requires_auth"])
         self.assertEqual(rows[0]["downloads"], 42)
         self.assertIn("thing:7379392", rows[0]["url"])
+        self.assertTrue(rows[0]["_details_available"])
+        self.assertFalse(rows[0]["_details_loaded"])
+
+    def test_thingiverse_details_supply_canonical_license_and_metrics(self):
+        payload = {
+            "id": 2716464,
+            "name": "Cup / Mug hanger",
+            "public_url": "https://www.thingiverse.com/thing:2716464",
+            "creator": {"name": "workshopbob"},
+            "license": "Creative Commons - Attribution",
+            "download_count": 1234,
+            "like_count": 6800,
+            "view_count": 9000,
+            "make_count": 17,
+        }
+        model = {
+            "_thing_id": 2716464,
+            "_platform_key": "thingiverse",
+            "url": "https://www.thingiverse.com/thing:2716464",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("thingiverse", "token")
+            with mock.patch.object(auth, "request", return_value=FakeResponse(payload)):
+                result = mod.ThingiverseSearcher.get_details(model, auth)
+        self.assertEqual(result["license"], "CC BY")
+        self.assertEqual(
+            result["license_url"], "https://creativecommons.org/licenses/by/4.0/"
+        )
+        self.assertEqual(result["downloads"], 1234)
+        self.assertEqual(result["views"], 9000)
+        self.assertEqual(result["makes"], 17)
+        self.assertTrue(result["_details_loaded"])
+        self.assertEqual(result["_platform_key"], "thingiverse")
 
     def test_cults_search_marks_download_as_authenticated(self):
         html = '<a href="/en/3d-model/tool/3dbenchy-the-jolly-3d-printing-torture-test">3DBenchy</a>'
@@ -407,10 +441,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_050(self):
+    def test_version_is_051(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.5.0"', head)
+        self.assertIn('# version = "0.5.1"', head)
 
 
 if __name__ == "__main__":

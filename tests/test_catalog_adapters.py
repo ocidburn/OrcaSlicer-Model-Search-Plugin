@@ -9,18 +9,39 @@ from tests._module_loader import PLUGIN_PATH, load_plugin
 mod = load_plugin("search_engine_catalog")
 
 
+class FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self.payload
+
+
 class CatalogSearchTests(unittest.TestCase):
-    def test_thingiverse_search_parses_public_model_link(self):
-        html = '<a href="/thing:7379392"><img src="/img/cube.webp" alt="Calibration cube">Calibration cube</a>'
-        with mock.patch.object(
-            mod,
-            "_fetch_html",
-            return_value=(html, "https://www.thingiverse.com/search?q=cube"),
-        ):
-            rows = mod.ThingiverseSearcher.search("cube", None)
+    def test_thingiverse_search_uses_official_api(self):
+        payload = [
+            {
+                "id": 7379392,
+                "name": "Calibration cube",
+                "public_url": "https://www.thingiverse.com/thing:7379392",
+                "creator": {"name": "Tester"},
+                "download_count": 42,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("thingiverse", "token")
+            with mock.patch.object(auth, "request", return_value=FakeResponse(payload)):
+                rows = mod.ThingiverseSearcher.search("cube", auth)
         self.assertEqual(rows[0]["platform"], "Thingiverse")
         self.assertEqual(rows[0]["name"], "Calibration cube")
-        self.assertFalse(rows[0]["requires_auth"])
+        self.assertTrue(rows[0]["requires_auth"])
+        self.assertEqual(rows[0]["downloads"], 42)
         self.assertIn("thing:7379392", rows[0]["url"])
 
     def test_cults_search_marks_download_as_authenticated(self):
@@ -34,27 +55,34 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertEqual(rows[0]["platform"], "Cults3D")
         self.assertTrue(rows[0]["requires_auth"])
 
-    def test_myminifactory_search_parses_object(self):
-        html = '<a href="/object/3d-print-yak-mount-127830">Yak Mount</a>'
-        with mock.patch.object(
-            mod,
-            "_fetch_html",
-            return_value=(html, "https://www.myminifactory.com/search/?query=yak"),
-        ):
-            rows = mod.MyMiniFactorySearcher.search("yak", None)
+    def test_myminifactory_search_uses_official_api(self):
+        payload = {
+            "items": [
+                {
+                    "id": 127830,
+                    "name": "Yak Mount",
+                    "url": "https://www.myminifactory.com/object/3d-print-yak-mount-127830",
+                    "designer": {"username": "maker"},
+                    "views": 50,
+                    "likes": 4,
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("myminifactory", "api-key")
+            with mock.patch.object(auth, "request", return_value=FakeResponse(payload)):
+                rows = mod.MyMiniFactorySearcher.search("yak", auth)
         self.assertEqual(rows[0]["name"], "Yak Mount")
         self.assertEqual(rows[0]["platform"], "MyMiniFactory")
+        self.assertEqual(rows[0]["views"], 50)
 
-    def test_thangs_search_parses_model(self):
-        html = '<a href="/designer/LM3D/3d-model/Free%20Dragon-12345">Free Dragon</a>'
-        with mock.patch.object(
-            mod,
-            "_fetch_html",
-            return_value=(html, "https://thangs.com/search/dragon?scope=thangs"),
-        ):
-            rows = mod.ThangsSearcher.search("dragon", None)
+    def test_thangs_search_uses_explicit_browser_fallback(self):
+        rows = mod.ThangsSearcher.search("dragon", None)
         self.assertEqual(rows[0]["platform"], "Thangs")
-        self.assertIn("/designer/LM3D/3d-model/", rows[0]["url"])
+        self.assertEqual(rows[0]["result_type"], "search_link")
+        self.assertFalse(rows[0]["direct_import"])
+        self.assertIn("/search/dragon", rows[0]["url"])
 
     def test_creality_search_parses_model(self):
         html = '<a href="/model-detail/output">Output</a>'
@@ -125,14 +153,13 @@ class DownloadResolverTests(unittest.TestCase):
             files, [{"url": "https://cdn.example.test/part.3mf", "name": "part.3mf"}]
         )
 
-    def test_myminifactory_paid_object_goes_to_browser(self):
+    def test_myminifactory_api_key_without_oauth_archive_goes_to_browser(self):
         model = {"url": "https://www.myminifactory.com/object/3d-print-paid-123"}
-        html = "<h1>$12 Paid</h1><button>Add Files To Cart $12</button>"
-        with (
-            mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])),
-            self.assertRaises(mod.BrowserRequired),
-        ):
-            mod.MyMiniFactorySearcher.get_files(model)
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("myminifactory", "api-key")
+            with self.assertRaises(mod.BrowserRequired):
+                mod.MyMiniFactorySearcher.get_files(model, auth)
 
     def test_thangs_member_model_goes_to_browser(self):
         model = {"url": "https://thangs.com/designer/A/3d-model/Paid-1"}
@@ -143,15 +170,17 @@ class DownloadResolverTests(unittest.TestCase):
         ):
             mod.ThangsSearcher.get_files(model)
 
-    def test_thingiverse_prefers_public_zip(self):
+    def test_thingiverse_lists_files_through_official_api(self):
         model = {"url": "https://www.thingiverse.com/thing:7379392"}
-        with mock.patch.object(
-            mod,
-            "_probe_download",
-            return_value={"url": model["url"] + "/zip", "name": "download"},
-        ):
-            files = mod.ThingiverseSearcher.get_files(model)
-        self.assertEqual(files[0]["name"], "thingiverse_7379392.zip")
+        payload = [
+            {"name": "cube.stl", "download_url": "https://cdn.example/cube.stl"}
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("thingiverse", "token")
+            with mock.patch.object(auth, "request", return_value=FakeResponse(payload)):
+                files = mod.ThingiverseSearcher.get_files(model, auth)
+        self.assertEqual(files[0]["name"], "cube.stl")
 
     def test_cults_requires_account_before_files(self):
         model = {"url": "https://cults3d.com/en/3d-model/tool/free-model"}
@@ -240,6 +269,13 @@ class RegistryAndUiTests(unittest.TestCase):
             "crealitycloud",
             "nexprint",
             "grabcad",
+            "smithsonian",
+            "wikimedia",
+            "nasa",
+            "nih3d",
+            "youmagine",
+            "pinshape",
+            "cgtrader",
         }
         self.assertTrue(requested.issubset(mod._PLATFORMS))
         display = {
@@ -251,6 +287,13 @@ class RegistryAndUiTests(unittest.TestCase):
             "Creality Cloud",
             "Nexprint",
             "GrabCAD",
+            "Smithsonian 3D",
+            "Wikimedia Commons",
+            "NASA 3D Resources",
+            "NIH 3D",
+            "YouMagine",
+            "Pinshape",
+            "CGTrader",
         }
         self.assertTrue(display.issubset(mod._PLATFORMS_BY_DISPLAY))
 
@@ -264,11 +307,26 @@ class RegistryAndUiTests(unittest.TestCase):
             self.assertTrue(callable(spec.adapter.get_files))
             self.assertFalse(hasattr(spec.adapter, "enabled"))
 
-    def test_public_sites_do_not_have_auth_controls(self):
-        for platform in ("thingiverse", "myminifactory", "thangs", "crealitycloud"):
+    def test_only_authenticated_sites_have_auth_controls(self):
+        for platform in (
+            "thangs",
+            "crealitycloud",
+            "smithsonian",
+            "wikimedia",
+            "nasa",
+            "nih3d",
+            "youmagine",
+            "pinshape",
+            "cgtrader",
+        ):
             self.assertNotIn(f'id="auth-{platform}"', mod.PAGE)
-        self.assertIn('id="auth-cults3d"', mod.PAGE)
-        self.assertIn('id="auth-grabcad"', mod.PAGE)
+        for platform in (
+            "cults3d",
+            "grabcad",
+            "thingiverse",
+            "myminifactory",
+        ):
+            self.assertIn(f'id="auth-{platform}"', mod.PAGE)
 
     def test_every_available_searcher_has_portal_checkbox(self):
         import re
@@ -293,15 +351,66 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn("safeUrl(m.thumbnail_url)", mod.PAGE)
         self.assertIn("var modelUrl=safeUrl(m.url)", mod.PAGE)
 
+    def test_sort_and_filter_controls_are_present(self):
+        self.assertIn('id="sort"', mod.PAGE)
+        self.assertIn('value="downloads"', mod.PAGE)
+        self.assertIn('value="rating"', mod.PAGE)
+        self.assertIn('id="free-only"', mod.PAGE)
+        self.assertIn('id="direct-only"', mod.PAGE)
+
+    def test_common_sort_puts_missing_metrics_last(self):
+        rows = mod._filter_and_sort_results(
+            [
+                {"name": "missing", "platform": "A"},
+                {"name": "low", "platform": "A", "downloads": 2},
+                {"name": "high", "platform": "B", "downloads": 20},
+            ],
+            {"sort": "downloads"},
+        )
+        self.assertEqual([row["name"] for row in rows], ["high", "low", "missing"])
+        self.assertTrue(all(field in rows[0] for field in mod._COMMON_RESULT_FIELDS))
+
+    def test_filters_do_not_guess_unknown_free_status(self):
+        rows = mod._filter_and_sort_results(
+            [
+                {"name": "free", "platform": "A", "is_free": True},
+                {"name": "unknown", "platform": "B", "is_free": None},
+            ],
+            {"free_only": True},
+        )
+        self.assertEqual([row["name"] for row in rows], ["free"])
+
+    def test_newest_sort_normalizes_epoch_milliseconds_and_iso_dates(self):
+        rows = mod._filter_and_sort_results(
+            [
+                {
+                    "name": "older ISO",
+                    "platform": "A",
+                    "published_at": "2024-01-01T00:00:00Z",
+                },
+                {
+                    "name": "newer epoch",
+                    "platform": "B",
+                    "published_at": 1735689600000,
+                },
+                {"name": "unknown", "platform": "C"},
+            ],
+            {"sort": "newest"},
+        )
+        self.assertEqual(
+            [row["name"] for row in rows],
+            ["newer epoch", "older ISO", "unknown"],
+        )
+
     def test_unsupported_archive_types_are_not_advertised(self):
         self.assertNotIn(".rar", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_040(self):
+    def test_version_is_050(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.4.0"', head)
+        self.assertIn('# version = "0.5.0"', head)
 
 
 if __name__ == "__main__":

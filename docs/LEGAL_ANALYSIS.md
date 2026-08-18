@@ -1,208 +1,105 @@
-# Legal Analysis — OrcaSlicer 3D Model Search Plugin
+# Source, Account, and Legal Notes
 
-## Executive Summary
+This document records how the plugin reaches each catalog and which boundaries
+the implementation enforces. It is a technical project note, not legal advice.
+Platform terms and model licenses can change; the linked model page remains the
+authoritative source.
 
-4 adapters all use **publicly accessible endpoints** (no auth, no access control bypass).
-All platforms serve search results and license metadata from public URLs that the platform's
-own web frontend calls. We access the same public data at reasonable rates, with the
-license and a responsibility notice displayed before download. Risk: LOW.
+## Operating principles
 
-Core safeguards implemented:
-1. License metadata displayed BEFORE download (non-negotiable)
-2. Public endpoints only — no auth bypass, no credential extraction
-3. No caching, redistribution, or re-hosting of model files
-4. Responsibility notice shown with the license on every model
-5. No data collection or telemetry
+- The project does not host, mirror, or redistribute model files.
+- Search requests go from the user's OrcaSlicer installation to the selected
+  catalog. There is no project-operated proxy, telemetry service, or analytics.
+- Downloads use a catalog's own URL and, where required, the user's own account
+  session or developer credential.
+- A model's license is shown when the source exposes it. `Unknown` is preserved
+  when it does not; the plugin does not invent a permissive license.
+- Paid, checkout, membership, CAPTCHA, and other interactive flows remain in
+  the official browser.
+- Browser-only search cards are labelled as such and are not presented as
+  downloadable models.
 
-Downloading is the user's own act, under the user's own platform account. See
-[User Responsibility](#user-responsibility).
+## Source map
 
----
+| Source | Search mechanism | Credential | File behavior |
+|---|---|---|---|
+| Printables | Public GraphQL `searchPrints2` | None | Public model files |
+| MakerWorld | Bambu search service | None for search; user token for import | Signed profile download |
+| Makeronline | Public search endpoint | User Anycubic token for import | Account-authorized files |
+| Nexprint | Public model-library gateway | User `auth_token` for import | Account-authorized files |
+| Cults3D | Public HTML catalog | User browser cookies for files | Account/checkout rules preserved |
+| GrabCAD | Member HTML catalog | User browser cookies | Member download rules preserved |
+| Thingiverse | Official API | Personal developer access token | Official files API |
+| MyMiniFactory | Documented API v2 | Personal API key | API-key metadata; OAuth/store downloads stay in browser |
+| Creality Cloud | Current public model-tag pages | None for search | Direct public file when exposed; otherwise browser |
+| Smithsonian 3D | Official 3D file-search API | None | Open Access STL ZIP URL |
+| Wikimedia Commons | MediaWiki Action API | None | Original STL URL and Commons license metadata |
+| NASA 3D Resources | Official NASA GitHub repository tree | None | Canonical raw STL/3MF URL |
+| NIH 3D | Current public Discover web application | None | Validated public file when exposed; otherwise browser |
+| YouMagine | Current public HTML search | None | Validated public file when exposed; otherwise browser |
+| Pinshape | Current public HTML search | None for search | Official browser download flow |
+| Thangs | Pre-filled official browser search | Browser interaction | Browser only |
+| CGTrader | Pre-filled official browser search | Browser interaction | Browser only |
 
-## Platform-by-Platform Analysis
+Undocumented public web endpoints can change without notice. Their use here is
+limited to the same search metadata exposed to an ordinary visitor; the plugin
+does not solve challenges, impersonate another account, or bypass access gates.
 
-### 1. MakerWorld (Bambu Lab) — `api.bambulab.com`
+## Credentials and privacy
 
-| Aspect | Detail |
-|--------|--------|
-| Endpoint | `GET api.bambulab.com/v1/search-service/select/design2?keyword=X&limit=30` |
-| Auth | None required. Public endpoint. |
-| License metadata | `license` field: BY, BY-SA, BY-NC, BY-ND, CC0, Standard Digital File License, Exclusive |
-| Files | `designExtension.model_files[]` — model name, type, size |
-| Access method | Same API called by makerworld.com frontend. Public CDN endpoint. |
-| ToS risk | **LOW** — public endpoint, no auth bypass, no scraping. |
+The credential store contains tokens or copied session-cookie values only.
+Passwords are never persisted. MakerWorld may accept a password transiently to
+obtain the user's token; the value is removed from the message immediately after
+the login attempt.
 
-### 2. Nexprint (Elegoo) — `nexprint.com`
+Credentials are scoped by the central `PlatformSpec` registry:
 
-| Aspect | Detail |
-|--------|--------|
-| Endpoint | `GET nexprint.com/gateway/api/v1/model-library-server/model-base-info/search?keyword=X&pageNo=1&pageSize=30` |
-| Auth | None required. Public gateway. |
-| License metadata | `licenseType` integer: 0=CC0, 1=BY, 2=BY-SA, 3=BY-NC, 4=BY-NC-SA, 5=BY-ND, 6=BY-NC-ND, 7=ARR |
-| Files | `model-base-info/get?id=X` — `modelFileInfoList[]` with fileUrl, fileName |
-| Access method | Public REST gateway. Same API called by nexprint.com frontend. |
-| ToS risk | **LOW** — public gateway endpoint, no auth bypass. |
+- authorization headers are attached only to allow-listed platform hosts;
+- headers are rebuilt after every redirect;
+- query parameters are removed after the first redirect;
+- copied cookies are placed in a domain-scoped cookie jar;
+- signed CDN/storage downloads do not receive the platform bearer token.
 
-### 3. Makeronline (Anycubic) — `makeronline.com`
+The plugin does not collect search history, account identifiers, downloaded
+filenames, or usage analytics. A selected platform still receives the query and
+the ordinary request metadata needed to answer it under that platform's own
+privacy policy.
 
-| Aspect | Detail |
-|--------|--------|
-| Endpoint | `POST makeronline.com/api/search/model` with `{keyword, page, page_size, print_type:0, search:1}` |
-| Auth | None required. Public endpoint. |
-| License metadata | `license` integer. 1=BY, 2=BY-SA, 3=BY-NC, 4=BY-NC-SA, 5=BY-ND, 6=BY-NC-ND, 7=CC0, 8=Standard |
-| Files | `api/mold/detail?id=X` — `files[]` with url, file_name |
-| Access method | Same POST endpoint called by makeronline.com Nuxt frontend. |
-| ToS risk | **LOW** — public endpoint, no auth bypass. |
+## Download safeguards
 
-### 4. Printables (Prusa Research) — `printables.com`
+- Only HTTP(S) URLs are accepted.
+- Literal and DNS-resolved private/local targets are rejected.
+- HTML/login responses are rejected as model files.
+- Redirects and download sizes are bounded.
+- Filenames are sanitized and collision-safe.
+- ZIP extraction rejects path traversal and oversized archives.
+- Unsupported archive types are not advertised as importable.
+- A failed browser/file resolution is reported as a failure, not a successful
+  import.
 
-| Aspect | Detail |
-|--------|--------|
-| Endpoint | `POST api.printables.com/graphql/` — `searchPrints2(query:, limit:)` |
-| Auth | None required. Public API. |
-| License metadata | `license { name }` returned by the API (`LicenseType` exposes no url) |
-| Files | `print(id:){stls{name filePreviewPath}}`; files hosted on files.printables.com. |
-| Access method | The same GraphQL query the printables.com frontend issues. No scraping: the HTML search page is behind a Cloudflare challenge and is no longer requested at all. |
-| ToS risk | **LOW** — public API, no authentication bypass, no challenge circumvention. |
-| Precedent | hiQ v. LinkedIn (9th Cir. 2022): accessing publicly available website data is not a CFAA violation. |
+## User responsibility
 
-### 5. Thingiverse (UltiMaker)
+The user is responsible for reviewing and complying with both the model license
+and the hosting platform's terms. In particular, attribution, non-commercial,
+no-derivatives, share-alike, editorial-use, trademark, publicity, and government
+media restrictions may continue to apply after a technically successful
+download.
 
-Disabled. Thingiverse requires OAuth app registration but the developer portal was
-removed in the 2025 site migration. API still functions but new app tokens cannot
-be obtained. Re-evaluate when developer portal returns.
+License metadata reflects what the platform or uploader published. It is not a
+guarantee that the uploader owns the design or selected the correct license.
+Questions or takedown requests concerning a model should be directed to the
+platform hosting that model; this repository stores no model content.
 
-### 6. GrabCAD (Stratasys)
+## Maintenance checklist
 
-Disabled. Both v1 and v2 REST APIs return 404. Public API fully retired.
+When adding or changing a source:
 
----
+1. Prefer a documented first-party API.
+2. Record authentication and download boundaries in this file and the README.
+3. Keep unknown license, price, and free-status values nullable.
+4. Add deterministic adapter tests and, for anonymous sources, a live smoke case.
+5. Verify credential scoping, redirect behavior, SSRF checks, and browser fallback.
+6. Re-check the source's current developer terms and robots/access controls.
 
-## Key Legal Framework
-
-### No CFAA / Computer Misuse Violation
-
-All 4 adapters access **publicly available** endpoints without:
-- Circumventing any authentication or access control
-- Extracting credentials or session tokens
-- Password cracking or credential stuffing
-- Exceeding authorized access
-
-The hiQ v. LinkedIn precedent (9th Circuit, 2022) established that accessing publicly
-available data on a website is not a violation of the Computer Fraud and Abuse Act (CFAA),
-even when the website owner objects. All our endpoints are reachable without authentication.
-
-### No Copyright Infringement
-
-- We do NOT host, cache, mirror, or redistribute any 3D model files
-- We display license metadata before download (legal requirement for CC licenses)
-- Downloaded files are stored on the user's local machine
-- The user is responsible for complying with each model's license
-
-### GDPR / Data Privacy
-
-- No user data is collected, stored, or transmitted
-- Search queries go directly from the plugin to the platform's API
-- No analytics, no tracking, no telemetry
-- No cookies or persistent identifiers
-
----
-
-## User Responsibility
-
-**Every download is the user's own act, and the user's own responsibility.**
-
-The plugin is a search tool. It does not hold an account on any of these platforms, does
-not authenticate on the user's behalf, and does not obtain any right to any model. Where a
-platform gates its files behind a login — MakerWorld, Nexprint and Makeronline all do —
-the user signs in with their own credentials, under their own account, and the download
-happens under the terms that platform extends to *them*. The plugin is not a party to it.
-
-That means, explicitly:
-
-- **The licence binds the user, not the plugin.** Attribution, non-commercial limits,
-  no-derivatives clauses and share-alike obligations attach to whoever downloads and uses
-  the file. The plugin displays the licence so the user can honour it; it cannot honour it
-  for them.
-- **The platform's terms of use bind the user.** Signing in creates an agreement between
-  the user and the platform. Any account-level consequence of what is done with a
-  downloaded file — including suspension — falls on the account holder.
-- **Credentials stay with the user.** Any token entered is used only to call that platform
-  and is never transmitted anywhere else, collected, or shared.
-- **The plugin supplies no warranty and no indemnity.** It is MIT-licensed and, per that
-  licence, provided "as is" without warranty of any kind. Licence metadata is reproduced
-  as the platform publishes it; where a platform reports it wrongly or not at all, the
-  authoritative source is the model's own page, which every result links to.
-
-## Disclaimer of Liability for Copyright Infringement
-
-**The authors and contributors of this plugin disclaim all responsibility and all
-liability for any download or use of a copyright-protected design carried out against the
-rights holder's terms.**
-
-The plugin performs a keyword search against public endpoints and returns what those
-platforms publish. It does not host, mirror, cache, re-host or redistribute any model
-file; it does not review, moderate or verify what a platform lists; and it cannot
-determine whether a given listing was uploaded with the rights holder's permission. A
-design may be listed on a platform in breach of someone's copyright without the plugin
-having any means of knowing it.
-
-Accordingly:
-
-- **Selecting and downloading a model is the user's decision and the user's act.** If that
-  design is protected by copyright and the download or subsequent use — printing, sharing,
-  modifying, selling — exceeds what the rights holder permits, the resulting liability is
-  the user's alone.
-- **No liability is accepted by the authors or contributors** for infringement, for any
-  claim brought by a rights holder, or for any direct, indirect, incidental or
-  consequential damages arising from a user's download or use of any model. This is
-  consistent with the MIT licence's exclusion of warranty and of liability, which governs
-  this software.
-- **Licence metadata is informational, not a guarantee of title.** It is reproduced as the
-  platform publishes it. It reflects what the *uploader* declared, which is not proof that
-  the uploader held the rights to declare it. Where the metadata is absent, wrong, or
-  disputed, the model's own page — linked from every result — is authoritative, and the
-  rights holder is the only definitive source.
-- **Rights holders**: this project stores and serves no model content, so there is nothing
-  here to take down. Requests concerning a specific model must be directed to the platform
-  hosting it — MakerWorld, Nexprint, Makeronline or Printables — which is the party in a
-  position to act. If a search adapter is nonetheless implicated, open an issue on the
-  repository.
-
-Nothing in this document is legal advice.
-
-## Implemented Safeguards
-
-1. **License display** — every result shows the license name, its plain-English summary,
-   and a link to the full terms
-2. **License shown before download** — the detail panel is the only route to the import and
-   download buttons, so the license and the responsibility notice below it are on screen
-   before either can be pressed
-3. **Responsibility notice** — stated in the detail panel, next to the license, on every
-   model
-4. **No caching** — downloads go to the plugin's local directory only
-5. **No redistribution** — files are never uploaded or shared
-6. **No credential handling** — the plugin never stores, transmits or proxies a user's
-   platform login
-7. **Rate limiting** — reasonable request intervals (30s timeout, sequential queries)
-
----
-
-## Risk Matrix
-
-| Risk | Severity | Mitigation | Status |
-|------|----------|------------|--------|
-| User downloads ARR model without attribution | HIGH | License and responsibility notice displayed before download | Implemented |
-| Platform ToS violation (scraping) | MEDIUM | Public APIs only — no HTML scraping anywhere; no auth bypass; reasonable rates | Implemented |
-| Mass copyright infringement | MEDIUM | No bulk download; license shown first; liability disclaimer | Implemented |
-| Anti-bot blocking | LOW | Rate limiting; user-agent header | Implemented |
-| GDPR violation | LOW | No data collection | Verified |
-| OrcaSlicer ToS violation | LOW | Plugin is separate work (AGPL-compatible MIT license) | N/A |
-
----
-
-## License
-
-Plugin licensed under MIT. OrcaSlicer is AGPL-3.0. Python plugins loaded at runtime
-via OrcaSlicer's plugin system are separate works — not derivative works. The plugin
-imports `orca` as an API boundary (standard plugin model under copyright law).
+The plugin is distributed under the MIT License and supplied without warranty,
+as described in [LICENSE](../LICENSE).

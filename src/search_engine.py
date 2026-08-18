@@ -4,14 +4,15 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "3D Model Search Engine"
-# description = "Search and import 3D models from MakerWorld, Printables, Thingiverse, Cults3D, MyMiniFactory, Thangs, Makeronline, Creality Cloud, Nexprint, and GrabCAD."
+# description = "Search, sort, and import 3D-printable models from community, museum, scientific, and space catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.4.0"
+# version = "0.5.0"
 # ///
 
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -22,8 +23,9 @@ import time
 import urllib.parse
 import webbrowser
 import zipfile
+from datetime import datetime, timezone
 from html.parser import HTMLParser
-from typing import ClassVar
+from typing import Any, ClassVar
 
 try:
     import orca
@@ -32,7 +34,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.4.0 "
+    "OrcaSlicer-Model-Search-Plugin/0.5.0 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -202,6 +204,156 @@ class PlatformSpec:
     @property
     def requires_auth(self):
         return bool(self.auth_mode)
+
+
+_COMMON_RESULT_FIELDS = (
+    "downloads",
+    "likes",
+    "rating",
+    "rating_count",
+    "views",
+    "makes",
+    "published_at",
+    "price",
+    "is_free",
+)
+
+
+def _number(value, integer=False):
+    """Return a finite number or None for inconsistent catalog values."""
+    if value in (None, "", "null", "None") or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return int(parsed) if integer else parsed
+
+
+def _first(value: Any, default: Any = "") -> Any:
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else default
+    return value if value not in (None, "") else default
+
+
+def _coalesce(*values, default=""):
+    return next((value for value in values if value not in (None, "")), default)
+
+
+def _strip_html(value):
+    return _clean_web_text(re.sub(r"<[^>]+>", " ", str(value or "")))
+
+
+def _timestamp(value):
+    numeric = _number(value)
+    if numeric is not None:
+        return numeric / 1000.0 if numeric > 10_000_000_000 else numeric
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _normalize_result(item, source_rank=0):
+    normalized = dict(item or {})
+    for field in _COMMON_RESULT_FIELDS:
+        normalized.setdefault(field, None)
+    for field in ("downloads", "likes", "rating_count", "views", "makes"):
+        normalized[field] = _number(normalized.get(field), integer=True)
+    normalized["rating"] = _number(normalized.get("rating"))
+    normalized["price"] = _number(normalized.get("price"))
+    normalized["_published_sort"] = _timestamp(normalized.get("published_at"))
+    normalized["source_rank"] = int(source_rank)
+    normalized.setdefault("result_type", "model")
+    normalized.setdefault("direct_import", True)
+    return normalized
+
+
+def _add_popularity_scores(results):
+    """Create a platform-relative score; raw counters are not cross-site units."""
+    by_platform = {}
+    for item in results:
+        raw = 0.0
+        for field, weight in (
+            ("downloads", 1.0),
+            ("likes", 1.5),
+            ("views", 0.2),
+            ("makes", 2.0),
+        ):
+            value = item.get(field)
+            if value is not None and value >= 0:
+                raw += weight * math.log1p(value)
+        rating = item.get("rating")
+        if rating is not None:
+            raw += max(0.0, rating) * 0.75
+        item["_popularity_raw"] = raw
+        by_platform.setdefault(item.get("platform", ""), []).append(raw)
+    for item in results:
+        values = sorted(by_platform.get(item.get("platform", ""), ()))
+        raw = item.get("_popularity_raw", 0.0)
+        if not values or raw <= 0:
+            item["popularity"] = None
+            continue
+        item["popularity"] = (
+            100.0 if len(values) == 1 else 100.0 * values.index(raw) / (len(values) - 1)
+        )
+
+
+def _filter_results(results, options):
+    if options.get("free_only"):
+        results = [item for item in results if item.get("is_free") is True]
+    if options.get("direct_only"):
+        results = [
+            item
+            for item in results
+            if item.get("direct_import") and item.get("result_type") == "model"
+        ]
+    return results
+
+
+def _sort_results(results, sort):
+    descending_fields = {
+        "popularity": "popularity",
+        "downloads": "downloads",
+        "likes": "likes",
+        "rating": "rating",
+        "newest": "_published_sort",
+        "makes": "makes",
+    }
+    field = descending_fields.get(sort)
+    if field:
+        present = [item for item in results if item.get(field) is not None]
+        missing = [item for item in results if item.get(field) is None]
+        present.sort(key=lambda item: item[field], reverse=True)
+        results = present + missing
+    elif sort in ("name", "platform"):
+        results.sort(
+            key=lambda item: (
+                str(item.get(sort) or "").casefold(),
+                item["source_rank"],
+            )
+        )
+    return results
+
+
+def _filter_and_sort_results(results, options=None):
+    options = options if isinstance(options, dict) else {}
+    normalized = [_normalize_result(item, index) for index, item in enumerate(results)]
+    _add_popularity_scores(normalized)
+    normalized = _filter_results(normalized, options)
+    normalized = _sort_results(normalized, str(options.get("sort") or "relevance"))
+    for item in normalized:
+        item.pop("_popularity_raw", None)
+        item.pop("_published_sort", None)
+    return normalized
 
 
 _PLATFORMS = {}
@@ -1240,7 +1392,7 @@ class MakeronlineSearcher:
     SEARCH_URL = f"{MAKERONLINE_BASE}/api/search/model"
 
     @staticmethod
-    def search(query, _context):
+    def search(query, _context, options=None):
         import requests
 
         response = requests.post(
@@ -1289,6 +1441,11 @@ class MakeronlineSearcher:
                     "url": item.get("target_url", ""),
                     "_mold_id": item.get("mold_id"),
                     "requires_auth": True,
+                    "downloads": item.get("download_num"),
+                    "likes": item.get("like_num"),
+                    "published_at": item.get("publish_time")
+                    or item.get("created_time"),
+                    "is_free": not bool(item.get("is_premium")),
                 }
             )
         return results
@@ -1342,7 +1499,7 @@ class NexprintSearcher:
     )
 
     @staticmethod
-    def search(query, _context):
+    def search(query, _context, options=None):
         import requests
 
         response = requests.get(
@@ -1358,6 +1515,7 @@ class NexprintSearcher:
         page = (data.get("data") or {}).get("pageResult") or {}
         results = []
         for item in page.get("list") or []:
+            statistics = item.get("statistics") or {}
             lic_name, lic_url = NEXPRINT_LICENSES.get(
                 item.get("licenseType", 0), ("Unknown", "")
             )
@@ -1377,6 +1535,12 @@ class NexprintSearcher:
                     "url": f"{NEXPRINT_BASE}/models/{model_id or ''}",
                     "_model_id": model_id,
                     "requires_auth": True,
+                    "downloads": statistics.get("staticsModelDownloadCount"),
+                    "likes": statistics.get("staticsModelStarPeoPleCount"),
+                    "views": statistics.get("staticsModelReadCount"),
+                    "makes": statistics.get("staticsModelPrintCount"),
+                    "published_at": item.get("publishTime"),
+                    "is_free": not bool(item.get("price")),
                 }
             )
         return results
@@ -1415,20 +1579,37 @@ class NexprintSearcher:
 class PrintablesSearcher:
     GRAPHQL_URL = "https://api.printables.com/graphql/"
     SEARCH_QUERY = (
-        "query Search($query: String!, $limit: Int) {"
-        " searchPrints2(query: $query, limit: $limit) {"
-        " items { id name slug image { filePath } license { name } user { publicUsername } } } }"
+        "query Search($query: String!, $limit: Int, $ordering: SearchChoicesEnum) {"
+        " searchPrints2(query: $query, limit: $limit, ordering: $ordering) {"
+        " items { id name slug downloadCount likesCount ratingAvg datePublished "
+        " image { filePath } license { name } user { publicUsername } } } }"
     )
 
     @staticmethod
-    def search(query, _context):
+    def search(query, _context, options=None):
         import requests
+
+        requested_sort = (
+            str(options.get("sort") or "") if isinstance(options, dict) else ""
+        )
+        ordering = {
+            "popularity": "popular",
+            "likes": "popular",
+            "downloads": "popular",
+            "rating": "rating",
+            "newest": "latest",
+            "makes": "makes_count",
+        }.get(requested_sort, "best_match")
 
         response = requests.post(
             PrintablesSearcher.GRAPHQL_URL,
             json={
                 "query": PrintablesSearcher.SEARCH_QUERY,
-                "variables": {"query": query, "limit": 30},
+                "variables": {
+                    "query": query,
+                    "limit": 30,
+                    "ordering": ordering,
+                },
             },
             headers={"Content-Type": "application/json", "User-Agent": _BROWSER_UA},
             timeout=30,
@@ -1464,6 +1645,11 @@ class PrintablesSearcher:
                     "url": url,
                     "requires_auth": False,
                     "importable": True,
+                    "downloads": item.get("downloadCount"),
+                    "likes": item.get("likesCount"),
+                    "rating": item.get("ratingAvg"),
+                    "published_at": item.get("datePublished"),
+                    "is_free": True,
                 }
             )
         return results
@@ -1527,7 +1713,7 @@ class MakerWorldSearcher:
     }
 
     @staticmethod
-    def search(query, _context):
+    def search(query, _context, options=None):
         import requests
 
         response = requests.get(
@@ -1558,6 +1744,13 @@ class MakerWorldSearcher:
                     "url": f"{MakerWorldSearcher.BASE}/en/models/{model_id or ''}",
                     "_model_id": model_id,
                     "requires_auth": True,
+                    "downloads": hit.get("downloadCount")
+                    or hit.get("rawModelFileDownloadCount"),
+                    "likes": hit.get("likeCount"),
+                    "views": hit.get("readCount"),
+                    "makes": hit.get("printCount"),
+                    "published_at": hit.get("createTime"),
+                    "is_free": not bool(hit.get("price")),
                 }
             )
         return results
@@ -1685,40 +1878,100 @@ class MakerWorldSearcher:
         return [{"name": name, "url": url, "signed": True}]
 
 
+def _license_from_api(value):
+    value = _first(value, "Unknown")
+    if isinstance(value, dict):
+        value = value.get("name") or "Unknown"
+    return _parse_license(str(value))
+
+
+def _thingiverse_thumbnail(item):
+    direct = _coalesce(item.get("thumbnail"), item.get("preview_image"))
+    if direct:
+        return direct
+    images = item.get("images") or []
+    return (images[0].get("url") or "") if images else ""
+
+
+def _thingiverse_result(item):
+    creator = item.get("creator") or {}
+    lic = _license_from_api(item.get("license"))
+    thing_id = item.get("id")
+    url = _coalesce(
+        item.get("public_url"),
+        default=f"https://www.thingiverse.com/thing:{thing_id}",
+    )
+    return {
+        "name": _coalesce(item.get("name"), default="Untitled"),
+        "author": _coalesce(
+            creator.get("name"), creator.get("username"), default="Unknown"
+        ),
+        "platform": "Thingiverse",
+        "thumbnail_url": _thingiverse_thumbnail(item),
+        "license": lic["name"],
+        "license_url": lic["url"],
+        "license_summary": lic["summary"],
+        "download_url": url,
+        "url": url,
+        "_thing_id": thing_id,
+        "requires_auth": True,
+        "downloads": item.get("download_count"),
+        "likes": item.get("like_count"),
+        "views": item.get("view_count"),
+        "published_at": _coalesce(item.get("added"), item.get("created_at")),
+        "is_free": True,
+    }
+
+
 class ThingiverseSearcher:
     BASE = "https://www.thingiverse.com"
-    SEARCH_URLS = (
-        BASE + "/search?q={query}&page=1&type=things&sort=relevant",
-        BASE + "/search?type=things&q={query}",
-    )
-    PATH_RE = r"/thing(?::|%3A)\d+"
+    API = "https://api.thingiverse.com"
 
     @staticmethod
-    def search(query, context):
-        return _catalog_search(
-            query,
-            ThingiverseSearcher.SEARCH_URLS,
-            ThingiverseSearcher.PATH_RE,
-            "Thingiverse",
+    def search(query, context, options=None):
+        if not isinstance(context, AuthManager) or not context.authenticated(
+            "thingiverse"
+        ):
+            raise AuthRequired(
+                "Thingiverse search now requires a personal Thingiverse API access token"
+            )
+        response = context.request(
+            "thingiverse",
+            "GET",
+            f"{ThingiverseSearcher.API}/search/{urllib.parse.quote(query, safe='')}",
+            params={"type": "things", "sort": "relevant", "per_page": 30},
+            timeout=30,
         )
+        if response.status_code in (401, 403):
+            raise AuthRequired("Thingiverse rejected the saved API access token")
+        response.raise_for_status()
+        payload = response.json()
+        items = payload if isinstance(payload, list) else payload.get("hits") or []
+        return [_thingiverse_result(item) for item in items]
 
     @staticmethod
-    def get_files(model, auth=None):
-        url = (model.get("url") or "").rstrip("/")
-        if not url:
-            raise ValueError("Thingiverse model URL is missing")
-        # Current Thingiverse exposes a public Download All Files action. Try the
-        # traditional zip route first; if the site changes it, fall back to
-        # parsing the model and Files pages for individual public file links.
-        zip_candidate = _probe_download(url + "/zip")
-        if zip_candidate:
-            m = re.search(r"thing(?::|%3A)(\d+)", url, re.IGNORECASE)
-            zip_candidate["name"] = f"thingiverse_{m.group(1) if m else 'model'}.zip"
-            return [zip_candidate]
-        return _public_page_files(
+    def get_files(model, auth):
+        if not auth.authenticated("thingiverse"):
+            raise AuthRequired("Thingiverse requires an API access token")
+        thing_id = _model_identifier(
             model,
-            extra_urls=(url + "/files",),
-            no_direct_message="Thingiverse did not expose a public file URL for this model; open the model page in the browser.",
+            "_thing_id",
+            r"thing(?::|%3A)(\d+)",
+            "Thingiverse model id is missing",
+        )
+        response = auth.request(
+            "thingiverse",
+            "GET",
+            f"{ThingiverseSearcher.API}/things/{thing_id}/files",
+            timeout=30,
+        )
+        if response.status_code in (401, 403):
+            raise AuthRequired("Thingiverse rejected the saved API access token")
+        response.raise_for_status()
+        return _file_records(
+            response.json(),
+            ("download_url", "public_url", "url"),
+            ("name", "filename"),
         )
 
 
@@ -1731,7 +1984,7 @@ class Cults3DSearcher:
     PATH_RE = r"/en/3d-model/[a-z0-9_-]+/[a-z0-9%._~+()-]+"
 
     @staticmethod
-    def search(query, context):
+    def search(query, context, options=None):
         items = _catalog_search(
             query, Cults3DSearcher.SEARCH_URLS, Cults3DSearcher.PATH_RE, "Cults3D"
         )
@@ -1756,74 +2009,141 @@ class Cults3DSearcher:
         )
 
 
+def _myminifactory_result(item):
+    designer = item.get("designer") or {}
+    images = item.get("images") or []
+    image = images[0] if images else {}
+    lic = _license_from_api(item.get("licenses"))
+    url = _coalesce(
+        item.get("url"),
+        default=f"https://www.myminifactory.com/object/{item.get('id', '')}",
+    )
+    archive = item.get("archive_download_url") or ""
+    return {
+        "name": _coalesce(item.get("name"), default="Untitled"),
+        "author": _coalesce(
+            designer.get("username"), designer.get("name"), default="Unknown"
+        ),
+        "platform": "MyMiniFactory",
+        "thumbnail_url": _coalesce(
+            image.get("thumbnail_url"), image.get("url")
+        ),
+        "license": lic["name"],
+        "license_url": lic["url"],
+        "license_summary": lic["summary"],
+        "download_url": url,
+        "url": url,
+        "_archive_download_url": archive,
+        "requires_auth": True,
+        "direct_import": bool(archive),
+        "views": item.get("views"),
+        "likes": item.get("likes"),
+        "published_at": item.get("published_at"),
+        "is_free": None,
+    }
+
+
 class MyMiniFactorySearcher:
     BASE = "https://www.myminifactory.com"
-    SEARCH_URLS = (
-        BASE + "/search/query/?query={query}",
-        BASE + "/search/?query={query}",
-        BASE + "/search/?q={query}",
-        BASE + "/search/{query}",
-    )
-    PATH_RE = r"/object/3d-print-[a-z0-9%._~+()-]+-\d+"
+    API = BASE + "/api/v2/search"
 
     @staticmethod
-    def search(query, context):
-        return _catalog_search(
-            query,
-            MyMiniFactorySearcher.SEARCH_URLS,
-            MyMiniFactorySearcher.PATH_RE,
-            "MyMiniFactory",
+    def search(query, context, options=None):
+        if not isinstance(context, AuthManager) or not context.authenticated(
+            "myminifactory"
+        ):
+            raise AuthRequired(
+                "MyMiniFactory search requires a personal API key from MyMiniFactory"
+            )
+        requested_sort = (
+            str(options.get("sort") or "") if isinstance(options, dict) else ""
         )
+        sort = {
+            "popularity": "popularity",
+            "views": "visits",
+            "newest": "date",
+        }.get(requested_sort, "popularity")
+        response = context.request(
+            "myminifactory",
+            "GET",
+            MyMiniFactorySearcher.API,
+            params={
+                "key": context.token("myminifactory"),
+                "q": query,
+                "page": 1,
+                "per_page": 30,
+                "sort": sort,
+                "order": "desc",
+            },
+            timeout=30,
+        )
+        if response.status_code in (401, 403):
+            raise AuthRequired("MyMiniFactory rejected the saved API key")
+        response.raise_for_status()
+        return [_myminifactory_result(item) for item in response.json().get("items") or []]
 
     @staticmethod
-    def get_files(model, auth=None):
-        return _public_page_files(
-            model,
-            restricted_markers=("Add Files To Cart",),
-            no_direct_message="MyMiniFactory did not expose a public direct file for this object. Paid/member-only objects must be downloaded in the browser.",
+    def get_files(model, auth):
+        if not auth.authenticated("myminifactory"):
+            raise AuthRequired("MyMiniFactory requires a personal API key")
+        archive = model.get("_archive_download_url") or ""
+        if archive:
+            return [{"name": "myminifactory_model.zip", "url": archive}]
+        raise BrowserRequired(
+            "MyMiniFactory API keys can search metadata, but file archives require the official account/OAuth download flow.",
+            model.get("url", ""),
         )
+
+
+def _browser_search_result(query, platform, url):
+    return {
+        "name": f"Open {platform} results for “{query}”",
+        "author": "Browser search",
+        "platform": platform,
+        "thumbnail_url": "",
+        "license": "Varies by model",
+        "license_url": "",
+        "license_summary": "Review the license on the selected model page.",
+        "download_url": url,
+        "url": url,
+        "requires_auth": False,
+        "direct_import": False,
+        "result_type": "search_link",
+        "is_free": None,
+    }
 
 
 class ThangsSearcher:
     BASE = "https://thangs.com"
-    SEARCH_URLS = (
-        BASE + "/search/{query}?scope=thangs&view=list",
-        BASE + "/digital/search/{query}?scope=thangs&view=list",
-    )
-    PATH_RE = r"/designer/[^\"'<>?#]+/3d-model/[^\"'<>?#]+"
-
     @staticmethod
-    def search(query, context):
-        return _catalog_search(
-            query, ThangsSearcher.SEARCH_URLS, ThangsSearcher.PATH_RE, "Thangs"
-        )
+    def search(query, context, options=None):
+        url = f"{ThangsSearcher.BASE}/search/{urllib.parse.quote(query, safe='')}?scope=thangs"
+        return [_browser_search_result(query, "Thangs", url)]
 
     @staticmethod
     def get_files(model, auth=None):
-        return _public_page_files(
-            model,
-            restricted_markers=(
-                "Become a member to download",
-                "Add download to cart",
-                "Purchase model for",
-            ),
-            no_direct_message="Thangs did not expose a public direct file for this free model. Use Open in browser for member/paid or interactive downloads.",
+        raise BrowserRequired(
+            "Thangs protects search and downloads with an interactive browser check.",
+            model.get("url", ""),
         )
 
 
 class CrealityCloudSearcher:
     BASE = "https://www.crealitycloud.com"
-    SEARCH_URLS = (BASE + "/search/model?q={query}",)
+    SEARCH_URLS = (BASE + "/model-tags/{query}",)
     PATH_RE = r"/model-detail/[a-z0-9%._~+()-]+"
 
     @staticmethod
-    def search(query, context):
-        return _catalog_search(
+    def search(query, context, options=None):
+        items = _catalog_search(
             query,
             CrealityCloudSearcher.SEARCH_URLS,
             CrealityCloudSearcher.PATH_RE,
             "Creality Cloud",
         )
+        for item in items:
+            item["is_free"] = None
+        return items
 
     @staticmethod
     def get_files(model, auth=None):
@@ -1843,7 +2163,7 @@ class GrabcadSearcher:
     PATH_RE = r"/library/[a-z0-9%._~+()-]+"
 
     @staticmethod
-    def search(query, context):
+    def search(query, context, options=None):
         if not isinstance(context, AuthManager) or not context.authenticated("grabcad"):
             raise AuthRequired(
                 "GrabCAD requires a free member account to access/download Community Library models. Connect a browser session first."
@@ -1866,6 +2186,353 @@ class GrabcadSearcher:
             auth=auth,
             platform_key="grabcad",
             no_direct_message="GrabCAD did not expose a downloadable CAD file to this browser session. Open the model page and refresh the saved Cookie header if necessary.",
+        )
+
+
+class SmithsonianSearcher:
+    API = "https://3d-api.si.edu/api/v1.0/content/file/search"
+
+    @staticmethod
+    def search(query, _context, options=None):
+        import requests
+
+        response = requests.get(
+            SmithsonianSearcher.API,
+            params={"q": query, "model_type": "stl", "start": 0, "rows": 30},
+            headers={"User-Agent": _BROWSER_UA},
+            timeout=30,
+        )
+        response.raise_for_status()
+        results = []
+        for item in response.json().get("rows") or []:
+            content = item.get("content") or {}
+            direct = content.get("uri") or ""
+            identifier = str(content.get("model_url") or "").split(":", 1)[-1]
+            results.append(
+                {
+                    "name": item.get("title") or "Untitled",
+                    "author": "Smithsonian Institution",
+                    "platform": "Smithsonian 3D",
+                    "thumbnail_url": "",
+                    "license": "Smithsonian Open Access",
+                    "license_url": "https://www.si.edu/openaccess",
+                    "license_summary": "Released through the Smithsonian Open Access initiative.",
+                    "download_url": direct,
+                    "url": f"https://3d.si.edu/object/3d/{identifier}"
+                    if identifier
+                    else direct,
+                    "_direct_file": direct,
+                    "requires_auth": False,
+                    "direct_import": bool(direct),
+                    "is_free": True,
+                }
+            )
+        return results
+
+    @staticmethod
+    def get_files(model, auth=None):
+        url = model.get("_direct_file") or model.get("download_url") or ""
+        if not url:
+            return []
+        name = os.path.basename(urllib.parse.urlsplit(url).path) or "smithsonian.zip"
+        return [{"name": name, "url": url}]
+
+
+class WikimediaCommonsSearcher:
+    API = "https://commons.wikimedia.org/w/api.php"
+
+    @staticmethod
+    def search(query, _context, options=None):
+        import requests
+
+        response = requests.get(
+            WikimediaCommonsSearcher.API,
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": f'{query} incategory:"STL files"',
+                "gsrnamespace": 6,
+                "gsrlimit": 30,
+                "prop": "imageinfo",
+                "iiprop": "url|extmetadata|size",
+                "iiurlwidth": 400,
+                "format": "json",
+                "formatversion": 2,
+            },
+            headers={"User-Agent": _BROWSER_UA},
+            timeout=30,
+        )
+        response.raise_for_status()
+        results = []
+        for page in (response.json().get("query") or {}).get("pages") or []:
+            info_rows = page.get("imageinfo") or []
+            if not info_rows:
+                continue
+            info = info_rows[0]
+            metadata = info.get("extmetadata") or {}
+
+            def meta(name, default="", metadata=metadata):
+                value = metadata.get(name) or {}
+                return value.get("value", default) if isinstance(value, dict) else default
+
+            lic = _parse_license(
+                _strip_html(meta("LicenseShortName")) or "Unknown",
+                meta("LicenseUrl"),
+            )
+            title = _strip_html(meta("ObjectName")) or page.get("title", "")
+            direct = info.get("url") or ""
+            results.append(
+                {
+                    "name": re.sub(r"^File:", "", title, flags=re.IGNORECASE),
+                    "author": _strip_html(meta("Artist")) or "Unknown",
+                    "platform": "Wikimedia Commons",
+                    "thumbnail_url": info.get("thumburl") or "",
+                    "license": lic["name"],
+                    "license_url": lic["url"],
+                    "license_summary": lic["summary"],
+                    "download_url": direct,
+                    "url": info.get("descriptionurl") or direct,
+                    "_direct_file": direct,
+                    "requires_auth": False,
+                    "direct_import": True,
+                    "published_at": meta("DateTimeOriginal") or meta("DateTime"),
+                    "is_free": True,
+                }
+            )
+        return results
+
+    @staticmethod
+    def get_files(model, auth=None):
+        url = model.get("_direct_file") or model.get("download_url") or ""
+        name = os.path.basename(urllib.parse.urlsplit(url).path) or "commons_model.stl"
+        return [{"name": urllib.parse.unquote(name), "url": url}] if url else []
+
+
+class NasaSearcher:
+    TREE_API = (
+        "https://api.github.com/repos/nasa/NASA-3D-Resources/git/trees/master"
+        "?recursive=1"
+    )
+    REPO = "https://github.com/nasa/NASA-3D-Resources"
+    RAW = "https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/"
+
+    @staticmethod
+    def search(query, _context, options=None):
+        import requests
+
+        response = requests.get(
+            NasaSearcher.TREE_API,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": _BROWSER_UA},
+            timeout=30,
+        )
+        response.raise_for_status()
+        terms = [term.casefold() for term in re.findall(r"[\w-]+", query)]
+        results = []
+        for item in response.json().get("tree") or []:
+            path = str(item.get("path") or "")
+            lower = path.casefold()
+            if item.get("type") != "blob" or not lower.endswith((".stl", ".3mf")):
+                continue
+            if terms and not all(term in lower for term in terms):
+                continue
+            direct = NasaSearcher.RAW + urllib.parse.quote(path, safe="/")
+            page = NasaSearcher.REPO + "/blob/master/" + urllib.parse.quote(path, safe="/")
+            results.append(
+                {
+                    "name": os.path.splitext(os.path.basename(path))[0],
+                    "author": "NASA",
+                    "platform": "NASA 3D Resources",
+                    "thumbnail_url": "",
+                    "license": "NASA Media Usage Guidelines",
+                    "license_url": "https://www.nasa.gov/nasa-brand-center/images-and-media/",
+                    "license_summary": "NASA resource; review NASA's media usage guidelines.",
+                    "download_url": direct,
+                    "url": page,
+                    "_direct_file": direct,
+                    "requires_auth": False,
+                    "direct_import": True,
+                    "is_free": True,
+                }
+            )
+            if len(results) >= 30:
+                break
+        return results
+
+    @staticmethod
+    def get_files(model, auth=None):
+        url = model.get("_direct_file") or model.get("download_url") or ""
+        name = os.path.basename(urllib.parse.urlsplit(url).path) or "nasa_model.stl"
+        return [{"name": urllib.parse.unquote(name), "url": url}] if url else []
+
+
+class Nih3DSearcher:
+    BASE = "https://3d.nih.gov"
+    _server_action: ClassVar[str] = ""
+
+    @classmethod
+    def _discover_search_action(cls, session):
+        if cls._server_action:
+            return cls._server_action
+        page = session.get(cls.BASE + "/discover", timeout=30)
+        page.raise_for_status()
+        paths = re.findall(r'<script[^>]+src="([^"]+)"', page.text, re.IGNORECASE)
+        path = next(
+            (value for value in paths if "/discover/page-" in value),
+            "",
+        )
+        if not path:
+            raise RuntimeError("NIH 3D discover application script was not found")
+        script = session.get(urllib.parse.urljoin(cls.BASE, path), timeout=30)
+        script.raise_for_status()
+        match = re.search(
+            r'createServerReference\)\("([0-9a-f]{40,64})".{0,250}"discoverSearch"',
+            script.text,
+        )
+        if not match:
+            raise RuntimeError("NIH 3D search action was not found")
+        cls._server_action = match.group(1)
+        return cls._server_action
+
+    @staticmethod
+    def _flight_payload(response):
+        marker = response.text.find('1:{"status"')
+        if marker < 0:
+            return None
+        payload, _end = json.JSONDecoder().raw_decode(response.text[marker + 2 :])
+        return payload
+
+    @staticmethod
+    def search(query, _context, options=None):
+        import requests
+
+        terms = " ".join(re.findall(r"[\w-]+", query, re.UNICODE))[:160]
+        if not terms:
+            return []
+        expression = (
+            'type:entry AND submissionstatus:"Published" AND '
+            f"{terms}?start=0&size=30&sort=publisheddate desc"
+        )
+        session = requests.Session()
+        session.headers.update({"User-Agent": _BROWSER_UA})
+        payload = None
+        for _attempt in range(2):
+            action = Nih3DSearcher._discover_search_action(session)
+            response = session.post(
+                Nih3DSearcher.BASE + "/discover",
+                data=json.dumps([expression]),
+                headers={
+                    "Accept": "text/x-component",
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Next-Action": action,
+                },
+                timeout=30,
+            )
+            if response.status_code < 400:
+                payload = Nih3DSearcher._flight_payload(response)
+            if payload:
+                break
+            Nih3DSearcher._server_action = ""
+        if not payload:
+            raise RuntimeError("NIH 3D search response format changed")
+        results = []
+        for hit in (payload.get("hits") or {}).get("hit") or []:
+            fields = hit.get("fields") or {}
+            identifier = str(_first(fields.get("paddedentryid") or fields.get("id")))
+            lic_name = str(_first(fields.get("license"), "Unknown"))
+            lic = _parse_license(lic_name.replace("CC-", "CC "))
+            page = f"{Nih3DSearcher.BASE}/entries/3DPX-{identifier}"
+            thumbnail = str(_first(fields.get("thumbnail")))
+            results.append(
+                {
+                    "name": str(_first(fields.get("title"), "Untitled")),
+                    "author": str(_first(fields.get("createdby"), "Unknown")),
+                    "platform": "NIH 3D",
+                    "thumbnail_url": urllib.parse.urljoin(Nih3DSearcher.BASE, thumbnail),
+                    "license": lic["name"],
+                    "license_url": lic["url"],
+                    "license_summary": lic["summary"],
+                    "download_url": page,
+                    "url": page,
+                    "requires_auth": False,
+                    "direct_import": False,
+                    "downloads": _first(fields.get("downloadcount"), None),
+                    "views": _first(fields.get("viewcount"), None),
+                    "published_at": _first(fields.get("publisheddate"), None),
+                    "is_free": True,
+                }
+            )
+        return results
+
+    @staticmethod
+    def get_files(model, auth=None):
+        return _public_page_files(
+            model,
+            no_direct_message="NIH 3D uses an interactive file-selection flow for this entry. Open it in the browser.",
+        )
+
+
+class YouMagineSearcher:
+    BASE = "https://youmagine.com"
+    SEARCH_URLS = (BASE + "/explore?query={query}",)
+    PATH_RE = r"/designs/[a-f0-9-]+"
+
+    @staticmethod
+    def search(query, context, options=None):
+        items = _catalog_search(
+            query, YouMagineSearcher.SEARCH_URLS, YouMagineSearcher.PATH_RE, "YouMagine"
+        )
+        for item in items:
+            item["is_free"] = None
+        return items
+
+    @staticmethod
+    def get_files(model, auth=None):
+        return _public_page_files(
+            model,
+            no_direct_message="YouMagine requires its official model page for this download.",
+        )
+
+
+class PinshapeSearcher:
+    BASE = "https://pinshape.com"
+    SEARCH_URLS = (BASE + "/items?search={query}",)
+    PATH_RE = r"/items/\d+-[a-z0-9%._~+()-]+"
+
+    @staticmethod
+    def search(query, context, options=None):
+        items = _catalog_search(
+            query, PinshapeSearcher.SEARCH_URLS, PinshapeSearcher.PATH_RE, "Pinshape"
+        )
+        for item in items:
+            if item.get("name", "").casefold() in ("free", "premium"):
+                item["name"] = _slug_title(item.get("url", ""))
+            item["direct_import"] = False
+            item["is_free"] = None
+        return items
+
+    @staticmethod
+    def get_files(model, auth=None):
+        raise BrowserRequired(
+            "Pinshape downloads use the official account/browser flow.",
+            model.get("url", ""),
+        )
+
+
+class CgTraderSearcher:
+    BASE = "https://www.cgtrader.com"
+
+    @staticmethod
+    def search(query, context, options=None):
+        url = CgTraderSearcher.BASE + "/3d-models?keywords=" + urllib.parse.quote(
+            query, safe=""
+        )
+        return [_browser_search_result(query, "CGTrader", url)]
+
+    @staticmethod
+    def get_files(model, auth=None):
+        raise BrowserRequired(
+            "CGTrader search and downloads require its interactive browser flow.",
+            model.get("url", ""),
         )
 
 
@@ -1900,7 +2567,15 @@ _PLATFORM_SPECS = (
         login_url="https://makerworld.com/en/sign-in",
         referer="https://makerworld.com/",
     ),
-    PlatformSpec("thingiverse", "Thingiverse", ThingiverseSearcher),
+    PlatformSpec(
+        "thingiverse",
+        "Thingiverse",
+        ThingiverseSearcher,
+        auth_hosts=("api.thingiverse.com",),
+        auth_mode="bearer",
+        login_url="https://www.thingiverse.com/developers",
+        referer="https://www.thingiverse.com/",
+    ),
     PlatformSpec(
         "cults3d",
         "Cults3D",
@@ -1911,7 +2586,15 @@ _PLATFORM_SPECS = (
         referer="https://cults3d.com/",
         cookie_domain=".cults3d.com",
     ),
-    PlatformSpec("myminifactory", "MyMiniFactory", MyMiniFactorySearcher),
+    PlatformSpec(
+        "myminifactory",
+        "MyMiniFactory",
+        MyMiniFactorySearcher,
+        auth_hosts=("myminifactory.com",),
+        auth_mode="api_key",
+        login_url="https://www.myminifactory.com/pages/for-developers",
+        referer="https://www.myminifactory.com/",
+    ),
     PlatformSpec("thangs", "Thangs", ThangsSearcher),
     PlatformSpec("crealitycloud", "Creality Cloud", CrealityCloudSearcher),
     PlatformSpec(
@@ -1924,6 +2607,13 @@ _PLATFORM_SPECS = (
         referer="https://grabcad.com/library",
         cookie_domain=".grabcad.com",
     ),
+    PlatformSpec("smithsonian", "Smithsonian 3D", SmithsonianSearcher),
+    PlatformSpec("wikimedia", "Wikimedia Commons", WikimediaCommonsSearcher),
+    PlatformSpec("nasa", "NASA 3D Resources", NasaSearcher),
+    PlatformSpec("nih3d", "NIH 3D", Nih3DSearcher),
+    PlatformSpec("youmagine", "YouMagine", YouMagineSearcher),
+    PlatformSpec("pinshape", "Pinshape", PinshapeSearcher),
+    PlatformSpec("cgtrader", "CGTrader", CgTraderSearcher),
 )
 _PLATFORMS.update((spec.key, spec) for spec in _PLATFORM_SPECS)
 _PLATFORMS_BY_DISPLAY.update((spec.display, spec) for spec in _PLATFORM_SPECS)
@@ -2289,9 +2979,9 @@ PAGE = r"""<!DOCTYPE html>
 <body>
 <style>
 *{box-sizing:border-box} body{font-family:var(--orca-font,sans-serif);background:var(--orca-bg,#1e1e1e);color:var(--orca-fg,#eee);padding:16px;margin:0}
-button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search-row input{flex:1;padding:8px 12px;border:1px solid var(--orca-border,#444);border-radius:6px;background:var(--orca-bg,#1e1e1e);color:inherit}.btn,button{padding:7px 12px;border:0;border-radius:6px;background:var(--orca-accent,#4a9eff);color:var(--orca-accent-fg,#fff);cursor:pointer}.secondary{background:transparent!important;border:1px solid var(--orca-border,#555)!important;color:var(--orca-fg,#eee)!important}.danger{background:#7a3030!important}.muted{color:var(--orca-muted,#999)}
-.accounts{display:grid;grid-template-columns:repeat(5,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account strong{display:block;font-size:.86em}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 6px}.source-head strong{font-size:.9em}.source-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.source-tools button{padding:4px 8px;font-size:.76em}.source-count{font-size:.76em;color:var(--orca-muted,#999)}.platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;margin-bottom:12px}.portal-option{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.84em;color:var(--orca-fg,#eee);cursor:pointer;user-select:none}.portal-option:hover{border-color:var(--orca-accent,#4a9eff)}.portal-option input{margin:0;accent-color:var(--orca-accent,#4a9eff)}
-#results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
+button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search-row input{flex:1;padding:8px 12px;border:1px solid var(--orca-border,#444);border-radius:6px;background:var(--orca-bg,#1e1e1e);color:inherit}.btn,button{padding:7px 12px;border:0;border-radius:6px;background:var(--orca-accent,#4a9eff);color:var(--orca-accent-fg,#fff);cursor:pointer}.secondary{background:transparent!important;border:1px solid var(--orca-border,#555)!important;color:var(--orca-fg,#eee)!important}.danger{background:#7a3030!important}.muted{color:var(--orca-muted,#999)}
+.accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account strong{display:block;font-size:.86em}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.search-options{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:-4px 0 10px;font-size:.82em}.search-options select{padding:5px 8px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.search-options label{display:flex;align-items:center;gap:5px}.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 6px}.source-head strong{font-size:.9em}.source-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.source-tools button{padding:4px 8px;font-size:.76em}.source-count{font-size:.76em;color:var(--orca-muted,#999)}.platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;margin-bottom:12px}.portal-option{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.84em;color:var(--orca-fg,#eee);cursor:pointer;user-select:none}.portal-option:hover{border-color:var(--orca-accent,#4a9eff)}.portal-option input{margin:0;accent-color:var(--orca-accent,#4a9eff)}
+#results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.metrics{font-size:.72em;color:var(--orca-muted,#999);min-height:1.2em;margin-top:3px}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
 .panel{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(650px,calc(100% - 32px));max-height:70vh;overflow:auto;z-index:20;padding:14px 34px 14px 14px;border:1px solid var(--orca-border,#444);border-radius:8px;background:var(--orca-bg,#1e1e1e);box-shadow:0 6px 28px rgba(0,0,0,.55);display:none}.panel.active{display:block}.close{position:absolute;right:8px;top:6px;background:none!important;font-size:1.35em;padding:2px 6px}.panel p{font-size:.86em;color:var(--orca-muted,#aaa);margin:6px 0}.panel a{color:var(--orca-accent,#4a9eff)}.responsibility{border-left:3px solid var(--orca-border,#444);padding:8px 10px;margin:10px 0;font-size:.78em;color:var(--orca-muted,#888)}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.file-list{max-height:46vh;overflow:auto;border:1px solid var(--orca-border,#555);border-radius:6px;margin:10px 0}.file-choice{display:flex;align-items:flex-start;gap:9px;padding:9px 10px;border-bottom:1px solid var(--orca-border,#444);cursor:pointer}.file-choice:last-child{border-bottom:0}.file-choice input{margin-top:2px}.file-choice span{overflow-wrap:anywhere}.file-tools{display:flex;gap:7px;margin:8px 0}.file-count{font-size:.8em;color:var(--orca-muted,#999)}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
 @media(max-width:680px){.accounts{grid-template-columns:1fr}}
@@ -2303,23 +2993,33 @@ button,input{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search
   <div class="account"><strong>Makeronline (Anycubic)</strong><span id="auth-makeronline" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('makeronline')">Account</button></div>
   <div class="account"><strong>Cults3D</strong><span id="auth-cults3d" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('cults3d')">Account</button></div>
   <div class="account"><strong>GrabCAD</strong><span id="auth-grabcad" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('grabcad')">Account</button></div>
+  <div class="account"><strong>Thingiverse API</strong><span id="auth-thingiverse" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('thingiverse')">API token</button></div>
+  <div class="account"><strong>MyMiniFactory API</strong><span id="auth-myminifactory" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('myminifactory')">API key</button></div>
 </div>
 <div class="search-row"><input id="query" placeholder="Search for 3D models..."><button id="search-btn" onclick="doSearch()">Search</button></div>
+<div class="search-options"><label>Sort <select id="sort"><option value="relevance">Relevance</option><option value="popularity">Popularity (normalized)</option><option value="downloads">Downloads</option><option value="likes">Likes</option><option value="rating">Rating</option><option value="newest">Newest</option><option value="makes">Most printed</option><option value="name">Name</option><option value="platform">Platform</option></select></label><label><input id="free-only" type="checkbox"> Free only</label><label><input id="direct-only" type="checkbox"> Direct import only</label></div>
 <div class="source-head"><strong>Search portals</strong><div class="source-tools"><button class="secondary" onclick="setAllPortals(true)">Select all</button><button class="secondary" onclick="setAllPortals(false)">Select none</button><span id="source-count" class="source-count"></span></div></div>
 <div class="platforms" id="search-portals">
-<label class="portal-option"><input id="portal-thingiverse" class="portal-search" type="checkbox" checked data-platform="thingiverse"> Thingiverse</label>
+<label class="portal-option"><input id="portal-thingiverse" class="portal-search" type="checkbox" data-platform="thingiverse"> Thingiverse</label>
 <label class="portal-option"><input id="portal-cults3d" class="portal-search" type="checkbox" checked data-platform="cults3d"> Cults3D</label>
-<label class="portal-option"><input id="portal-myminifactory" class="portal-search" type="checkbox" checked data-platform="myminifactory"> MyMiniFactory</label>
-<label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" checked data-platform="thangs"> Thangs</label>
+<label class="portal-option"><input id="portal-myminifactory" class="portal-search" type="checkbox" data-platform="myminifactory"> MyMiniFactory</label>
+<label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" data-platform="thangs"> Thangs (browser)</label>
 <label class="portal-option"><input id="portal-makeronline" class="portal-search" type="checkbox" checked data-platform="makeronline"> Makeronline</label>
 <label class="portal-option"><input id="portal-crealitycloud" class="portal-search" type="checkbox" checked data-platform="crealitycloud"> Creality Cloud</label>
 <label class="portal-option"><input id="portal-nexprint" class="portal-search" type="checkbox" checked data-platform="nexprint"> Nexprint</label>
-<label class="portal-option"><input id="portal-grabcad" class="portal-search" type="checkbox" checked data-platform="grabcad"> GrabCAD</label>
+<label class="portal-option"><input id="portal-grabcad" class="portal-search" type="checkbox" data-platform="grabcad"> GrabCAD</label>
 <label class="portal-option"><input id="portal-printables" class="portal-search" type="checkbox" checked data-platform="printables"> Printables</label>
 <label class="portal-option"><input id="portal-makerworld" class="portal-search" type="checkbox" checked data-platform="makerworld"> MakerWorld</label>
+<label class="portal-option"><input id="portal-smithsonian" class="portal-search" type="checkbox" checked data-platform="smithsonian"> Smithsonian 3D</label>
+<label class="portal-option"><input id="portal-wikimedia" class="portal-search" type="checkbox" checked data-platform="wikimedia"> Wikimedia Commons</label>
+<label class="portal-option"><input id="portal-nasa" class="portal-search" type="checkbox" checked data-platform="nasa"> NASA 3D Resources</label>
+<label class="portal-option"><input id="portal-nih3d" class="portal-search" type="checkbox" checked data-platform="nih3d"> NIH 3D</label>
+<label class="portal-option"><input id="portal-youmagine" class="portal-search" type="checkbox" checked data-platform="youmagine"> YouMagine</label>
+<label class="portal-option"><input id="portal-pinshape" class="portal-search" type="checkbox" checked data-platform="pinshape"> Pinshape</label>
+<label class="portal-option"><input id="portal-cgtrader" class="portal-search" type="checkbox" data-platform="cgtrader"> CGTrader (browser)</label>
 </div>
 <div id="results"></div>
-<div id="detail" class="panel"><button class="close" onclick="closeDetail()">&times;</button><h2 id="det-name"></h2><p id="det-author"></p><p id="det-platform"></p><p id="det-url"></p><p id="det-license"></p><p id="det-summary"></p><p class="responsibility">Downloads use your own account session and the platform's own file URL. The plugin does not host or redistribute models. You remain responsible for the model license and the platform terms.</p><button id="det-import-btn" onclick="doImport()">Import into OrcaSlicer</button><button class="secondary" onclick="doDownload()">Open in browser</button></div>
+<div id="detail" class="panel"><button class="close" onclick="closeDetail()">&times;</button><h2 id="det-name"></h2><p id="det-author"></p><p id="det-platform"></p><p id="det-metrics"></p><p id="det-url"></p><p id="det-license"></p><p id="det-summary"></p><p class="responsibility">Downloads use your own account session and the platform's own file URL. The plugin does not host or redistribute models. You remain responsible for the model license and the platform terms.</p><button id="det-import-btn" onclick="doImport()">Import into OrcaSlicer</button><button class="secondary" onclick="doDownload()">Open in browser</button></div>
 <div id="modal-bg" class="modal-backdrop" onclick="closeTopModal()"></div>
 <div id="auth-modal" class="auth-modal">
   <h2 id="auth-title" style="margin:0 0 5px;font-size:1.05em">Account</h2>
@@ -2343,29 +3043,31 @@ var selectedModel=null, searching=false, authPlatform=null, authStates={}, pendi
 var $=function(id){return document.getElementById(id)};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function safeUrl(s){try{var u=new URL(String(s||''));return(u.protocol==='http:'||u.protocol==='https:')?u.href:''}catch(e){return''}}
-function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',MyMiniFactory:'myminifactory',Thangs:'thangs','Creality Cloud':'crealitycloud',GrabCAD:'grabcad'}[display]||String(display||'').toLowerCase()}
+function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',MyMiniFactory:'myminifactory',Thangs:'thangs','Creality Cloud':'crealitycloud',GrabCAD:'grabcad','Smithsonian 3D':'smithsonian','Wikimedia Commons':'wikimedia','NASA 3D Resources':'nasa','NIH 3D':'nih3d',YouMagine:'youmagine',Pinshape:'pinshape',CGTrader:'cgtrader'}[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
-function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
-var PORTAL_PREF_KEY='orca-model-search-portals-v1';
+function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
+var PORTAL_PREF_KEY='orca-model-search-portals-v2';
 function selectedPortals(){var ps=[];document.querySelectorAll('.portal-search:checked').forEach(function(x){ps.push(x.dataset.platform)});return ps}
 function updatePortalCount(){var all=document.querySelectorAll('.portal-search');var checked=document.querySelectorAll('.portal-search:checked');$('source-count').textContent=checked.length+' / '+all.length+' selected'}
 function savePortalSelection(){try{localStorage.setItem(PORTAL_PREF_KEY,JSON.stringify(selectedPortals()))}catch(e){}}
 function restorePortalSelection(){try{var raw=localStorage.getItem(PORTAL_PREF_KEY);if(raw){var saved=JSON.parse(raw);if(Array.isArray(saved)){var set={};saved.forEach(function(p){set[p]=true});document.querySelectorAll('.portal-search').forEach(function(x){x.checked=!!set[x.dataset.platform]})}}}catch(e){}updatePortalCount()}
 function setAllPortals(value){document.querySelectorAll('.portal-search').forEach(function(x){x.checked=!!value});updatePortalCount();savePortalSelection()}
 $('search-portals').addEventListener('change',function(e){if(e.target&&e.target.classList.contains('portal-search')){updatePortalCount();savePortalSelection()}});
-function doSearch(){if(searching)return;var q=$('query').value.trim();if(!q)return;var ps=selectedPortals();if(!ps.length){$('status').textContent='Select at least one search portal.';return}searching=true;$('search-btn').disabled=true;$('search-btn').textContent='Searching...';$('status').textContent='Searching '+ps.length+' portal(s)...';closeDetail();orca.postMessage({action:'search',query:q,platforms:ps})}
+function doSearch(){if(searching)return;var q=$('query').value.trim();if(!q)return;var ps=selectedPortals();if(!ps.length){$('status').textContent='Select at least one search portal.';return}searching=true;$('search-btn').disabled=true;$('search-btn').textContent='Searching...';$('status').textContent='Searching '+ps.length+' portal(s)...';closeDetail();orca.postMessage({action:'search',query:q,platforms:ps,options:{sort:$('sort').value,free_only:$('free-only').checked,direct_only:$('direct-only').checked}})}
 $('query').addEventListener('keydown',function(e){if(e.key==='Enter')doSearch()});
-function renderResults(models){window._results=models||[];var html='';window._results.forEach(function(m,i){html+='<div class="card" data-idx="'+i+'"><img src="'+esc(safeUrl(m.thumbnail_url))+'"><h3 title="'+esc(m.name)+'">'+esc(m.name)+'</h3><div class="author">'+esc(m.author)+' · '+esc(m.platform)+'</div><span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span></div>'});$('results').innerHTML=html;$('status').textContent=window._results.length+' result(s)'}
+function compactNumber(v){v=Number(v);if(!isFinite(v))return'';if(v>=1000000)return(v/1000000).toFixed(v>=10000000?0:1)+'M';if(v>=1000)return(v/1000).toFixed(v>=10000?0:1)+'K';return String(Math.round(v))}
+function metricText(m){var p=[];if(m.downloads!=null)p.push('Downloads '+compactNumber(m.downloads));if(m.likes!=null)p.push('Likes '+compactNumber(m.likes));if(m.rating!=null)p.push('Rating '+Number(m.rating).toFixed(1));if(m.views!=null)p.push('Views '+compactNumber(m.views));if(m.makes!=null)p.push('Prints '+compactNumber(m.makes));return p.join(' / ')}
+function renderResults(models){window._results=models||[];var html='';window._results.forEach(function(m,i){html+='<div class="card" data-idx="'+i+'"><img src="'+esc(safeUrl(m.thumbnail_url))+'"><h3 title="'+esc(m.name)+'">'+esc(m.name)+'</h3><div class="author">'+esc(m.author)+' · '+esc(m.platform)+'</div><div class="metrics">'+esc(metricText(m))+'</div><span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span></div>'});$('results').innerHTML=html;$('status').textContent=window._results.length+' result(s)'}
 $('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)showDetail(m,true)});
-function showDetail(m,open){selectedModel=m;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span>';$('det-summary').textContent=m.license_summary||'No license information available.';var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=false;b.textContent=(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
+function showDetail(m,open){selectedModel=m;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-metrics').innerHTML=metricText(m)?'<strong>Metrics:</strong> '+esc(metricText(m)):'';$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(m.license||'Unknown')+'</span>';$('det-summary').textContent=m.license_summary||'No license information available.';var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=m.result_type==='search_link';b.textContent=m.result_type==='search_link'?'Browser search only':(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
 function closeDetail(){$('detail').classList.remove('active')}
 document.addEventListener('pointerdown',function(e){var d=$('detail');if(!d||!d.classList.contains('active'))return;if(d.contains(e.target))return;closeDetail()},true);
 $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;e.preventDefault();openExternal(a.getAttribute('href'))});
 function licenseClass(l){if(/CC|Creative Commons|CC0|Public Domain/i.test(l||''))return'license-cc';if(/All Rights Reserved|Standard Digital|Exclusive/i.test(l||''))return'license-arr';return''}
 function openExternal(url){orca.postMessage({action:'open_external',url:url})}
 function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedModel.download_url)}
-function doImport(){if(!selectedModel)return;if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
-function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':'Session/access token (alternative)';$('auth-note').textContent=p==='makerworld'?'Use Bambu email/password or paste an existing Bambu Cloud access token. MFA verification codes are supported.':p==='nexprint'?'Sign in on the official Nexprint site, then paste the auth_token session cookie. The plugin never asks for or stores your Nexprint password.':p==='grabcad'?'GrabCAD Community Library downloads require membership. Sign in on the official GrabCAD page, then paste the Cookie request header (or the session cookie string). The plugin never asks for your GrabCAD password.':p==='cults3d'?'Cults3D requires an account even for free downloads. Sign in on the official Cults3D page, then paste the Cookie request header/session cookies. The plugin never asks for your Cults3D password.':'Makeronline no longer uses the legacy direct password endpoint. Sign in with Anycubic Slicer Next and click Import from Anycubic Slicer Next, or paste an existing access token.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
+function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
+function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=p==='makerworld'?'Use Bambu email/password or paste an existing Bambu Cloud access token. MFA verification codes are supported.':p==='nexprint'?'Sign in on the official Nexprint site, then paste the auth_token session cookie. The plugin never asks for or stores your Nexprint password.':p==='grabcad'?'GrabCAD Community Library downloads require membership. Sign in on the official GrabCAD page, then paste the Cookie request header (or the session cookie string). The plugin never asks for your GrabCAD password.':p==='cults3d'?'Cults3D requires an account even for free downloads. Sign in on the official Cults3D page, then paste the Cookie header/session cookies.':p==='thingiverse'?'Create or open a Thingiverse developer app and paste its personal API access token.':p==='myminifactory'?'Create a MyMiniFactory API client and paste its API key. API-key search does not bypass storefront or OAuth download rules.':'Makeronline no longer uses the legacy direct password endpoint. Sign in with Anycubic Slicer Next and click Import from Anycubic Slicer Next, or paste an existing access token.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
 function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
 function closeAuth(){$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
 function closeFilePicker(){$('file-modal').classList.remove('active');pendingFiles=[];syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
@@ -2374,7 +3076,7 @@ function updateFileCount(){var all=document.querySelectorAll('#file-list input[t
 function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){html+='<label class="file-choice"><input type="checkbox" checked value="'+Number(f.index)+'" onchange="updateFileCount()"><span>'+esc(f.name||('File '+(Number(f.index)+1)))+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
 function setAllFiles(value){document.querySelectorAll('#file-list input[type=checkbox]').forEach(function(x){x.checked=!!value});updateFileCount()}
 function confirmFileImport(){var selected=[];document.querySelectorAll('#file-list input[type=checkbox]:checked').forEach(function(x){selected.push(parseInt(x.value,10))});if(!selected.length)return;$('file-import').disabled=true;$('status').textContent='Downloading selected files...';$('file-modal').classList.remove('active');syncBackdrop();orca.postMessage({action:'import_selected',indices:selected})}
-function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
+function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}if((authPlatform==='thingiverse'||authPlatform==='myminifactory')&&!token){$('status').textContent='Paste the API token/key first.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform})}
 function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('status').textContent='Looking for Anycubic Slicer Next session...'}
@@ -2555,6 +3257,7 @@ if orca is not None:
 
         def _do_search(self, msg):
             query = msg.get("query", "")
+            options = msg.get("options") if isinstance(msg.get("options"), dict) else {}
             results = []
             errors = []
             for platform in dict.fromkeys(msg.get("platforms", [])):
@@ -2562,7 +3265,7 @@ if orca is not None:
                 if spec is None:
                     continue
                 try:
-                    items = spec.adapter.search(query, self.auth)
+                    items = spec.adapter.search(query, self.auth, options)
                     for item in items:
                         item["_platform_key"] = spec.key
                         item["authenticated"] = not item.get(
@@ -2574,7 +3277,12 @@ if orca is not None:
                     results.extend(items)
                 except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
                     errors.append(f"{platform}: {exc}")
-            self._post({"action": "results", "results": results})
+            self._post(
+                {
+                    "action": "results",
+                    "results": _filter_and_sort_results(results, options),
+                }
+            )
             if errors:
                 self._post({"action": "status", "message": " | ".join(errors)})
 

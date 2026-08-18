@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.4.0**
+**Current plugin version: v0.5.0**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -23,7 +23,9 @@ The selected search portals are remembered by the embedded UI and restored the n
 
 ## Main features
 
-- Search across 10 supported model portals from one OrcaSlicer window.
+- Search across 17 model catalogs and browser fallbacks from one OrcaSlicer window.
+- Sort merged results by relevance, normalized popularity, downloads, likes, rating, date, print count, name, or platform.
+- Filter to models explicitly marked free or to sources with a direct-import path.
 - A dedicated checkbox for every registered search adapter.
 - **Select all / Select none** controls for search sources.
 - Selected-source counter and protection against starting a search with no portal selected.
@@ -45,15 +47,22 @@ The selected search portals are remembered by the embedded UI and restored the n
 | Portal | Search | Direct import | Authentication |
 |---|---:|---:|---|
 | **Printables** | Yes | Yes, for public files | None |
-| **Thingiverse** | Yes | Yes, when a public download is exposed | None |
-| **MyMiniFactory** | Yes | Yes, for public/free direct files | None |
-| **Thangs** | Yes | Yes, for public/free direct files | None |
+| **Thingiverse** | Yes, official API | Yes | Personal Thingiverse API token |
+| **MyMiniFactory** | Yes, official API | OAuth archives only; otherwise browser | Personal MyMiniFactory API key |
+| **Thangs** | Browser search link | Browser | Interactive browser check |
 | **Creality Cloud** | Yes | Yes, when a public STL/3MF/CAD URL is exposed | None |
 | **MakerWorld / Bambu Lab** | Yes | Yes | Bambu/MakerWorld account session |
 | **Nexprint / Elegoo** | Yes | Yes | `auth_token` session cookie |
 | **Makeronline / Anycubic** | Yes | Yes | Anycubic access token / Anycubic Slicer Next session |
 | **Cults3D** | Yes | Yes, for files available to the signed-in account | Cults3D browser session cookies |
 | **GrabCAD** | Yes | Yes, for files available to the signed-in account | GrabCAD browser session cookies |
+| **Smithsonian 3D** | Yes | Yes, public STL ZIP | None |
+| **Wikimedia Commons** | Yes | Yes, public STL | None |
+| **NASA 3D Resources** | Yes | Yes, public STL/3MF | None |
+| **NIH 3D** | Yes | Direct file when exposed; otherwise browser | None |
+| **YouMagine** | Yes | Public file when exposed; otherwise browser | None |
+| **Pinshape** | Yes | Browser | None for search |
+| **CGTrader** | Browser search link | Browser | Interactive browser flow |
 
 A successful search result does not guarantee that the portal allows a direct programmatic download. Paid models, member-only models, CAPTCHA-protected downloads, checkout flows, or pages that do not expose a direct file URL are intentionally sent to **Open in browser** instead of being reported as a successful import.
 
@@ -67,26 +76,24 @@ A successful search result does not guarantee that the portal allows a direct pr
 
 ### Thingiverse
 
-- Public web search.
-- No plugin authentication is used.
-- The plugin first tries Thingiverse's public download-all ZIP route and then falls back to public model/file links.
-- If the site does not expose a usable direct download, the model page is opened in the browser.
+- Uses Thingiverse's official API instead of its client-rendered search page.
+- Create/open a Thingiverse developer app, paste its personal access token in the plugin, and enable the Thingiverse source.
+- Search metrics and downloadable files come from the same authenticated API.
 
 ### MyMiniFactory
 
-- Public search.
-- Public/free direct files are imported without authentication.
-- Paid/cart-only objects use the browser flow instead of attempting to bypass the storefront.
+- Uses the documented MyMiniFactory API v2 and requires a personal API key.
+- API-key search provides model metadata, likes, views, and dates.
+- The documented API exposes archive downloads only to an OAuth-connected user; API-key-only and storefront downloads open the official model page.
 
 ### Thangs
 
-- Public search.
-- Public/free direct files are imported without authentication.
-- Member-only, paid, cart, or interactive-download models fall back to the browser.
+- Thangs currently rejects non-browser search requests with an interactive protection page and has no documented public search API.
+- The plugin returns an explicitly labelled browser-search card with the query pre-filled. It never reports that card as an importable model.
 
 ### Creality Cloud
 
-- Public search.
+- Public search uses the current model-tag pages; the removed legacy `/search/model` address is no longer used.
 - Public STL/3MF/CAD downloads are imported without a plugin login when a direct file URL is available.
 - Paid/subscription/browser-only downloads are opened on the official model page.
 
@@ -150,6 +157,27 @@ GrabCAD Community Library search/download requires a member session.
 
 Search and file resolution then use that saved GrabCAD browser session. Expired sessions are detected and rejected instead of returning a fake successful import.
 
+### Smithsonian, Wikimedia Commons, NASA, and NIH
+
+- Smithsonian uses the official Smithsonian 3D file-search API and imports water-tight STL ZIP resources directly.
+- Wikimedia Commons uses the MediaWiki Action API, limits results to the STL-files category, and preserves author/license metadata and original STL URLs.
+- NASA searches the official `nasa/NASA-3D-Resources` repository tree and imports matching STL/3MF files from their canonical raw URLs.
+- NIH 3D uses the current public Discover application, including download/view/date metrics. Its changing server-action identifier is discovered from the current application bundle instead of being hard-coded. Interactive entry downloads fall back to the browser.
+
+### YouMagine, Pinshape, and CGTrader
+
+- YouMagine and Pinshape use their current public HTML search pages.
+- YouMagine attempts validated public file resolution; Pinshape keeps downloads in its official browser flow.
+- CGTrader's current anti-bot flow returns an explicitly labelled browser-search card rather than fake or incomplete model results.
+
+## Sorting and filters
+
+Every result is normalized to the same nullable metric fields: downloads, likes, rating, rating count, views, print/make count, publication date, price, and free status. A missing counter stays unknown and is sorted after known values; it is never converted to zero.
+
+Raw counters from different portals are not directly comparable. **Popularity (normalized)** computes a platform-relative score from available counters and compares each result's percentile within its own platform. Exact **Downloads**, **Likes**, and **Rating** sorts remain available when raw values are what you want.
+
+**Free only** includes only results whose source explicitly marks them free. **Direct import only** removes browser-only search cards and sources without a direct file path.
+
 ## Search-source selection
 
 The **Search portals** section contains one checkbox for every registered adapter:
@@ -164,6 +192,13 @@ The **Search portals** section contains one checkbox for every registered adapte
 - GrabCAD
 - Printables
 - MakerWorld
+- Smithsonian 3D
+- Wikimedia Commons
+- NASA 3D Resources
+- NIH 3D
+- YouMagine
+- Pinshape
+- CGTrader
 
 Use **Select all** or **Select none** for quick changes. The selected list is stored in the embedded UI's local storage.
 
@@ -328,6 +363,7 @@ ruff check .
 vulture src/search_engine.py --min-confidence 80
 radon cc src/search_engine.py -s -a
 bandit -q -r src/search_engine.py
+python scripts/live_smoke.py
 ```
 
 The embedded JavaScript can also be extracted and validated with:
@@ -337,19 +373,22 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.4.0 validation gates are:
+The v0.5.0 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check
-- **51/51 tests**, repeated twice
+- all unit/regression tests, repeated twice
 - Pyright: **0 errors, 0 warnings**
 - Ruff and Vulture: no findings
 - Bandit: no unreviewed findings
 - Radon complexity report and Windows IPC smoke test
+- opt-in live search smoke across public programmatic catalogs
 
 ## Current limitations
 
 - Portal websites and private web APIs can change without notice; an adapter may need updating when a site changes its frontend/API.
+- Thangs and CGTrader currently provide browser-search links because their interactive protection blocks a safe anonymous plugin search request.
+- Thingiverse and MyMiniFactory require user-supplied developer credentials for their documented APIs.
 - MakerWorld download endpoints are not a public stable third-party API contract.
 - Browser-session integrations depend on the user's own valid portal session.
 - Paid, checkout, member-only, CAPTCHA and interactive flows intentionally stay in the browser.

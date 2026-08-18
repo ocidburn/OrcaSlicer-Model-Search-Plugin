@@ -5,6 +5,18 @@
 - Organized the repository into `src/`, `tests/`, `scripts/`, `docs/`, and `typings/` while keeping the plugin itself as one downloadable Python file.
 - Centralized test-module loading and reusable JavaScript/Windows IPC validation helpers.
 
+## 0.5.0
+
+- Added a common nullable metrics schema and merged-result sorting by relevance, normalized popularity, downloads, likes, rating, publication date, print count, name, and platform.
+- Added explicit free-only and direct-import-only filters; unknown values are never guessed as zero or free.
+- Added Smithsonian 3D, Wikimedia Commons, NASA 3D Resources, NIH 3D, YouMagine, Pinshape, and CGTrader/browser search support.
+- Replaced Thingiverse's non-functional client-rendered HTML search with its authenticated official API.
+- Replaced MyMiniFactory's obsolete HTML endpoints with its documented API v2 and explicit API-key authentication.
+- Replaced Creality Cloud's removed search URL with its current model-tag pages.
+- Converted Thangs and CGTrader to clearly labelled browser-search results because their interactive protection blocks anonymous programmatic search.
+- Added source-native metrics for Printables, MakerWorld, Makeronline, Nexprint, Thingiverse, MyMiniFactory, and NIH 3D.
+- Added an opt-in live public-catalog smoke test and expanded registry/UI/sorting regression coverage.
+
 ## 0.4.0
 
 - Replaced five parallel platform maps with one `PlatformSpec` registry covering search, import, authentication hosts, cookie scope, login URL, and referer behavior.

@@ -168,7 +168,7 @@ Supported connection methods:
 
 The old direct `api.cloud.anycubic.com` email/password flow is intentionally not used.
 
-MakerOnline completes its OAuth code exchange on the MakerOnline origin and stores the result in `mo_access_token`. OrcaSlicer's plugin UI does not expose the system browser's cookie store, so the plugin deliberately requires an explicit token paste instead of reading browser profiles. If Slicer Next stores the session in an encrypted/unsupported location, use the same explicit token method.
+MakerOnline completes its OAuth code exchange on the MakerOnline origin and stores the result in `mo_access_token`. OrcaSlicer's plugin UI does not expose the system browser's cookie store, so the plugin never reads browser profiles; the session is handed over deliberately instead. Use **Sign in in browser** to do that without leaving the browser (see [Browser sign-in](#browser-sign-in)), or paste the token directly. If Slicer Next stores the session in an encrypted/unsupported location, the same hand-over applies.
 
 ### Cults3D
 
@@ -317,6 +317,51 @@ Typical OrcaSlicer data directories:
 - macOS: `~/Library/Application Support/OrcaSlicer`
 
 The auth store writes tokens/session values only. Password-like fields are stripped before persistence. Cloudflare clearances are kept in the same file, keyed by host, alongside the User-Agent they are bound to.
+
+## Browser sign-in
+
+Connecting a portal used to mean opening its login in your browser, digging a
+value out of developer tools, switching back to OrcaSlicer, and pasting it into
+a small field. **Sign in in browser** in the account panel removes the switch
+back.
+
+Pressing it opens two tabs: the portal's own login page, and a short finish
+page served by the plugin on `http://127.0.0.1:<port>` &mdash; a listener bound
+to loopback, valid for one credential and five minutes. Sign in to the portal
+normally, then hand the session over on the finish page. OrcaSlicer picks it up
+immediately; the account panel updates on its own.
+
+**What this is not.** The plugin cannot read your browser's cookies. Orca's
+plugin UI can only render HTML the plugin supplies: it has no API to load a
+portal's login page in-process and no access to any cookie jar, and the system
+browser's cookie store is not exposed to it either. That is a boundary worth
+keeping, so for most portals you still copy one value &mdash; you just no longer
+carry it between windows by hand.
+
+A portal *can* complete with no copying at all when its sign-in can be pointed
+back at the loopback origin, which the receiver accepts on `/callback` as
+`access_token`, `auth_token`, `token`, or `code`. That applies to an OAuth app
+you register yourself. Portals whose OAuth clients are registered against their
+own domains (MakerOnline, Creality Cloud) cannot redirect to your machine, so
+those keep the hand-over page.
+
+MakerWorld does not need any of this: it still signs in directly from
+OrcaSlicer with your Bambu account, including the verification code.
+
+How the endpoint is kept to itself:
+
+- It binds `127.0.0.1` only, never a routable interface.
+- Every request must carry a random single-use state value, compared in
+  constant time. Without it the answer is `403`.
+- Requests are refused unless the `Host` header is loopback, and a page on any
+  other site is refused by its `Origin`/`Referer`.
+- It serves nothing but the finish page and the callback, answers `no-store`
+  and `no-referrer`, and never writes the credential to a log.
+- It stops the moment a credential is accepted, when the account panel is
+  closed, or after the timeout &mdash; whichever comes first.
+
+If the socket cannot be opened at all &mdash; a sandbox may refuse it &mdash;
+the plugin says so and the existing paste field keeps working.
 
 ## Cloudflare verification
 

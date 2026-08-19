@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Added a browser sign-in hand-off. **Sign in in browser** opens the portal's
+  login together with a short finish page served on loopback, so a session
+  reaches OrcaSlicer without switching windows and retyping. The plugin still
+  does not read browser cookies; Orca's plugin UI exposes no cookie jar and no
+  way to host a portal login page, so the hand-over stays deliberate.
+- A sign-in that can be redirected to the loopback origin completes with no
+  copying at all: the receiver accepts `access_token`, `auth_token`, `token`,
+  or `code` on `/callback`.
+- The receiver binds `127.0.0.1` only, requires a random single-use state
+  compared in constant time, refuses forged `Host` headers and cross-site
+  `Origin`/`Referer`, answers `no-store` and `no-referrer`, keeps the
+  credential out of its logs, and shuts down on success, on panel close, or
+  after five minutes.
+- A refused credential reports the reason and leaves the link usable, so a
+  mistyped paste does not force the whole sign-in to be restarted.
+- If the loopback socket cannot be opened, the plugin reports it and the
+  existing paste field continues to work.
+
 - Added a Cloudflare verification hand-off. The plugin does not solve or bypass
   a challenge; the user passes it in their own browser and the resulting
   `cf_clearance` cookie is replayed together with the User-Agent it is bound to.

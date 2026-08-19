@@ -45,6 +45,16 @@ Undocumented public web endpoints can change without notice. Their use here is
 limited to the same search metadata exposed to an ordinary visitor; the plugin
 does not solve challenges, impersonate another account, or bypass access gates.
 
+## Browser sign-in hand-off
+
+The plugin can serve a short finish page on `http://127.0.0.1:<port>` so a
+portal session can be handed over in the browser the user signed in with. It
+does not read browser cookies, browser profiles, or any cookie jar: Orca's
+plugin UI provides no such API, and the hand-over remains an explicit user
+action. The listener binds loopback only, accepts one credential guarded by a
+random single-use state value, refuses cross-site submissions, keeps the value
+out of its logs, and stops on success, on panel close, or after a timeout.
+
 ## Credentials and privacy
 
 The credential store contains tokens or copied session-cookie values only.

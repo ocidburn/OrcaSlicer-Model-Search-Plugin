@@ -9,12 +9,14 @@
 # version = "0.8.8"
 # ///
 
+import hmac
 import html
 import ipaddress
 import json
 import math
 import os
 import re
+import secrets
 import socket
 import subprocess  # nosec B404
 import sys
@@ -26,6 +28,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 
 try:
@@ -800,6 +803,314 @@ def _cloudflare_challenge(url, auth=None, detail="", host=""):
             "Cloudflare verification."
         )
     return CloudflareChallenge(message, url, host)
+
+
+_LOGIN_TIMEOUT_SECONDS = 300
+
+_LOGIN_PAGE_STYLE = (
+    "body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:32px;"
+    "background:#1e1e1e;color:#eee}"
+    "main{max-width:640px;margin:0 auto}"
+    "h1{font-size:1.3em;margin:0 0 4px}"
+    "p{color:#bbb}"
+    "ol{color:#bbb;padding-left:20px}"
+    "code{background:#2b2b2b;padding:1px 5px;border-radius:4px;color:#eee}"
+    "textarea{width:100%;min-height:120px;background:#151515;color:#eee;"
+    "border:1px solid #444;border-radius:6px;padding:10px;font:13px monospace}"
+    "button{margin-top:12px;padding:9px 16px;border:0;border-radius:6px;"
+    "background:#4a9eff;color:#fff;font-size:1em;cursor:pointer}"
+    ".bad{color:#e78b8b}.good{color:#8fd18f}"
+)
+
+
+def _login_page(title, body):
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        f"<title>{html.escape(title)}</title><style>{_LOGIN_PAGE_STYLE}</style>"
+        f"</head><body><main><h1>{html.escape(title)}</h1>{body}</main></body></html>"
+    ).encode()
+
+
+class LoginReceiver:
+    """Finish a portal sign-in in the browser the user signed in with.
+
+    OrcaSlicer's plugin UI can only render HTML the plugin supplies: there is
+    no API to load a portal's own login page in-process and no access to any
+    cookie jar, so a portal session cannot be captured automatically and has to
+    be handed over deliberately.  This receiver moves that hand-over into the
+    browser tab where the user has just signed in -- it listens on loopback
+    only, for one credential, for a few minutes -- instead of asking them to
+    carry the value back into OrcaSlicer by hand.
+
+    A portal that can be configured to redirect to this loopback origin (an
+    OAuth app the user registers themselves) completes without any paste at
+    all.  Portals whose OAuth clients are registered against their own domains
+    cannot redirect here; for those the browser page is still the drop-off
+    point, which is why both routes exist.
+    """
+
+    def __init__(self, platform, on_credential, timeout=_LOGIN_TIMEOUT_SECONDS):
+        self.platform = platform
+        self._on_credential = on_credential
+        self.timeout = timeout
+        self.state = secrets.token_urlsafe(24)
+        self._server = None
+        self._timer = None
+        self._lock = threading.RLock()
+        self._done = False
+
+    @property
+    def origin(self):
+        with self._lock:
+            server = self._server
+        if server is None:
+            return ""
+        host, port = server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    @property
+    def url(self):
+        origin = self.origin
+        if not origin:
+            return ""
+        return f"{origin}/connect?state={urllib.parse.quote(self.state)}"
+
+    @property
+    def finished(self):
+        with self._lock:
+            return self._done
+
+    def start(self):
+        """Bind loopback and serve until a credential arrives or time runs out."""
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _login_handler(self))
+        server.daemon_threads = True
+        with self._lock:
+            self._server = server
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        timer = threading.Timer(self.timeout, self.stop)
+        timer.daemon = True
+        timer.start()
+        with self._lock:
+            self._timer = timer
+        return self.url
+
+    def stop(self):
+        with self._lock:
+            server, self._server = self._server, None
+            timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
+        if server is not None:
+            # shutdown() blocks until serve_forever returns, so keep it off the
+            # serving thread.
+            threading.Thread(target=self._close, args=(server,), daemon=True).start()
+
+    @staticmethod
+    def _close(server):
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+
+    def valid_state(self, value):
+        return hmac.compare_digest(str(value or ""), self.state)
+
+    def submit(self, value):
+        """Hand one credential to the plugin. Returns (accepted, message)."""
+        with self._lock:
+            if self._done:
+                return False, "This sign-in link has already been used."
+        try:
+            self._on_credential(self.platform, value)
+        except (AuthError, OSError, ValueError) as exc:
+            return False, str(exc)
+        with self._lock:
+            self._done = True
+        return True, ""
+
+
+def _login_handler(receiver):
+    """Build a request handler bound to one receiver."""
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "OrcaSlicerModelSearch"
+        sys_version = ""
+
+        def log_message(self, *_args):
+            """Stay silent: a request line here can contain the credential."""
+
+        def _reply(self, status, page):
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(page)
+
+        def _is_local(self):
+            """Only this machine, and only pages this receiver served."""
+            host = self.headers.get("Host", "")
+            if not re.fullmatch(r"(?:127\.0\.0\.1|localhost)(?::\d+)?", host):
+                return False
+            origin = receiver.origin
+            for name in ("Origin", "Referer"):
+                value = self.headers.get(name)
+                if value and origin and not value.startswith(origin):
+                    return False
+            return True
+
+        def _query(self):
+            parsed = urllib.parse.urlsplit(self.path)
+            return parsed.path, urllib.parse.parse_qs(parsed.query)
+
+        def do_GET(self):
+            path, query = self._query()
+            if not self._is_local():
+                self._reply(403, _login_page("Blocked", "<p>Local requests only.</p>"))
+                return
+            if not receiver.valid_state(_first(query.get("state"))):
+                self._reply(
+                    403,
+                    _login_page(
+                        "Link expired",
+                        "<p>Start the sign-in again from OrcaSlicer.</p>",
+                    ),
+                )
+                return
+            if path == "/callback":
+                self._handle_callback(query)
+                return
+            if path != "/connect":
+                self._reply(404, _login_page("Not found", "<p>Nothing here.</p>"))
+                return
+            self._reply(200, _connect_page(receiver.platform, receiver.state, ""))
+
+        def _handle_callback(self, query):
+            value = _coalesce(
+                _first(query.get("access_token")),
+                _first(query.get("auth_token")),
+                _first(query.get("token")),
+                _first(query.get("code")),
+                default="",
+            )
+            if not value:
+                self._reply(
+                    400,
+                    _login_page(
+                        "Nothing to connect",
+                        "<p>The portal redirect carried no token.</p>",
+                    ),
+                )
+                return
+            ok, message = receiver.submit(value)
+            self._reply(200 if ok else 400, _login_result(ok, message))
+            if ok:
+                # The reply is written, so tearing the listener down now cannot
+                # truncate it.
+                receiver.stop()
+
+        def do_POST(self):
+            if not self._is_local():
+                self._reply(403, _login_page("Blocked", "<p>Local requests only.</p>"))
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 64 * 1024:
+                self._reply(400, _login_page("Bad request", "<p>Empty submission.</p>"))
+                return
+            fields = urllib.parse.parse_qs(
+                self.rfile.read(length).decode("utf-8", "replace")
+            )
+            if not receiver.valid_state(_first(fields.get("state"))):
+                self._reply(
+                    403,
+                    _login_page(
+                        "Link expired",
+                        "<p>Start the sign-in again from OrcaSlicer.</p>",
+                    ),
+                )
+                return
+            value = _first(fields.get("value"), "")
+            ok, message = receiver.submit(value)
+            if ok:
+                self._reply(200, _login_result(True, ""))
+                receiver.stop()
+                return
+            self._reply(
+                400, _connect_page(receiver.platform, receiver.state, message)
+            )
+
+    return Handler
+
+
+def _connect_page(platform, state, error):
+    spec = _platform(platform)
+    display = spec.display if spec else platform
+    hint = _LOGIN_HINTS.get(
+        platform, "Paste the session value the portal issued after you signed in."
+    )
+    problem = (
+        f'<p class="bad">{html.escape(error)}</p>' if error else ""
+    )
+    body = (
+        f"<p>Signed in to {html.escape(display)} in this browser? "
+        "Finish the connection here and OrcaSlicer picks it up automatically "
+        "&mdash; you do not need to switch back and retype anything.</p>"
+        f"<ol><li>{hint}</li><li>Paste it below and press Connect.</li></ol>"
+        f"{problem}"
+        '<form method="post" action="/connect">'
+        f'<input type="hidden" name="state" value="{html.escape(state)}">'
+        '<textarea name="value" autofocus placeholder="Paste here"></textarea>'
+        "<div><button type=\"submit\">Connect</button></div>"
+        "</form>"
+        "<p>This page is served by the plugin on your own machine and is "
+        "reachable only from it. Nothing is sent anywhere else.</p>"
+    )
+    return _login_page(f"Connect {display}", body)
+
+
+def _login_result(ok, message):
+    if ok:
+        return _login_page(
+            "Connected",
+            '<p class="good">OrcaSlicer has the session. You can close this tab.</p>',
+        )
+    return _login_page(
+        "Not connected",
+        f'<p class="bad">{html.escape(message or "The value was not accepted.")}</p>'
+        "<p>Start the sign-in again from OrcaSlicer.</p>",
+    )
+
+
+_LOGIN_HINTS = {
+    "nexprint": (
+        "Copy the <code>auth_token</code> cookie value from this signed-in "
+        "session."
+    ),
+    "makeronline": (
+        "Copy the <code>mo_access_token</code> cookie value that MakerOnline "
+        "set after the Anycubic login."
+    ),
+    "cults3d": "Copy the <code>Cookie</code> request header of this session.",
+    "grabcad": "Copy the <code>Cookie</code> request header of this session.",
+    "crealitycloud": (
+        "Copy the <code>model_token</code> cookie value (include "
+        "<code>model_user_id</code> if you have it)."
+    ),
+    "thingiverse": "Copy your personal Thingiverse API access token.",
+    "myminifactory": "Copy your MyMiniFactory API key.",
+    "thangs": (
+        "Copy the token from an <code>Authorization: Bearer</code> request "
+        "header of this signed-in session."
+    ),
+    "makerworld": (
+        "Copy the Bambu Cloud access token, or sign in directly from "
+        "OrcaSlicer instead."
+    ),
+}
 
 
 class AuthManager:
@@ -4664,7 +4975,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
   <div id="password-field" class="field"><label>Password (never saved)</label><input id="auth-password" type="password" autocomplete="current-password"></div>
   <div id="code-field" class="field" style="display:none"><label>Verification code</label><input id="auth-code" autocomplete="one-time-code"></div>
   <div class="field"><label id="token-label">Session/access token (alternative)</label><input id="auth-token" type="password" autocomplete="off"></div>
-  <div class="button-row"><button id="auth-submit" onclick="submitAuth()">Connect</button><button id="official-login" class="secondary" onclick="openOfficialLogin()">Open official login</button><button id="import-anycubic" class="secondary" style="display:none" onclick="importAnycubic()">Import from Anycubic Slicer Next</button><button id="auth-logout" class="danger" onclick="logoutAuth()">Forget session</button><button class="secondary" onclick="closeAuth()">Cancel</button></div>
+  <div class="button-row"><button id="auth-submit" onclick="submitAuth()">Connect</button><button id="auth-seamless" onclick="startSeamlessLogin()">Sign in in browser</button><button id="official-login" class="secondary" onclick="openOfficialLogin()">Open official login</button><button id="import-anycubic" class="secondary" style="display:none" onclick="importAnycubic()">Import from Anycubic Slicer Next</button><button id="auth-logout" class="danger" onclick="logoutAuth()">Forget session</button><button class="secondary" onclick="closeAuth()">Cancel</button></div>
 </div>
 <div id="cloudflare-modal" class="auth-modal">
   <h2 style="margin:0 0 5px;font-size:1.05em">Cloudflare verification</h2>
@@ -4749,7 +5060,7 @@ function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedM
 function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var platform=platformKey(selectedModel.platform);if(!selectedModel._download_format&&(platform==='makerworld'||platform==='crealitycloud'||platform==='nexprint')){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id,picker_platform:cached.picker_platform});$('status').textContent='Select a '+cached.picker_platform+' print profile and file format.';return}}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
 function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory'||p==='crealitycloud'||p==='thangs');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API',crealitycloud:'Creality Cloud account',thangs:'Thangs account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='makeronline'?'MakerOnline mo_access_token value or Cookie header':p==='crealitycloud'?'Creality model_token value or Cookie header':p==='thangs'?'Thangs Bearer access token':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=AUTH_HELP[p]||'Use the account credentials supplied by the selected platform.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
 function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active')||$('cloudflare-modal').classList.contains('active')||$('makerworld-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
-function closeAuth(){$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
+function closeAuth(){orca.postMessage({action:'auth_cancel_login'});$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
 function closeFilePicker(){$('file-modal').classList.remove('active');hideImagePreview(null,true);pendingFiles=[];syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
 function closeMakerWorldPicker(){$('makerworld-modal').classList.remove('active');hideImagePreview(null,true);pendingMakerWorldModel=null;syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
 function closeTopModal(){if($('file-modal').classList.contains('active'))closeFilePicker();else if($('makerworld-modal').classList.contains('active'))closeMakerWorldPicker();else if($('cloudflare-modal').classList.contains('active'))closeCloudflare();else closeAuth()}
@@ -4767,6 +5078,7 @@ function showMakerWorldChoices(msg){cacheMakerWorldChoices(msg);pendingMakerWorl
 function confirmMakerWorldChoice(){var p=document.querySelector('#mw-profiles input:checked'),f=document.querySelector('#mw-formats input:checked');if(!p||!f||!pendingMakerWorldModel)return;var platform=pendingMakerWorldModel.platform||'platform';$('mw-import').disabled=true;$('status').textContent=f.value==='3mf'?'Resolving selected '+platform+' profile...':'Opening '+platform+'...';orca.postMessage({action:'resolve_profile_choice',model:pendingMakerWorldModel,profile_id:p.value,format:f.value})}
 function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='crealitycloud'&&!token){$('status').textContent='Creality Cloud: paste model_token after signing in.';return}if(authPlatform==='thangs'&&!token){$('status').textContent='Thangs: paste the Bearer access token after signing in.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}if((authPlatform==='thingiverse'||authPlatform==='myminifactory')&&!token){$('status').textContent='Paste the API token/key first.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
+function startSeamlessLogin(){if(!authPlatform)return;orca.postMessage({action:'auth_start_login',platform:authPlatform});$('status').textContent='Opening the portal sign-in and a local finish page...'}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform});if(authPlatform==='makeronline')$('status').textContent='Anycubic login opened. After MakerOnline returns, copy mo_access_token, paste it here, and connect.'}
 function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('status').textContent='Looking for Anycubic Slicer Next session...'}
 orca.onMessage(function(msg){
@@ -4775,6 +5087,10 @@ orca.onMessage(function(msg){
     searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[],msg.append?false:true);renderSourceResults(msg.sources||[],msg.can_load_more);
   }else if(msg.action==='model_details'){
     applyModelDetails(msg.model||{},!!msg.background);
+  }else if(msg.action==='login_pending'){
+    $('status').textContent='Sign in in the browser, then finish on the local page that opened. OrcaSlicer picks the session up automatically (link valid for '+Math.round((msg.timeout||300)/60)+' min).';
+  }else if(msg.action==='login_cancelled'){
+    $('status').textContent='Browser sign-in cancelled.';
   }else if(msg.action==='cloudflare_required'){
     $('status').textContent=msg.message||'Cloudflare verification is required.';openCloudflare(msg.host||'',msg.url||'');
   }else if(msg.action==='auth_status'||msg.action==='auth_changed'){
@@ -4856,6 +5172,8 @@ if orca is not None:
             self._search_stats = {}
             self._detail_prefetch_lock = threading.RLock()
             self._detail_prefetch_inflight = set()
+            self._login_lock = threading.RLock()
+            self._login = None
 
         def get_name(self):
             return "Search 3D Models"
@@ -4878,6 +5196,7 @@ if orca is not None:
 
         def on_close(self):
             self.win = None
+            self._stop_login()
 
         def _post(self, msg):
             if self.win is not None and self.win.is_open():
@@ -4913,6 +5232,8 @@ if orca is not None:
                 "auth_logout": self._handle_auth_logout,
                 "auth_open_login": self._handle_auth_open_login,
                 "auth_import_anycubic": self._handle_auth_import_anycubic,
+                "auth_start_login": self._handle_auth_start_login,
+                "auth_cancel_login": self._handle_auth_cancel_login,
                 "cloudflare_save": self._handle_cloudflare_save,
                 "cloudflare_forget": self._handle_cloudflare_forget,
             }.get(msg.get("action", ""))
@@ -4980,6 +5301,67 @@ if orca is not None:
 
         def _handle_auth_import_anycubic(self, _msg):
             self._start(self._do_import_anycubic)
+
+        def _handle_auth_start_login(self, msg):
+            self._start(self._do_start_login, msg.get("platform", ""))
+
+        def _handle_auth_cancel_login(self, _msg):
+            self._stop_login()
+            self._post({"action": "login_cancelled"})
+
+        def _stop_login(self):
+            with self._login_lock:
+                receiver, self._login = self._login, None
+            if receiver is not None:
+                receiver.stop()
+
+        def _store_login_credential(self, platform, value):
+            """Called from the loopback receiver once the user submits."""
+            self.auth.save_token(platform, value, label="Browser sign-in")
+            with self._login_lock:
+                self._login = None
+            self._post_auth(
+                "auth_changed",
+                f"{_display_name(platform)} connected from your browser.",
+            )
+
+        def _do_start_login(self, platform):
+            spec = _platform(platform)
+            if spec is None or not spec.requires_auth:
+                self._post(
+                    {"action": "error", "message": "This portal does not use a session."}
+                )
+                return
+            self._stop_login()
+            receiver = LoginReceiver(platform, self._store_login_credential)
+            try:
+                url = receiver.start()
+            except OSError as exc:
+                # A sandbox may refuse the loopback socket. Fall back to the
+                # existing paste flow rather than leaving the user stuck.
+                self._post(
+                    {
+                        "action": "error",
+                        "message": (
+                            "Could not open the local sign-in endpoint "
+                            f"({exc}). Use the token field instead."
+                        ),
+                    }
+                )
+                return
+            with self._login_lock:
+                self._login = receiver
+            if spec.login_url:
+                self._open_external(spec.login_url)
+            self._open_external(url)
+            self._post(
+                {
+                    "action": "login_pending",
+                    "platform": platform,
+                    "url": url,
+                    "timeout": receiver.timeout,
+                }
+            )
 
         def _handle_cloudflare_save(self, msg):
             self._start(self._do_cloudflare_save, msg)

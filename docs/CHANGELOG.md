@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.6.0
+
+- Removed NIH 3D, Smithsonian 3D, NASA 3D Resources, and Wikimedia Commons from the adapters, platform registry, search UI, live smoke checks, tests, and current documentation.
+
 ## 0.5.9
 
 - Added official per-file Thingiverse render thumbnails and file sizes to the multi-file import picker.

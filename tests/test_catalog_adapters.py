@@ -118,6 +118,12 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertFalse(rows[0]["direct_import"])
         self.assertIn("/search/dragon", rows[0]["url"])
 
+    def test_cgtrader_search_uses_explicit_browser_fallback(self):
+        rows = mod.CgTraderSearcher.search("benchy", None)
+        self.assertEqual(rows[0]["platform"], "CGTrader")
+        self.assertEqual(rows[0]["result_type"], "search_link")
+        self.assertFalse(rows[0]["direct_import"])
+
     def test_creality_search_parses_model(self):
         html = '<a href="/model-detail/output">Output</a>'
         with mock.patch.object(
@@ -321,7 +327,7 @@ class DownloadResolverTests(unittest.TestCase):
 
 
 class RegistryAndUiTests(unittest.TestCase):
-    def test_all_requested_catalogs_are_registered(self):
+    def test_supported_catalogs_are_registered_and_removed_catalogs_are_absent(self):
         requested = {
             "thingiverse",
             "cults3d",
@@ -331,10 +337,6 @@ class RegistryAndUiTests(unittest.TestCase):
             "crealitycloud",
             "nexprint",
             "grabcad",
-            "smithsonian",
-            "wikimedia",
-            "nasa",
-            "nih3d",
             "youmagine",
             "pinshape",
             "cgtrader",
@@ -349,15 +351,22 @@ class RegistryAndUiTests(unittest.TestCase):
             "Creality Cloud",
             "Nexprint",
             "GrabCAD",
-            "Smithsonian 3D",
-            "Wikimedia Commons",
-            "NASA 3D Resources",
-            "NIH 3D",
             "YouMagine",
             "Pinshape",
             "CGTrader",
         }
         self.assertTrue(display.issubset(mod._PLATFORMS_BY_DISPLAY))
+        removed_keys = {"smithsonian", "wikimedia", "nasa", "nih3d"}
+        removed_names = {
+            "Smithsonian 3D",
+            "Wikimedia Commons",
+            "NASA 3D Resources",
+            "NIH 3D",
+        }
+        self.assertTrue(removed_keys.isdisjoint(mod._PLATFORMS))
+        self.assertTrue(removed_names.isdisjoint(mod._PLATFORMS_BY_DISPLAY))
+        for key in removed_keys:
+            self.assertNotIn(f'data-platform="{key}"', mod.PAGE)
 
     def test_platform_registry_is_consistent(self):
         self.assertEqual(len(mod._PLATFORM_SPECS), len(mod._PLATFORMS))
@@ -373,10 +382,6 @@ class RegistryAndUiTests(unittest.TestCase):
         for platform in (
             "thangs",
             "crealitycloud",
-            "smithsonian",
-            "wikimedia",
-            "nasa",
-            "nih3d",
             "youmagine",
             "pinshape",
             "cgtrader",
@@ -494,10 +499,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_059(self):
+    def test_version_is_060(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.5.9"', head)
+        self.assertIn('# version = "0.6.0"', head)
 
 
 if __name__ == "__main__":

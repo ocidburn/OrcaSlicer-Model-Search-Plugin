@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.5.9**
+**Current plugin version: v0.6.0**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -61,10 +61,6 @@ The selected search portals are remembered by the embedded UI and restored the n
 | **Makeronline / Anycubic** | Yes | Yes | Anycubic access token / Anycubic Slicer Next session |
 | **Cults3D** | Yes | Yes, for files available to the signed-in account | Cults3D browser session cookies |
 | **GrabCAD** | Yes | Yes, for files available to the signed-in account | GrabCAD browser session cookies |
-| **Smithsonian 3D** | Yes | Yes, public STL ZIP | None |
-| **Wikimedia Commons** | Yes | Yes, public STL | None |
-| **NASA 3D Resources** | Yes | Yes, public STL/3MF | None |
-| **NIH 3D** | Yes | Direct file when exposed; otherwise browser | None |
 | **YouMagine** | Yes | Public file when exposed; otherwise browser | None |
 | **Pinshape** | Yes | Browser | None for search |
 | **CGTrader** | Browser search link | Browser | Interactive browser flow |
@@ -168,13 +164,6 @@ GrabCAD Community Library search/download requires a member session.
 
 Search and file resolution then use that saved GrabCAD browser session. Expired sessions are detected and rejected instead of returning a fake successful import.
 
-### Smithsonian, Wikimedia Commons, NASA, and NIH
-
-- Smithsonian uses the official Smithsonian 3D file-search API and imports water-tight STL ZIP resources directly.
-- Wikimedia Commons uses the MediaWiki Action API, limits results to the STL-files category, and preserves author/license metadata and original STL URLs.
-- NASA searches the official `nasa/NASA-3D-Resources` repository tree and imports matching STL/3MF files from their canonical raw URLs.
-- NIH 3D uses the current public Discover application, including download/view/date metrics. Its changing server-action identifier is discovered from the current application bundle instead of being hard-coded. Interactive entry downloads fall back to the browser.
-
 ### YouMagine, Pinshape, and CGTrader
 
 - YouMagine and Pinshape use their current public HTML search pages.
@@ -203,10 +192,6 @@ The **Search portals** section contains one checkbox for every registered adapte
 - GrabCAD
 - Printables
 - MakerWorld
-- Smithsonian 3D
-- Wikimedia Commons
-- NASA 3D Resources
-- NIH 3D
 - YouMagine
 - Pinshape
 - CGTrader
@@ -384,7 +369,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.5.9 validation gates are:
+The v0.6.0 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

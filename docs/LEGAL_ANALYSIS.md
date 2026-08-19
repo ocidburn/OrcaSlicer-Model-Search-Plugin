@@ -32,10 +32,6 @@ authoritative source.
 | Thingiverse | Official API | Personal developer access token | Official files API |
 | MyMiniFactory | Documented API v2 | Personal API key | API-key metadata; OAuth/store downloads stay in browser |
 | Creality Cloud | Current public model-tag pages | None for search | Direct public file when exposed; otherwise browser |
-| Smithsonian 3D | Official 3D file-search API | None | Open Access STL ZIP URL |
-| Wikimedia Commons | MediaWiki Action API | None | Original STL URL and Commons license metadata |
-| NASA 3D Resources | Official NASA GitHub repository tree | None | Canonical raw STL/3MF URL |
-| NIH 3D | Current public Discover web application | None | Validated public file when exposed; otherwise browser |
 | YouMagine | Current public HTML search | None | Validated public file when exposed; otherwise browser |
 | Pinshape | Current public HTML search | None for search | Official browser download flow |
 | Thangs | Pre-filled official browser search | Browser interaction | Browser only |

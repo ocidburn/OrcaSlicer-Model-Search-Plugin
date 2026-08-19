@@ -25,10 +25,6 @@ SEARCHES = (
     ("nexprint", "benchy"),
     ("cults3d", "benchy"),
     ("crealitycloud", "benchy"),
-    ("smithsonian", "apollo"),
-    ("wikimedia", "cube"),
-    ("nasa", "apollo"),
-    ("nih3d", "heart"),
     ("youmagine", "cube"),
     ("pinshape", "benchy"),
 )

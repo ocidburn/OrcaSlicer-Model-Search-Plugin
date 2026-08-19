@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community and public institutional catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.8.0"
+# version = "0.8.1"
 # ///
 
 import html
@@ -35,7 +35,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.8.0 "
+    "OrcaSlicer-Model-Search-Plugin/0.8.1 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _STANDARD_BROWSER_UA = (
@@ -1543,6 +1543,15 @@ MAKERONLINE_LICENSES = {
 MAKERONLINE_BASE = "https://www.makeronline.com"
 
 
+def _makeronline_thumbnail_url(value):
+    """Return MakerOnline's CDN image unchanged, apart from URL normalization."""
+    value = _decode_embedded_url(value)
+    if value.startswith("//"):
+        value = "https:" + value
+    url = urllib.parse.urljoin(MAKERONLINE_BASE, value)
+    return url if _is_http_url(url) else ""
+
+
 class MakeronlineSearcher:
     SEARCH_URL = f"{MAKERONLINE_BASE}/api/search/model"
 
@@ -1587,8 +1596,8 @@ class MakeronlineSearcher:
                     "author": item.get("show_user_name")
                     or item.get("user_name", "Unknown"),
                     "platform": "Makeronline",
-                    "thumbnail_url": (item.get("mold_image") or "").replace(
-                        "thumbnail", "400x300"
+                    "thumbnail_url": _makeronline_thumbnail_url(
+                        item.get("mold_image")
                     ),
                     "license": lic["name"],
                     "license_url": lic["url"],

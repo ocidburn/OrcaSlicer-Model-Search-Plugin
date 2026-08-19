@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.8.1
+
+- Fixed missing MakerOnline result images by preserving the working official
+  `_thumbnail` CDN URLs instead of rewriting them to nonexistent `_400x300`
+  objects.
+- Normalized relative and protocol-relative MakerOnline image URLs while
+  rejecting non-HTTP image values.
+
 ## 0.8.0
 
 - Restored the non-excluded public NIH 3D, Smithsonian 3D, and NASA 3D

@@ -220,6 +220,41 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertEqual(rows.total, 61)
         self.assertTrue(rows.has_more)
 
+    def test_makeronline_preserves_working_cdn_thumbnail_url(self):
+        thumbnail = (
+            "https://cdn-acop.makeronline.com/asop/2026-07/25/jpg/"
+            "178495837862472000-6a644daa9885_thumbnail.jpg"
+        )
+        payload = {
+            "code": 0,
+            "data": {
+                "data": [
+                    {
+                        "title": "Cup",
+                        "mold_id": 314922,
+                        "mold_image": thumbnail,
+                        "target_url": "https://www.makeronline.com/model/Cup/314922.html",
+                    }
+                ]
+            },
+        }
+        with mock.patch("requests.post", return_value=FakeResponse(payload)):
+            rows = mod.MakeronlineSearcher.search("cup", None)
+
+        self.assertEqual(rows[0]["thumbnail_url"], thumbnail)
+        self.assertNotIn("_400x300", rows[0]["thumbnail_url"])
+
+    def test_makeronline_normalizes_relative_and_protocol_relative_images(self):
+        self.assertEqual(
+            mod._makeronline_thumbnail_url("/images/cup_thumbnail.jpg"),
+            "https://www.makeronline.com/images/cup_thumbnail.jpg",
+        )
+        self.assertEqual(
+            mod._makeronline_thumbnail_url("//cdn-acop.makeronline.com/cup.webp"),
+            "https://cdn-acop.makeronline.com/cup.webp",
+        )
+        self.assertEqual(mod._makeronline_thumbnail_url("javascript:alert(1)"), "")
+
     def test_printables_and_makerworld_use_offsets(self):
         printables_payload = {"data": {"searchPrints2": {"items": []}}}
         with mock.patch(
@@ -743,10 +778,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_080(self):
+    def test_version_is_081(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.8.0"', head)
+        self.assertIn('# version = "0.8.1"', head)
 
 
 if __name__ == "__main__":

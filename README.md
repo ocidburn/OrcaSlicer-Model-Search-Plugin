@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.5.6**
+**Current plugin version: v0.5.7**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -138,6 +138,7 @@ Search is public. Import requires an Anycubic/Makeronline access token.
 
 Supported connection methods:
 
+- **Open official login** — opens Anycubic's current `cas.anycubic.com` OAuth authorization page. Completing browser login does not by itself pass the OAuth code back to this plugin.
 - **Import from Anycubic Slicer Next** — the plugin checks known local Slicer Next configuration locations for an `access_token`.
 - Paste an existing access token from an authenticated Anycubic/Makeronline session.
 
@@ -383,7 +384,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.5.6 validation gates are:
+The v0.5.7 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

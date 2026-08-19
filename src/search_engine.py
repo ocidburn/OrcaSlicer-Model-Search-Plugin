@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community, museum, scientific, and space catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.5.6"
+# version = "0.5.7"
 # ///
 
 import html
@@ -34,7 +34,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.5.6 "
+    "OrcaSlicer-Model-Search-Plugin/0.5.7 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -2823,7 +2823,10 @@ _PLATFORM_SPECS = (
         MakeronlineSearcher,
         auth_hosts=("makeronline.com", "anycubic.com"),
         auth_mode="anycubic",
-        login_url="https://uc.makeronline.com/",
+        login_url=(
+            "https://cas.anycubic.com/login/oauth/authorize"
+            "?client_id=69ce24b6eaf78e597ac0&response_type=code"
+        ),
         referer="https://www.makeronline.com/",
     ),
     PlatformSpec(
@@ -3319,7 +3322,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <script>
 var selectedModel=null, searching=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[], pendingMakerWorldModel=null, activeAuthHelp=null, resultImageObserver=null, makerWorldChoicesCache={}, makerWorldPrefetching={}, makerWorldPreloadedImages={};
 var $=function(id){return document.getElementById(id)};
-var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Sign in through Anycubic Slicer Next, then click Import from Anycubic Slicer Next in the Account dialog. You can alternatively paste an existing Anycubic access token. The removed legacy password endpoint is not used.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'A GrabCAD Community Library membership is required. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.'};
+var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login if you need to sign in. Browser login alone does not connect this plugin: afterwards import the session from Anycubic Slicer Next or paste an existing Anycubic access token. The removed legacy password endpoint is not used.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'A GrabCAD Community Library membership is required. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.'};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function safeUrl(s){try{var u=new URL(String(s||''));return(u.protocol==='http:'||u.protocol==='https:')?u.href:''}catch(e){return''}}
 function showAuthHelp(button){var tooltip=$('auth-tooltip'),text=AUTH_HELP[button.dataset.platform]||'';if(!text)return;activeAuthHelp=button;tooltip.textContent=text;tooltip.classList.add('active');tooltip.style.left='0px';tooltip.style.top='0px';var r=button.getBoundingClientRect(),gap=8,margin=8,left=Math.max(margin,Math.min(window.innerWidth-tooltip.offsetWidth-margin,r.left+r.width/2-tooltip.offsetWidth/2)),top=r.bottom+gap;if(top+tooltip.offsetHeight>window.innerHeight-margin)top=Math.max(margin,r.top-tooltip.offsetHeight-gap);tooltip.style.left=Math.round(left)+'px';tooltip.style.top=Math.round(top)+'px'}

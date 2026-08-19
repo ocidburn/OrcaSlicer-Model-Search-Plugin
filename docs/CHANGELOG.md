@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.7
+
+- Updated MakerOnline's official-login button from the old generic user-center page to Anycubic's current `cas.anycubic.com` OAuth authorization endpoint and clarified that the plugin still needs a Slicer Next session import or access token.
+
 ## 0.5.6
 
 - Fixed MakerWorld 3MF downloads whose print-profile names contain decimal dots, such as `0.2mm layer`, being saved without the required `.3mf` extension and therefore skipped by OrcaSlicer import.

@@ -376,6 +376,14 @@ class RegistryAndUiTests(unittest.TestCase):
         for platform in expected:
             self.assertIn(f"{platform}:", mod.PAGE)
 
+    def test_makeronline_login_uses_current_anycubic_oauth_endpoint(self):
+        self.assertEqual(
+            mod._PLATFORMS["makeronline"].login_url,
+            "https://cas.anycubic.com/login/oauth/authorize"
+            "?client_id=69ce24b6eaf78e597ac0&response_type=code",
+        )
+        self.assertIn("Browser login alone does not connect this plugin", mod.PAGE)
+
     def test_every_available_searcher_has_portal_checkbox(self):
         import re
 
@@ -455,10 +463,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_056(self):
+    def test_version_is_057(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.5.6"', head)
+        self.assertIn('# version = "0.5.7"', head)
 
 
 if __name__ == "__main__":

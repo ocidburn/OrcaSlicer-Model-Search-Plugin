@@ -1078,7 +1078,33 @@ def _login_handler(receiver):
                 # truncate it.
                 receiver.stop()
 
+        def _read_body(self):
+            """Consume the request body before anything is written back.
+
+            Replying while the client is still uploading gets the connection
+            reset instead of the response, so every refusal below reads first.
+            Oversized bodies are drained only up to a bound, never buffered.
+            """
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length <= 0:
+                return 0, ""
+            capped = min(length, 4 * _LOGIN_MAX_BODY_BYTES)
+            remaining = capped
+            chunks = []
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                if length <= _LOGIN_MAX_BODY_BYTES:
+                    chunks.append(chunk)
+            return length, b"".join(chunks).decode("utf-8", "replace")
+
         def do_POST(self):
+            length, body = self._read_body()
             if not self._is_local():
                 self._blocked()
                 return
@@ -1091,24 +1117,10 @@ def _login_handler(receiver):
                     ),
                 )
                 return
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                length = 0
             if length <= 0:
                 self._reply(400, _login_page("Bad request", "<p>Empty submission.</p>"))
                 return
             if length > _LOGIN_MAX_BODY_BYTES:
-                # Drain a bounded amount first: replying to a client that is
-                # still uploading gets the connection reset instead of the
-                # error page, which is exactly the kind of dead end this
-                # endpoint should not produce.
-                remaining = min(length, 4 * _LOGIN_MAX_BODY_BYTES)
-                while remaining > 0:
-                    chunk = self.rfile.read(min(remaining, 65536))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
                 self._reply(
                     413,
                     _login_page(
@@ -1118,9 +1130,7 @@ def _login_handler(receiver):
                     ),
                 )
                 return
-            fields = urllib.parse.parse_qs(
-                self.rfile.read(length).decode("utf-8", "replace")
-            )
+            fields = urllib.parse.parse_qs(body)
             if not receiver.valid_state(_first(fields.get("state"))):
                 self._reply(
                     403,

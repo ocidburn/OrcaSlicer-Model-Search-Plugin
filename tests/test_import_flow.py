@@ -189,6 +189,70 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertIn("Select all", mod.PAGE)
         self.assertIn("Select none", mod.PAGE)
 
+    def test_makerworld_import_opens_profile_and_format_picker(self):
+        mod, action = self.make_action()
+        model = {
+            "platform": "MakerWorld",
+            "_model_id": 10,
+            "url": "https://makerworld.com/en/models/10",
+            "requires_auth": True,
+        }
+        choices = {
+            "profiles": [{"profile_id": "123", "title": "Fast"}],
+            "default_profile_id": "123",
+            "formats": [{"id": "3mf", "label": "3MF", "available": True}],
+        }
+        with (
+            mock.patch.object(action.auth, "authenticated", return_value=True),
+            mock.patch.object(
+                mod.MakerWorldSearcher,
+                "get_download_choices",
+                return_value=choices,
+            ),
+            mock.patch.object(action, "_download_and_import") as download,
+        ):
+            action._resolve_import(model)
+        download.assert_not_called()
+        self.assertEqual(action.win.posts[-1]["action"], "makerworld_choices")
+        self.assertEqual(action.win.posts[-1]["profiles"][0]["profile_id"], "123")
+
+    def test_makerworld_3mf_choice_preserves_explicit_profile(self):
+        _mod, action = self.make_action()
+        model = {
+            "platform": "MakerWorld",
+            "url": "https://makerworld.com/en/models/10",
+        }
+        with mock.patch.object(action, "_resolve_import") as resolve:
+            action._resolve_makerworld_choice(
+                model, {"profile_id": "456", "format": "3mf"}
+            )
+        selected = resolve.call_args.args[0]
+        self.assertEqual(selected["_profile_id"], "456")
+        self.assertEqual(selected["_download_format"], "3mf")
+
+    def test_makerworld_raw_files_use_official_browser_flow(self):
+        _mod, action = self.make_action()
+        action._resolve_makerworld_choice(
+            {
+                "platform": "MakerWorld",
+                "url": "https://makerworld.com/en/models/10#profileId-111",
+            },
+            {"profile_id": "456", "format": "raw_browser"},
+        )
+        message = action.win.posts[-1]
+        self.assertEqual(message["action"], "browser_required")
+        self.assertEqual(
+            message["url"], "https://makerworld.com/en/models/10#profileId-456"
+        )
+
+    def test_ui_contains_makerworld_profile_and_format_picker(self):
+        mod = load_module()
+        self.assertIn('id="makerworld-modal"', mod.PAGE)
+        self.assertIn('id="mw-profiles"', mod.PAGE)
+        self.assertIn('id="mw-formats"', mod.PAGE)
+        self.assertIn("resolve_makerworld_choice", mod.PAGE)
+        self.assertIn("STL/CAD files", mod.PAGE)
+
     def test_detail_import_panel_closes_on_click_outside(self):
         mod = load_module()
         self.assertIn("document.addEventListener('pointerdown'", mod.PAGE)

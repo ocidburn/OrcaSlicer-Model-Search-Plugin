@@ -441,10 +441,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_051(self):
+    def test_version_is_052(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.5.1"', head)
+        self.assertIn('# version = "0.5.2"', head)
 
 
 if __name__ == "__main__":

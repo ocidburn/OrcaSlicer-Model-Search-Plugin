@@ -23,8 +23,8 @@ authoritative source.
 
 | Source | Search mechanism | Credential | File behavior |
 |---|---|---|---|
-| Printables | Public GraphQL `searchPrints2` | None | Public model files |
-| MakerWorld | Bambu search service | None for search; user token for import | Signed profile download |
+| Printables | Public GraphQL `searchPrints2` | None | Canonical per-file `getDownloadLink` URLs |
+| MakerWorld | Bambu search service | None for search; user token for import | Selected signed 3MF profile; raw STL/CAD stays in browser |
 | Makeronline | Public search endpoint | User Anycubic token for import | Account-authorized files |
 | Nexprint | Public model-library gateway | User `auth_token` for import | Account-authorized files |
 | Cults3D | Public HTML catalog | User browser cookies for files | Account/checkout rules preserved |

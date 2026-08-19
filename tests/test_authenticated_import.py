@@ -160,6 +160,58 @@ class AuthStoreTests(unittest.TestCase):
 
 
 class ResolverTests(unittest.TestCase):
+    def test_printables_uses_get_download_link_instead_of_filename_url_guessing(self):
+        files_response = FakeResponse(
+            data={
+                "data": {
+                    "print": {
+                        "stls": [
+                            {"id": "789571", "name": "Phone Stand.stl", "fileSize": 42}
+                        ]
+                    }
+                }
+            }
+        )
+        link_response = FakeResponse(
+            data={
+                "data": {
+                    "getDownloadLink": {
+                        "ok": True,
+                        "errors": [],
+                        "output": {
+                            "link": "https://files.printables.com/canonical/phone-stand.stl",
+                            "count": 1,
+                            "ttl": 86400,
+                        },
+                    }
+                }
+            }
+        )
+        with mock.patch(
+            "requests.post", side_effect=[files_response, link_response]
+        ) as post:
+            files = mod.PrintablesSearcher.get_files(
+                {"url": "https://www.printables.com/model/187125-phone-stand"}
+            )
+        self.assertEqual(files[0]["name"], "Phone Stand.stl")
+        self.assertEqual(
+            files[0]["url"],
+            "https://files.printables.com/canonical/phone-stand.stl",
+        )
+        self.assertTrue(files[0]["signed"])
+        self.assertNotIn("Phone%20Stand.stl", files[0]["url"])
+        mutation = post.call_args_list[1].kwargs["json"]
+        self.assertIn("getDownloadLink", mutation["query"])
+        self.assertEqual(
+            mutation["variables"],
+            {
+                "id": "789571",
+                "modelId": "187125",
+                "fileType": "stl",
+                "source": "model_detail",
+            },
+        )
+
     def test_makerworld_uses_internal_model_id_and_profile_download_endpoint(self):
         design = {
             "modelId": "US2bb73b106683e5",
@@ -185,16 +237,79 @@ class ResolverTests(unittest.TestCase):
         self.assertIn("/user/profile/3601086", auth.calls[1][2])
         self.assertEqual(auth.calls[1][3]["params"]["model_id"], "US2bb73b106683e5")
 
-    def test_makerworld_selects_first_instance_when_url_has_no_profile(self):
-        design = {"modelId": "MID", "title": "Thing", "instances": []}
-        instances = {"hits": [{"profileId": 123, "title": "Default"}]}
-        signed = {"url": "https://makerworld.bblmw.com/a.3mf?x=1"}
+    def test_makerworld_lists_profiles_and_formats_before_downloading(self):
+        design = {
+            "modelId": "MID",
+            "title": "Thing",
+            "instances": [
+                {
+                    "profileId": 123,
+                    "title": "Fast profile",
+                    "isDefault": True,
+                    "hasZipStl": True,
+                    "prediction": 7200,
+                    "ratingScoreTotal": 48,
+                    "ratingCount": 10,
+                    "instanceCreator": {"name": "Designer"},
+                    "extention": {
+                        "modelInfo": {
+                            "compatibility": {"devProductName": "X1 Carbon"},
+                            "plates": [{}, {}],
+                            "projectSettings": {
+                                "layerHeight": "0.2mm",
+                                "wallLoops": 2,
+                                "sparseInfillDensity": "10%",
+                            },
+                        }
+                    },
+                },
+                {"profileId": 456, "title": "Quality profile"},
+            ],
+        }
         auth = FakeAuth(
             "makerworld",
             [
                 FakeResponse(data=design),
-                FakeResponse(data=instances),
-                FakeResponse(data=signed),
+                FakeResponse(data={"hits": design["instances"], "total": 2}),
+            ],
+        )
+        choices = mod.MakerWorldSearcher.get_download_choices(
+            {
+                "platform": "MakerWorld",
+                "_model_id": 10,
+                "url": "https://makerworld.com/en/models/10",
+            },
+            auth,
+        )
+        self.assertEqual(
+            [item["profile_id"] for item in choices["profiles"]], ["123", "456"]
+        )
+        self.assertEqual(choices["default_profile_id"], "123")
+        self.assertEqual(choices["profiles"][0]["plates"], 2)
+        self.assertEqual(choices["profiles"][0]["rating"], 4.8)
+        self.assertEqual(choices["profiles"][0]["printer"], "X1 Carbon")
+        self.assertEqual(
+            [item["id"] for item in choices["formats"]], ["3mf", "raw_browser"]
+        )
+        self.assertTrue(choices["formats"][1]["available"])
+        self.assertIn("/design/10/instances", auth.calls[1][2])
+
+    def test_makerworld_profile_list_uses_wrapper_id_when_detail_id_is_zero(self):
+        instance = {
+            "profileId": 789,
+            "title": "Wrapper title",
+            "detail": {"profileId": 0, "title": "Detailed title"},
+        }
+        profile = mod.MakerWorldSearcher._profile_record(instance)
+        self.assertEqual(profile["profile_id"], "789")
+        self.assertEqual(profile["title"], "Detailed title")
+
+    def test_makerworld_does_not_silently_select_first_profile(self):
+        design = {"modelId": "MID", "title": "Thing", "instances": []}
+        auth = FakeAuth(
+            "makerworld",
+            [
+                FakeResponse(data=design),
             ],
         )
         model = {
@@ -202,11 +317,9 @@ class ResolverTests(unittest.TestCase):
             "_model_id": 10,
             "url": "https://makerworld.com/en/models/10",
         }
-        files = mod.MakerWorldSearcher.get_files(model, auth)
-        self.assertEqual(len(files), 1)
-        self.assertTrue(files[0]["name"].endswith(".3mf"))
-        self.assertIn("/design/10/instances", auth.calls[1][2])
-        self.assertIn("/user/profile/123", auth.calls[2][2])
+        with self.assertRaisesRegex(ValueError, "Select a MakerWorld print profile"):
+            mod.MakerWorldSearcher.get_files(model, auth)
+        self.assertEqual(len(auth.calls), 1)
 
     def test_nexprint_lists_all_model_files(self):
         payload = {

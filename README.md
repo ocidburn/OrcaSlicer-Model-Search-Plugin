@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.5.1**
+**Current plugin version: v0.5.2**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -17,7 +17,7 @@ The plugin opens a non-modal `Search 3D Models` window, lets you choose which po
 4. Open **Prepare**, press **Space**, choose **Search 3D Models**, and press Enter. In builds without Actions Speed Dial, launch the script from the Plugins UI.
 5. Tick the portals you want to search, enter a query, and press **Search**.
 6. Open a result and press **Import into OrcaSlicer**.
-7. If the model contains multiple files, tick only the files you want and press **Import selected**.
+7. If the model contains multiple files, select the files to import. For MakerWorld, select a print profile and download format first.
 
 The selected search portals are remembered by the embedded UI and restored the next time the search window is opened.
 
@@ -36,6 +36,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 - Passwords are never persisted.
 - Single-file downloads import immediately.
 - Multi-file models show a checkbox list before downloading.
+- MakerWorld models show their available print profiles and let you choose direct 3MF import or the official browser flow for STL/CAD files.
 - ZIP downloads are safely expanded and supported model files are imported.
 - Downloaded models are handed to the already-running OrcaSlicer instance and added to the current project.
 - Re-running `Search 3D Models` reuses the existing search window instead of opening duplicates.
@@ -72,7 +73,8 @@ A successful search result does not guarantee that the portal allows a direct pr
 
 - Public search through Printables.
 - No login is required for public model files.
-- The plugin resolves available STL files and imports them into the active OrcaSlicer project.
+- The plugin requests every file's canonical temporary URL through Printables' `getDownloadLink` mutation. It never guesses a storage URL from filename capitalization, spaces, or hyphens.
+- Available STL files can be selected and imported into the active OrcaSlicer project.
 
 ### Thingiverse
 
@@ -110,7 +112,10 @@ The account panel supports:
 
 Only the resulting session token is saved. The password is not stored.
 
-MakerWorld import resolves the design, chooses the requested/first printable profile, asks MakerWorld for the authenticated profile download, and downloads the returned signed 3MF URL.
+MakerWorld import lists the available print profiles with their title, creator, printer, layer settings, plate count, estimated print time, and rating when supplied by MakerWorld. The user explicitly selects a profile and then chooses:
+
+- **3MF print profile** — asks MakerWorld for the authenticated signed profile URL and imports it directly.
+- **STL/CAD files** — opens the selected profile on MakerWorld for its signed-in browser download flow. Bambu's token API does not expose raw files to this plugin, so this option is never presented as a successful direct import.
 
 ### Nexprint / Elegoo
 
@@ -374,7 +379,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.5.1 validation gates are:
+The v0.5.2 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

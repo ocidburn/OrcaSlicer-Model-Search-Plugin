@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.5.2
+
+- Replaced Printables filename-based storage URL construction with its canonical `getDownloadLink` GraphQL mutation.
+- Added an explicit MakerWorld print-profile picker with profile metadata instead of silently downloading the first profile.
+- Added a MakerWorld format choice: direct signed 3MF import or the official signed-in browser flow for raw STL/CAD files.
+- Added regression coverage for Printables mixed-case/spaced filenames and MakerWorld profile/format routing.
 - Organized the repository into `src/`, `tests/`, `scripts/`, `docs/`, and `typings/` while keeping the plugin itself as one downloadable Python file.
 - Centralized test-module loading and reusable JavaScript/Windows IPC validation helpers.
 

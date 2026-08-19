@@ -359,16 +359,128 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertEqual(get.call_count, 2)
         self.assertIn("/search/dragon", raised.exception.url)
 
-    def test_creality_search_parses_model(self):
-        html = '<a href="/model-detail/output">Output</a>'
-        with mock.patch.object(
-            mod,
-            "_fetch_html",
-            return_value=(html, "https://www.crealitycloud.com/search/model?q=output"),
-        ):
-            rows = mod.CrealityCloudSearcher.search("output", None)
+    def test_creality_search_uses_api_and_keeps_high_resolution_cover(self):
+        payload = {
+            "code": 0,
+            "result": {
+                "count": 61,
+                "list": [
+                    {
+                        "id": "68df5251aaaa058eab3729a1",
+                        "urlAlias": "dragon-cup-3d-print",
+                        "groupName": "DRAGON CUP",
+                        "userInfo": {"nickName": "ABDULLAH ALAN"},
+                        "covers": [
+                            {
+                                "url": "https://pic2-cdn.creality.com/comp/model/dragon.webp",
+                                "originUrl": "https://pic2-cdn.creality.com/model/dragon.png",
+                            }
+                        ],
+                        "license": "CXY-SL",
+                        "downloadCount": 436,
+                        "likeCount": 202,
+                        "pv": 2405,
+                        "model3mfCount": 2,
+                        "isPay": False,
+                    }
+                ],
+            },
+        }
+        with mock.patch("requests.post", return_value=FakeResponse(payload)) as post:
+            rows = mod.CrealityCloudSearcher.search(
+                "dragon cup", None, {"page": 2, "sort": "downloads"}
+            )
         self.assertEqual(rows[0]["platform"], "Creality Cloud")
-        self.assertEqual(rows[0]["name"], "Output")
+        self.assertEqual(rows[0]["name"], "DRAGON CUP")
+        self.assertEqual(
+            rows[0]["thumbnail_url"],
+            "https://pic2-cdn.creality.com/comp/model/dragon.webp",
+        )
+        self.assertNotIn("h_10", rows[0]["thumbnail_url"])
+        self.assertEqual(rows[0]["license"], "Standard Digital File License")
+        self.assertEqual(rows[0]["downloads"], 436)
+        self.assertEqual(rows.total, 61)
+        self.assertTrue(rows.has_more)
+        self.assertEqual(post.call_args.kwargs["json"]["page"], 2)
+        self.assertEqual(post.call_args.kwargs["json"]["sortType"], 7)
+
+    def test_creality_lists_print_profiles_and_formats(self):
+        payload = {
+            "code": 0,
+            "result": {
+                "count": 1,
+                "list": [
+                    {
+                        "id": "690dd45f2904ad6ab51c9f2c",
+                        "secondName": "0.16mm layer, 2 walls, 15% infill",
+                        "thumbnail": "https://pic2-cdn.creality.com/profile.png",
+                        "printerName": "Creality Hi",
+                        "layerHeight": "0.16",
+                        "wallLoops": "2",
+                        "sparseInfillDensity": "15%",
+                        "plateCount": 1,
+                        "printTime": 4135,
+                        "size": 13954344,
+                        "userInfo": {"nickName": "3dtex"},
+                    }
+                ],
+            },
+        }
+        with mock.patch("requests.post", return_value=FakeResponse(payload)):
+            choices = mod.CrealityCloudSearcher.get_download_choices(
+                {
+                    "_model_id": "68df5251aaaa058eab3729a1",
+                    "platform": "Creality Cloud",
+                }
+            )
+        self.assertEqual(choices["picker_platform"], "Creality Cloud")
+        self.assertEqual(
+            choices["profiles"][0]["profile_id"], "690dd45f2904ad6ab51c9f2c"
+        )
+        self.assertEqual(choices["profiles"][0]["printer"], "Creality Hi")
+        self.assertEqual(
+            [item["id"] for item in choices["formats"]], ["3mf", "raw_browser"]
+        )
+
+    def test_creality_signed_3mf_keeps_file_extension(self):
+        auth = mock.Mock()
+        auth.authenticated.return_value = True
+        auth.token.return_value = (
+            "model_token=model-token; model_user_id=5925463110"
+        )
+        responses = [
+            FakeResponse(
+                {
+                    "code": 0,
+                    "result": {"name": "0.16mm layer, 2 walls", "size": 4096},
+                }
+            ),
+            FakeResponse(
+                {
+                    "code": 0,
+                    "result": "https://file2-cdn.creality.com/signed/profile",
+                }
+            ),
+        ]
+        with mock.patch("requests.post", side_effect=responses) as post:
+            files = mod.CrealityCloudSearcher.get_files(
+                {
+                    "platform": "Creality Cloud",
+                    "_profile_id": "690dd45f2904ad6ab51c9f2c",
+                    "_download_format": "3mf",
+                },
+                auth,
+            )
+        self.assertEqual(files[0]["name"], "0.16mm layer_ 2 walls.3mf")
+        self.assertEqual(
+            files[0]["url"], "https://file2-cdn.creality.com/signed/profile"
+        )
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["__CXY_TOKEN_"], "model-token"
+        )
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["__CXY_UID_"], "5925463110"
+        )
 
     def test_grabcad_requires_session_for_search(self):
         with tempfile.TemporaryDirectory() as td:
@@ -639,7 +751,6 @@ class RegistryAndUiTests(unittest.TestCase):
             "yeggi",
             "thangs",
             "stlfinder",
-            "crealitycloud",
             "smithsonian",
             "nasa",
             "nih3d",
@@ -652,6 +763,7 @@ class RegistryAndUiTests(unittest.TestCase):
             "grabcad",
             "thingiverse",
             "myminifactory",
+            "crealitycloud",
         ):
             self.assertIn(f'id="auth-{platform}"', mod.PAGE)
 
@@ -679,6 +791,13 @@ class RegistryAndUiTests(unittest.TestCase):
         )
         self.assertIn("copy the mo_access_token cookie value", mod.PAGE)
         self.assertIn("MakerOnline mo_access_token value or Cookie header", mod.PAGE)
+
+    def test_creality_login_uses_official_identity_connect_endpoint(self):
+        login_url = mod._PLATFORMS["crealitycloud"].login_url
+        self.assertTrue(login_url.startswith("https://id.creality.com/connect?"))
+        self.assertIn("client_id=f9c302ecc29c59a0a6e921ff39a073ca", login_url)
+        self.assertIn("redirect_uri=https%3A%2F%2Fwww.crealitycloud.com%2F", login_url)
+        self.assertIn("model_token cookie value", mod.PAGE)
 
     def test_every_available_searcher_has_portal_checkbox(self):
         import re
@@ -741,6 +860,7 @@ class RegistryAndUiTests(unittest.TestCase):
                 "myminifactory",
                 "thangs",
                 "stlfinder",
+                "crealitycloud",
                 "smithsonian",
                 "nih3d",
             },
@@ -832,10 +952,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_082(self):
+    def test_version_is_083(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.8.2"', head)
+        self.assertIn('# version = "0.8.3"', head)
 
 
 if __name__ == "__main__":

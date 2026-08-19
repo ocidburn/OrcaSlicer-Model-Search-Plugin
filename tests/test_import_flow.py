@@ -238,7 +238,7 @@ class MultiFileSelectionTests(unittest.TestCase):
         ):
             action._resolve_import(model)
         download.assert_not_called()
-        self.assertEqual(action.win.posts[-1]["action"], "makerworld_choices")
+        self.assertEqual(action.win.posts[-1]["action"], "profile_choices")
         self.assertEqual(action.win.posts[-1]["profiles"][0]["profile_id"], "123")
 
     def test_makerworld_card_selection_can_prefetch_profiles_without_login(self):
@@ -269,10 +269,10 @@ class MultiFileSelectionTests(unittest.TestCase):
                 return_value=choices,
             ) as get_choices,
         ):
-            action._prefetch_makerworld_profiles(model)
+            action._prefetch_profile_choices(model)
         get_choices.assert_called_once_with(model, action.auth)
         message = action.win.posts[-1]
-        self.assertEqual(message["action"], "makerworld_prefetched")
+        self.assertEqual(message["action"], "profile_prefetched")
         self.assertEqual(message["model"], model)
         self.assertEqual(message["profiles"][0]["profile_id"], "123")
 
@@ -310,7 +310,7 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertIn('id="makerworld-modal"', mod.PAGE)
         self.assertIn('id="mw-profiles"', mod.PAGE)
         self.assertIn('id="mw-formats"', mod.PAGE)
-        self.assertIn("resolve_makerworld_choice", mod.PAGE)
+        self.assertIn("resolve_profile_choice", mod.PAGE)
         self.assertIn("STL/CAD files", mod.PAGE)
         self.assertIn("mw-summary", mod.PAGE)
 
@@ -324,11 +324,76 @@ class MultiFileSelectionTests(unittest.TestCase):
 
     def test_ui_prefetches_makerworld_profiles_and_images(self):
         mod = load_module()
-        self.assertIn("prefetch_makerworld_profiles", mod.PAGE)
-        self.assertIn("makerworld_prefetched", mod.PAGE)
+        self.assertIn("prefetch_profile_choices", mod.PAGE)
+        self.assertIn("profile_prefetched", mod.PAGE)
         self.assertIn("makerWorldChoicesCache", mod.PAGE)
         self.assertIn("makerWorldPreloadedImages", mod.PAGE)
         self.assertIn("new Image()", mod.PAGE)
+
+    def test_creality_import_opens_profile_and_format_picker(self):
+        mod, action = self.make_action()
+        model = {
+            "platform": "Creality Cloud",
+            "_platform_key": "crealitycloud",
+            "_model_id": "68df5251aaaa058eab3729a1",
+            "url": "https://www.crealitycloud.com/model-detail/dragon-cup-3d-print",
+        }
+        choices = {
+            "picker_platform": "Creality Cloud",
+            "profiles": [
+                {"profile_id": "690dd45f2904ad6ab51c9f2c", "title": "0.16mm"}
+            ],
+            "default_profile_id": "690dd45f2904ad6ab51c9f2c",
+            "formats": [
+                {"id": "3mf", "label": "3MF", "available": True},
+                {"id": "raw_browser", "label": "STL/CAD", "available": True},
+            ],
+        }
+        with mock.patch.object(
+            mod.CrealityCloudSearcher,
+            "get_download_choices",
+            return_value=choices,
+        ):
+            action._resolve_import(model)
+        message = action.win.posts[-1]
+        self.assertEqual(message["action"], "profile_choices")
+        self.assertEqual(message["picker_platform"], "Creality Cloud")
+        self.assertEqual(
+            message["profiles"][0]["profile_id"], "690dd45f2904ad6ab51c9f2c"
+        )
+
+    def test_creality_3mf_choice_preserves_selected_profile(self):
+        _mod, action = self.make_action()
+        model = {
+            "platform": "Creality Cloud",
+            "_platform_key": "crealitycloud",
+            "url": "https://www.crealitycloud.com/model-detail/dragon-cup-3d-print",
+        }
+        with mock.patch.object(action, "_resolve_import") as resolve:
+            action._resolve_profile_choice(
+                model,
+                {"profile_id": "690dd45f2904ad6ab51c9f2c", "format": "3mf"},
+            )
+        selected = resolve.call_args.args[0]
+        self.assertEqual(selected["_profile_id"], "690dd45f2904ad6ab51c9f2c")
+        self.assertEqual(selected["_download_format"], "3mf")
+
+    def test_creality_raw_files_use_official_browser_flow(self):
+        _mod, action = self.make_action()
+        action._resolve_profile_choice(
+            {
+                "platform": "Creality Cloud",
+                "_platform_key": "crealitycloud",
+                "url": "https://www.crealitycloud.com/model-detail/dragon-cup-3d-print",
+            },
+            {
+                "profile_id": "690dd45f2904ad6ab51c9f2c",
+                "format": "raw_browser",
+            },
+        )
+        message = action.win.posts[-1]
+        self.assertEqual(message["action"], "browser_required")
+        self.assertIn("profileId=690dd45f2904ad6ab51c9f2c", message["url"])
 
     def test_ui_has_enlarged_makerworld_profile_preview(self):
         mod = load_module()

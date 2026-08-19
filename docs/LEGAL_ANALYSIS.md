@@ -33,7 +33,7 @@ authoritative source.
 | MyMiniFactory | Documented API v2 | Personal API key | API-key metadata; OAuth/store downloads stay in browser |
 | Yeggi | Pre-filled official browser search | Browser interaction | Meta-search; original portal owns the file flow |
 | STLFinder | Public indexed model pages | Original portal credential, when required | Delegates only to a registered original portal |
-| Creality Cloud | Current public model-tag pages | None for search | Direct public file when exposed; otherwise browser |
+| Creality Cloud | Public JSON model search and Print Settings | None for search; user's `model_token` for signed 3MF | Selected signed 3MF profile; original STL/CAD stays in browser |
 | Smithsonian 3D | Public Smithsonian file API | None | Public STL ZIP resource |
 | NASA 3D Resources | Official NASA GitHub mirror | None | Canonical public STL/3MF raw files |
 | NIH 3D | Public Discover application | None | Validated public file when exposed; otherwise browser |

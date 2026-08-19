@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community and public institutional catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.8.2"
+# version = "0.8.3"
 # ///
 
 import html
@@ -35,7 +35,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.8.2 "
+    "OrcaSlicer-Model-Search-Plugin/0.8.3 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _STANDARD_BROWSER_UA = (
@@ -96,6 +96,7 @@ _LICENSE_ALIASES = {
     "creative commons - attribution - no derivatives": "CC BY-ND",
     "creative commons - attribution - non-commercial - no derivatives": "CC BY-NC-ND",
     "creative commons - public domain dedication": "CC0",
+    "cxy-sl": "Standard Digital File License",
 }
 
 
@@ -664,6 +665,8 @@ class AuthManager:
                 )
             if m:
                 token = m.group(1).strip()
+        if mode == "creality" and token.lower().startswith("cookie:"):
+            token = token.split(":", 1)[1].strip()
         return token
 
     def save_token(
@@ -2892,28 +2895,310 @@ class ThangsSearcher:
 
 class CrealityCloudSearcher:
     BASE = "https://www.crealitycloud.com"
-    SEARCH_URLS = (BASE + "/model-tags/{query}",)
-    PATH_RE = r"/model-detail/[a-z0-9%._~+()-]+"
+    API_BASE = "https://admin.crealitycloud.com"
+    LOGIN_URL = (
+        "https://id.creality.com/connect?lang=en-US"
+        "&client_id=f9c302ecc29c59a0a6e921ff39a073ca"
+        "&app_id=cxy-gen2"
+        "&redirect_uri=https%3A%2F%2Fwww.crealitycloud.com%2F"
+        "&platform=-100"
+        "&back_url=https%3A%2F%2Fwww.crealitycloud.com%2Foauth"
+    )
+    SEARCH_PATH = "/api/cxy/smart_search/v1/model"
+    PROFILE_LIST_PATH = "/api/cxy/v3/model/3mfList"
+    PROFILE_DETAIL_PATH = "/api/cxy/v3/model/3mfDetail"
+    PROFILE_DOWNLOAD_PATH = "/api/cxy/v3/model/3mfDownload"
+    PAGE_SIZE = 30
+    SORT_TYPES: ClassVar[dict[str, int]] = {
+        "relevance": 10,
+        "popularity": 10,
+        "downloads": 7,
+        "likes": 1,
+        "newest": 3,
+        "makes": 6,
+    }
+
+    @staticmethod
+    def _auth_values(auth):
+        raw = auth.token("crealitycloud") if auth is not None else ""
+        token = str(raw or "").strip()
+        uid = ""
+        match = re.search(r"(?i)(?:^|[;\s])model_token=([^;\s]+)", token)
+        if match:
+            token = match.group(1).strip()
+        uid_match = re.search(
+            r"(?i)(?:^|[;\s])model_user_id=([^;\s]+)", str(raw or "")
+        )
+        if uid_match:
+            uid = uid_match.group(1).strip()
+        return token, uid
+
+    @staticmethod
+    def _headers(auth=None):
+        token, uid = CrealityCloudSearcher._auth_values(auth)
+        return {
+            "User-Agent": _STANDARD_BROWSER_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Content-Type": "application/json",
+            "Origin": CrealityCloudSearcher.BASE,
+            "Referer": CrealityCloudSearcher.BASE + "/",
+            "__CXY_OS_VER_": "Windows 10",
+            "__CXY_PLATFORM_": "2",
+            "__CXY_BRAND_": "creality",
+            "__CXY_APP_CH_": "nuxt_proxy_pc",
+            "__CXY_DUID_": "not set",
+            "__CXY_APP_ID_": "cxy-gen2",
+            "__CXY_APP_VER_": "7.3.20",
+            "__CXY_TIMEZONE_": "0",
+            "__CXY_OS_LANG_": "0",
+            "__CXY_TOKEN_": token,
+            "__CXY_UID_": uid,
+            "__CXY_REQUESTID_": str(time.time_ns()),
+        }
+
+    @staticmethod
+    def _post(path, body, auth=None, *, requires_auth=False):
+        import requests
+
+        response = requests.post(
+            CrealityCloudSearcher.API_BASE + path,
+            json=body,
+            headers=CrealityCloudSearcher._headers(auth),
+            timeout=30,
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise TypeError("Creality Cloud returned an invalid API response")
+        code = _number(payload.get("code"), integer=True)
+        if code not in (None, 0):
+            message = str(payload.get("msg") or payload.get("message") or code)
+            if requires_auth and code in (4, 401, 403):
+                raise AuthRequired(
+                    "Creality Cloud session expired. Open the official login and "
+                    "paste the model_token cookie value again."
+                )
+            raise RuntimeError(f"Creality Cloud API: {message}")
+        return payload.get("result")
+
+    @staticmethod
+    def _cover(item):
+        for field in ("pcCovers", "covers", "editCovers", "modelCovers"):
+            covers = item.get(field) or []
+            if not isinstance(covers, list):
+                continue
+            for cover in covers:
+                if isinstance(cover, dict):
+                    url = str(cover.get("url") or cover.get("originUrl") or "")
+                else:
+                    url = str(cover or "")
+                if _is_http_url(url):
+                    return url
+        return ""
+
+    @staticmethod
+    def _model_id(model):
+        identifier = str(model.get("_model_id") or "").strip()
+        if identifier:
+            return identifier
+        path = urllib.parse.urlsplit(str(model.get("url") or "")).path.rstrip("/")
+        identifier = urllib.parse.unquote(path.rsplit("/", 1)[-1]).strip()
+        if not identifier:
+            raise ValueError("Creality Cloud model id is missing")
+        return identifier
+
+    @staticmethod
+    def _model_url(item):
+        slug = str(item.get("urlAlias") or item.get("id") or "").strip()
+        return CrealityCloudSearcher.BASE + "/model-detail/" + urllib.parse.quote(
+            slug, safe="%._~+()-"
+        )
+
+    @staticmethod
+    def _result(item):
+        license_info = _parse_license(str(item.get("license") or ""))
+        paid = bool(item.get("isPay"))
+        profile_count = int(_number(item.get("model3mfCount"), integer=True) or 0)
+        user = item.get("userInfo") if isinstance(item.get("userInfo"), dict) else {}
+        return _normalize_result(
+            {
+                "name": item.get("groupName") or item.get("name") or "Untitled model",
+                "url": CrealityCloudSearcher._model_url(item),
+                "thumbnail_url": CrealityCloudSearcher._cover(item),
+                "author": user.get("nickName") or user.get("name") or "Unknown",
+                "platform": "Creality Cloud",
+                "license": license_info["name"] or "Unknown",
+                "license_url": license_info["url"],
+                "license_summary": license_info["summary"],
+                "downloads": item.get("downloadCount"),
+                "likes": item.get("likeCount"),
+                "views": item.get("pv"),
+                "makes": item.get("printCountTotal"),
+                "published_at": item.get("createTime"),
+                "price": _coalesce(item.get("promoPrice"), item.get("totalPrice"), default=None),
+                "is_free": not paid,
+                "requires_auth": False,
+                "direct_import": profile_count > 0,
+                "_model_id": str(item.get("id") or ""),
+                "_profile_count": profile_count,
+            }
+        )
 
     @staticmethod
     def search(query, context, options=None):
-        items = _catalog_search(
-            query,
-            CrealityCloudSearcher.SEARCH_URLS,
-            CrealityCloudSearcher.PATH_RE,
-            "Creality Cloud",
+        page = _search_page_number(options)
+        sort = str((options or {}).get("sort") or "relevance")
+        result = CrealityCloudSearcher._post(
+            CrealityCloudSearcher.SEARCH_PATH,
+            {
+                "page": page,
+                "pageSize": CrealityCloudSearcher.PAGE_SIZE,
+                "keyword": query,
+                "sortType": CrealityCloudSearcher.SORT_TYPES.get(sort, 10),
+                "printers": [],
+                "promoType": 0,
+                "isVip": 0,
+                "trendType": 1,
+                "multiMark": 0,
+            },
         )
-        for item in items:
-            item["is_free"] = None
-        return items
+        result = result if isinstance(result, dict) else {}
+        items = [
+            CrealityCloudSearcher._result(item)
+            for item in result.get("list") or []
+            if isinstance(item, dict) and item.get("id")
+        ]
+        return _search_page_result(
+            items, page, CrealityCloudSearcher.PAGE_SIZE, result.get("count")
+        )
+
+    @staticmethod
+    def _profile_record(item):
+        user = item.get("userInfo") if isinstance(item.get("userInfo"), dict) else {}
+        cover = str(item.get("thumbnail") or "") or CrealityCloudSearcher._cover(item)
+        return {
+            "profile_id": str(item.get("id") or ""),
+            "title": item.get("secondName") or item.get("name") or "Print profile",
+            "summary": _strip_html(item.get("desc")),
+            "cover": cover if _is_http_url(cover) else "",
+            "creator": user.get("nickName") or "",
+            "printer": item.get("printerName") or "",
+            "layer_height": item.get("layerHeight") or "",
+            "walls": item.get("wallLoops") or "",
+            "infill": item.get("sparseInfillDensity") or "",
+            "prediction": _number(item.get("printTime"), integer=True),
+            "plates": _number(item.get("plateCount"), integer=True),
+            "rating": _number(item.get("score")),
+            "rating_count": _number(item.get("commnetCount"), integer=True),
+            "size": _number(item.get("size"), integer=True),
+        }
+
+    @staticmethod
+    def get_download_choices(model, auth=None):
+        model_id = CrealityCloudSearcher._model_id(model)
+        result = CrealityCloudSearcher._post(
+            CrealityCloudSearcher.PROFILE_LIST_PATH,
+            {
+                "page": 1,
+                "pageSize": 199,
+                "modelGroupId": model_id,
+                "printerInternalNameList": [],
+                "filterType": 11,
+            },
+            auth,
+        )
+        result = result if isinstance(result, dict) else {}
+        profiles = [
+            CrealityCloudSearcher._profile_record(item)
+            for item in result.get("list") or []
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if not profiles:
+            profiles = [
+                {
+                    "profile_id": "model-files",
+                    "title": "Original model files",
+                    "summary": "No public Creality print profile is available.",
+                    "cover": str(model.get("thumbnail_url") or ""),
+                }
+            ]
+        return {
+            "picker_platform": "Creality Cloud",
+            "profiles": profiles,
+            "default_profile_id": profiles[0]["profile_id"],
+            "formats": [
+                {
+                    "id": "3mf",
+                    "label": "3MF print profile",
+                    "description": "Download and import the selected Creality print profile directly.",
+                    "available": profiles[0]["profile_id"] != "model-files",
+                },
+                {
+                    "id": "raw_browser",
+                    "label": "STL/CAD files",
+                    "description": "Open the official Creality Cloud file list in your browser.",
+                    "available": True,
+                },
+            ],
+        }
 
     @staticmethod
     def get_files(model, auth=None):
-        return _public_page_files(
-            model,
-            restricted_markers=("Buy now", "Purchase", "Subscribe to download"),
-            no_direct_message="Creality Cloud did not expose a public direct 3MF/STL URL for this model. Use Open in browser for its official download flow.",
+        if model.get("_download_format") != "3mf":
+            raise BrowserRequired(
+                "Creality Cloud STL/CAD files use its official browser download flow.",
+                model.get("url", ""),
+            )
+        profile_id = str(model.get("_profile_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", profile_id):
+            raise ValueError("Creality Cloud print profile id is invalid")
+        if auth is None or not auth.authenticated("crealitycloud"):
+            raise AuthRequired(
+                "Sign in to Creality Cloud and connect its model_token before importing a 3MF profile."
+            )
+        detail = CrealityCloudSearcher._post(
+            CrealityCloudSearcher.PROFILE_DETAIL_PATH,
+            {"id": profile_id},
+            auth,
         )
+        result = CrealityCloudSearcher._post(
+            CrealityCloudSearcher.PROFILE_DOWNLOAD_PATH,
+            {"id": profile_id},
+            auth,
+            requires_auth=True,
+        )
+        if isinstance(result, str):
+            url = result
+        elif isinstance(result, dict):
+            url = str(
+                _coalesce(
+                    result.get("url"),
+                    result.get("downloadUrl"),
+                    result.get("route"),
+                    result.get("fileUrl"),
+                    default="",
+                )
+            )
+        else:
+            url = ""
+        if not _is_http_url(url):
+            raise RuntimeError("Creality Cloud did not return a signed 3MF URL")
+        detail = detail if isinstance(detail, dict) else {}
+        name = _safe_filename(
+            detail.get("name") or model.get("name") or "creality-profile.3mf"
+        )
+        if not name.lower().endswith(".3mf"):
+            name += ".3mf"
+        return [
+            {
+                "url": url,
+                "name": name,
+                "preview_url": detail.get("thumbnail") or model.get("thumbnail_url") or "",
+                "size": detail.get("size"),
+            }
+        ]
 
 
 class GrabcadSearcher:
@@ -3322,7 +3607,16 @@ _PLATFORM_SPECS = (
         StlFinderSearcher,
         search_page_size=30,
     ),
-    PlatformSpec("crealitycloud", "Creality Cloud", CrealityCloudSearcher),
+    PlatformSpec(
+        "crealitycloud",
+        "Creality Cloud",
+        CrealityCloudSearcher,
+        auth_hosts=("admin.crealitycloud.com",),
+        auth_mode="creality",
+        login_url=CrealityCloudSearcher.LOGIN_URL,
+        referer="https://www.crealitycloud.com/",
+        search_page_size=30,
+    ),
     PlatformSpec(
         "grabcad",
         "GrabCAD",
@@ -3726,6 +4020,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
   <div class="account"><div class="account-head"><strong>GrabCAD</strong><button type="button" class="auth-help" data-platform="grabcad" aria-label="GrabCAD authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-grabcad" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('grabcad')">Account</button></div>
   <div class="account"><div class="account-head"><strong>Thingiverse API</strong><button type="button" class="auth-help" data-platform="thingiverse" aria-label="Thingiverse authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-thingiverse" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('thingiverse')">API token</button></div>
   <div class="account"><div class="account-head"><strong>MyMiniFactory API</strong><button type="button" class="auth-help" data-platform="myminifactory" aria-label="MyMiniFactory authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-myminifactory" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('myminifactory')">API key</button></div>
+  <div class="account"><div class="account-head"><strong>Creality Cloud</strong><button type="button" class="auth-help" data-platform="crealitycloud" aria-label="Creality Cloud authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-crealitycloud" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('crealitycloud')">Account</button></div>
 </div>
 <div id="auth-tooltip" class="auth-tooltip" role="tooltip"></div>
 <div class="search-row"><input id="query" placeholder="Search for 3D models..."><button id="search-btn" onclick="doSearch()">Search</button></div>
@@ -3773,8 +4068,8 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
   <div class="button-row"><button id="file-import" onclick="confirmFileImport()">Import selected</button><button class="secondary" onclick="closeFilePicker()">Cancel</button></div>
 </div>
 <div id="makerworld-modal" class="auth-modal makerworld-modal">
-  <h2 style="margin:0 0 5px;font-size:1.05em">Choose MakerWorld download</h2>
-  <div class="auth-note">Select a print profile and file format. Direct import uses the official signed 3MF profile URL.</div>
+  <h2 id="profile-picker-title" style="margin:0 0 5px;font-size:1.05em">Choose profile download</h2>
+  <div id="profile-picker-note" class="auth-note">Select a print profile and file format.</div>
   <div id="mw-profiles" class="mw-profiles"></div>
   <h3 style="margin:10px 0 4px;font-size:.9em">File format</h3>
   <div id="mw-formats" class="mw-formats"></div>
@@ -3785,14 +4080,14 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <script>
 var selectedModel=null, searching=false, canLoadMore=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[], pendingMakerWorldModel=null, activeAuthHelp=null, resultImageObserver=null, makerWorldChoicesCache={}, makerWorldPrefetching={}, makerWorldPreloadedImages={}, currentPage=1, pageSize=24;
 var $=function(id){return document.getElementById(id)};
-var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login in your browser. After MakerOnline returns, copy the mo_access_token cookie value (or its Cookie header), paste it below, and connect. You can alternatively import the Anycubic Slicer Next session. The plugin never reads the browser profile or password.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'A GrabCAD Community Library membership is required. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.'};
+var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login in your browser. After MakerOnline returns, copy the mo_access_token cookie value (or its Cookie header), paste it below, and connect. You can alternatively import the Anycubic Slicer Next session. The plugin never reads the browser profile or password.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'A GrabCAD Community Library membership is required. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.',crealitycloud:'Open the official Creality Cloud login and sign in. In the signed-in browser session, copy the model_token cookie value (or a Cookie header containing model_token and model_user_id), paste it below, and connect. The plugin never reads your browser profile or password.'};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function safeUrl(s){try{var u=new URL(String(s||''));return(u.protocol==='http:'||u.protocol==='https:')?u.href:''}catch(e){return''}}
 function showAuthHelp(button){var tooltip=$('auth-tooltip'),text=AUTH_HELP[button.dataset.platform]||'';if(!text)return;activeAuthHelp=button;tooltip.textContent=text;tooltip.classList.add('active');tooltip.style.left='0px';tooltip.style.top='0px';var r=button.getBoundingClientRect(),gap=8,margin=8,left=Math.max(margin,Math.min(window.innerWidth-tooltip.offsetWidth-margin,r.left+r.width/2-tooltip.offsetWidth/2)),top=r.bottom+gap;if(top+tooltip.offsetHeight>window.innerHeight-margin)top=Math.max(margin,r.top-tooltip.offsetHeight-gap);tooltip.style.left=Math.round(left)+'px';tooltip.style.top=Math.round(top)+'px'}
 function hideAuthHelp(button){if(activeAuthHelp!==button||button.matches(':hover')||document.activeElement===button)return;$('auth-tooltip').classList.remove('active');activeAuthHelp=null}
 function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',Yeggi:'yeggi',MyMiniFactory:'myminifactory',Thangs:'thangs',STLFinder:'stlfinder','Creality Cloud':'crealitycloud',GrabCAD:'grabcad','Smithsonian 3D':'smithsonian','NASA 3D Resources':'nasa','NIH 3D':'nih3d',YouMagine:'youmagine',Pinshape:'pinshape'}[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
-function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
+function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory','crealitycloud'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
 var PORTAL_PREF_KEY='orca-model-search-portals-v2';
 function selectedPortals(){var ps=[];document.querySelectorAll('.portal-search:checked').forEach(function(x){ps.push(x.dataset.platform)});return ps}
 function updatePortalCount(){var all=document.querySelectorAll('.portal-search');var checked=document.querySelectorAll('.portal-search:checked');$('source-count').textContent=checked.length+' / '+all.length+' selected'}
@@ -3817,8 +4112,8 @@ $('source-results').addEventListener('click',function(e){var button=e.target.clo
 function loadMoreResults(){if(searching||!canLoadMore)return;searching=true;$('search-btn').disabled=true;$('load-more').disabled=true;$('load-more').textContent='Loading...';$('status').textContent='Loading next portal pages...';orca.postMessage({action:'search_more'})}
 function modelIdentity(m){return String((m&&m._platform_key)||platformKey(m&&m.platform)||'')+'|'+String((m&&m._thing_id)||(m&&m._model_id)||(m&&m.url)||'')}
 function preloadMakerWorldImages(key,profiles){var images=[];(profiles||[]).forEach(function(p){var url=safeUrl(p.cover);if(!url)return;var img=new Image();img.decoding='async';img.src=url;images.push(img)});makerWorldPreloadedImages[key]=images}
-function cacheMakerWorldChoices(msg){var model=msg.model||selectedModel;if(!model)return;var key=modelIdentity(model);makerWorldChoicesCache[key]={profiles:msg.profiles||[],formats:msg.formats||[],default_profile_id:msg.default_profile_id||''};makerWorldPrefetching[key]=false;if(!makerWorldPreloadedImages[key])preloadMakerWorldImages(key,msg.profiles||[])}
-function prefetchMakerWorld(m){if(!m||platformKey(m.platform)!=='makerworld')return;var key=modelIdentity(m);if(makerWorldChoicesCache[key]||makerWorldPrefetching[key])return;makerWorldPrefetching[key]=true;orca.postMessage({action:'prefetch_makerworld_profiles',model:m})}
+function cacheMakerWorldChoices(msg){var model=msg.model||selectedModel;if(!model)return;var key=modelIdentity(model);makerWorldChoicesCache[key]={profiles:msg.profiles||[],formats:msg.formats||[],default_profile_id:msg.default_profile_id||'',picker_platform:msg.picker_platform||model.platform||'MakerWorld'};makerWorldPrefetching[key]=false;if(!makerWorldPreloadedImages[key])preloadMakerWorldImages(key,msg.profiles||[])}
+function prefetchMakerWorld(m){var platform=platformKey(m&&m.platform);if(platform!=='makerworld'&&platform!=='crealitycloud')return;var key=modelIdentity(m);if(makerWorldChoicesCache[key]||makerWorldPrefetching[key])return;makerWorldPrefetching[key]=true;orca.postMessage({action:'prefetch_profile_choices',model:m})}
 function openModelDetail(m){var load=m._details_available&&!m._details_loaded&&!m._details_loading;if(load)m._details_loading=true;showDetail(m,true);prefetchMakerWorld(m);if(load)orca.postMessage({action:'model_details',model:m})}
 $('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)openModelDetail(m)});
 function showDetail(m,open){selectedModel=m;var loading=!!m._details_loading;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-metrics').innerHTML=metricText(m)?'<strong>Metrics:</strong> '+esc(metricText(m)):'';$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(loading?'Loading...':(m.license||'Unknown'))+'</span>';$('det-summary').textContent=loading?'Loading the official license and complete metrics...':(m.license_summary||'No license information available.');var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=m.result_type==='search_link';b.textContent=m.result_type==='search_link'?'Browser search only':(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
@@ -3829,8 +4124,8 @@ $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.targe
 function licenseClass(l){if(/CC|Creative Commons|CC0|Public Domain/i.test(l||''))return'license-cc';if(/All Rights Reserved|Standard Digital|Exclusive/i.test(l||''))return'license-arr';return''}
 function openExternal(url){orca.postMessage({action:'open_external',url:url})}
 function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedModel.download_url)}
-function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}if(platformKey(selectedModel.platform)==='makerworld'){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id});$('status').textContent='Select a MakerWorld print profile and file format.';return}}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
-function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='makeronline'?'MakerOnline mo_access_token value or Cookie header':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=AUTH_HELP[p]||'Use the account credentials supplied by the selected platform.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
+function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var platform=platformKey(selectedModel.platform);if(!selectedModel._download_format&&(platform==='makerworld'||platform==='crealitycloud')){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id,picker_platform:cached.picker_platform});$('status').textContent='Select a '+cached.picker_platform+' print profile and file format.';return}}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
+function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory'||p==='crealitycloud');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API',crealitycloud:'Creality Cloud account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='makeronline'?'MakerOnline mo_access_token value or Cookie header':p==='crealitycloud'?'Creality model_token value or Cookie header':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=AUTH_HELP[p]||'Use the account credentials supplied by the selected platform.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
 function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active')||$('makerworld-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
 function closeAuth(){$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
 function closeFilePicker(){$('file-modal').classList.remove('active');hideImagePreview(null,true);pendingFiles=[];syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
@@ -3842,13 +4137,13 @@ function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.f
 function setAllFiles(value){document.querySelectorAll('#file-list input[type=checkbox]').forEach(function(x){x.checked=!!value});updateFileCount()}
 function confirmFileImport(){var selected=[];document.querySelectorAll('#file-list input[type=checkbox]:checked').forEach(function(x){selected.push(parseInt(x.value,10))});if(!selected.length)return;$('file-import').disabled=true;$('status').textContent='Downloading selected files...';$('file-modal').classList.remove('active');syncBackdrop();orca.postMessage({action:'import_selected',indices:selected})}
 function profileMeta(p){var v=[];if(p.creator)v.push('by '+p.creator);if(p.printer)v.push(p.printer);if(p.layer_height)v.push(p.layer_height+' layer');if(p.walls)v.push(p.walls+' walls');if(p.infill)v.push(p.infill+' infill');if(p.prediction)v.push(Math.max(1,Math.round(Number(p.prediction)/3600*10)/10)+' h');if(p.plates)v.push(p.plates+' plate'+(Number(p.plates)===1?'':'s'));if(p.rating!=null)v.push('Rating '+p.rating+(p.rating_count?' ('+p.rating_count+')':''));return v.join(' / ')}
-function updateMakerWorldChoice(){var f=document.querySelector('#mw-formats input:checked');var p=document.querySelector('#mw-profiles input:checked');$('mw-import').disabled=!(f&&p);$('mw-import').textContent=f&&f.value==='raw_browser'?'Open STL/CAD files in MakerWorld':'Download selected 3MF'}
+function updateMakerWorldChoice(){var f=document.querySelector('#mw-formats input:checked');var p=document.querySelector('#mw-profiles input:checked'),platform=pendingMakerWorldModel&&pendingMakerWorldModel.platform||'platform';$('mw-import').disabled=!(f&&p);$('mw-import').textContent=f&&f.value==='raw_browser'?'Open STL/CAD files in '+platform:'Download selected 3MF'}
 function positionImagePreview(source){var preview=$('image-preview'),r=source.getBoundingClientRect(),gap=12,margin=10,left=r.right+gap,top=r.top;if(left+preview.offsetWidth>window.innerWidth-margin)left=r.left-preview.offsetWidth-gap;left=Math.max(margin,Math.min(left,window.innerWidth-preview.offsetWidth-margin));top=Math.max(margin,Math.min(top,window.innerHeight-preview.offsetHeight-margin));preview.style.left=Math.round(left)+'px';preview.style.top=Math.round(top)+'px';preview.style.visibility='visible'}
 function showImagePreview(source){var url=safeUrl(source.currentSrc||source.src);if(!url)return;var preview=$('image-preview');preview.src=url;preview.classList.add('active');preview.style.visibility='hidden';requestAnimationFrame(function(){positionImagePreview(source)})}
 function hideImagePreview(source,force){if(!force&&source&&(source.matches(':hover')||document.activeElement===source))return;var preview=$('image-preview');preview.classList.remove('active');preview.style.visibility='hidden'}
-function showMakerWorldChoices(msg){cacheMakerWorldChoices(msg);pendingMakerWorldModel=msg.model||selectedModel;var profiles=msg.profiles||[],formats=msg.formats||[],defaultId=String(msg.default_profile_id||'');var phtml='';profiles.forEach(function(p,i){var id=String(p.profile_id||''),title=p.title||'Print profile';var image=safeUrl(p.cover),summary=p.summary?'<span class="mw-summary">'+esc(p.summary)+'</span>':'';phtml+='<label class="mw-profile"><input type="radio" name="mw-profile" value="'+esc(id)+'" '+((id===defaultId||(!defaultId&&i===0))?'checked':'')+' onchange="updateMakerWorldChoice()">'+(image?'<img class="mw-cover" src="'+esc(image)+'" alt="'+esc(title)+'" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="mw-cover"></span>')+'<span><span class="mw-title">'+esc(title)+'</span>'+summary+'<span class="mw-meta">'+esc(profileMeta(p))+'</span></span></label>'});$('mw-profiles').innerHTML=phtml;var fhtml='';formats.forEach(function(f,i){if(f.available===false)return;fhtml+='<label class="mw-format"><input type="radio" name="mw-format" value="'+esc(f.id)+'" '+(i===0?'checked':'')+' onchange="updateMakerWorldChoice()"><span><strong>'+esc(f.label)+'</strong><small>'+esc(f.description||'')+'</small></span></label>'});$('mw-formats').innerHTML=fhtml;$('makerworld-modal').classList.add('active');syncBackdrop();updateMakerWorldChoice()}
-function confirmMakerWorldChoice(){var p=document.querySelector('#mw-profiles input:checked'),f=document.querySelector('#mw-formats input:checked');if(!p||!f||!pendingMakerWorldModel)return;$('mw-import').disabled=true;$('status').textContent=f.value==='3mf'?'Resolving selected MakerWorld profile...':'Opening MakerWorld...';orca.postMessage({action:'resolve_makerworld_choice',model:pendingMakerWorldModel,profile_id:p.value,format:f.value})}
-function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}if((authPlatform==='thingiverse'||authPlatform==='myminifactory')&&!token){$('status').textContent='Paste the API token/key first.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
+function showMakerWorldChoices(msg){cacheMakerWorldChoices(msg);pendingMakerWorldModel=msg.model||selectedModel;var platform=msg.picker_platform||pendingMakerWorldModel.platform||'platform',profiles=msg.profiles||[],formats=msg.formats||[],defaultId=String(msg.default_profile_id||'');$('profile-picker-title').textContent='Choose '+platform+' download';$('profile-picker-note').textContent='Select a print profile and file format. 3MF uses the official signed profile URL.';var phtml='';profiles.forEach(function(p,i){var id=String(p.profile_id||''),title=p.title||'Print profile';var image=safeUrl(p.cover),summary=p.summary?'<span class="mw-summary">'+esc(p.summary)+'</span>':'';phtml+='<label class="mw-profile"><input type="radio" name="mw-profile" value="'+esc(id)+'" '+((id===defaultId||(!defaultId&&i===0))?'checked':'')+' onchange="updateMakerWorldChoice()">'+(image?'<img class="mw-cover" src="'+esc(image)+'" alt="'+esc(title)+'" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="mw-cover"></span>')+'<span><span class="mw-title">'+esc(title)+'</span>'+summary+'<span class="mw-meta">'+esc(profileMeta(p))+'</span></span></label>'});$('mw-profiles').innerHTML=phtml;var fhtml='',first=true;formats.forEach(function(f){if(f.available===false)return;fhtml+='<label class="mw-format"><input type="radio" name="mw-format" value="'+esc(f.id)+'" '+(first?'checked':'')+' onchange="updateMakerWorldChoice()"><span><strong>'+esc(f.label)+'</strong><small>'+esc(f.description||'')+'</small></span></label>';first=false});$('mw-formats').innerHTML=fhtml;$('makerworld-modal').classList.add('active');syncBackdrop();updateMakerWorldChoice()}
+function confirmMakerWorldChoice(){var p=document.querySelector('#mw-profiles input:checked'),f=document.querySelector('#mw-formats input:checked');if(!p||!f||!pendingMakerWorldModel)return;var platform=pendingMakerWorldModel.platform||'platform';$('mw-import').disabled=true;$('status').textContent=f.value==='3mf'?'Resolving selected '+platform+' profile...':'Opening '+platform+'...';orca.postMessage({action:'resolve_profile_choice',model:pendingMakerWorldModel,profile_id:p.value,format:f.value})}
+function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='crealitycloud'&&!token){$('status').textContent='Creality Cloud: paste model_token after signing in.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}if((authPlatform==='thingiverse'||authPlatform==='myminifactory')&&!token){$('status').textContent='Paste the API token/key first.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform});if(authPlatform==='makeronline')$('status').textContent='Anycubic login opened. After MakerOnline returns, copy mo_access_token, paste it here, and connect.'}
 function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('status').textContent='Looking for Anycubic Slicer Next session...'}
@@ -3869,12 +4164,12 @@ orca.onMessage(function(msg){
     $('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.';
   }else if(msg.action==='auth_required'){
     $('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform);
-  }else if(msg.action==='makerworld_prefetched'){
+  }else if(msg.action==='profile_prefetched'){
     cacheMakerWorldChoices(msg);
-  }else if(msg.action==='makerworld_prefetch_failed'){
+  }else if(msg.action==='profile_prefetch_failed'){
     makerWorldPrefetching[modelIdentity(msg.model||{})]=false;
-  }else if(msg.action==='makerworld_choices'){
-    showMakerWorldChoices(msg);$('status').textContent='Select a MakerWorld print profile and file format.';
+  }else if(msg.action==='profile_choices'){
+    showMakerWorldChoices(msg);$('status').textContent='Select a '+(msg.picker_platform||'platform')+' print profile and file format.';
   }else if(msg.action==='file_choices'){
     showFilePicker(msg.files||[]);$('status').textContent='Select one or more files to import.';
   }else if(msg.action==='status'){
@@ -3969,9 +4264,9 @@ if orca is not None:
                 "search": self._handle_search,
                 "search_more": self._handle_search_more,
                 "model_details": self._handle_model_details,
-                "prefetch_makerworld_profiles": self._handle_makerworld_prefetch,
+                "prefetch_profile_choices": self._handle_profile_prefetch,
                 "resolve_import": self._handle_resolve_import,
-                "resolve_makerworld_choice": self._handle_makerworld_choice,
+                "resolve_profile_choice": self._handle_profile_choice,
                 "import_selected": self._handle_import_selected,
                 "open_external": self._handle_open_external,
                 "auth_status": self._handle_auth_status,
@@ -4003,20 +4298,20 @@ if orca is not None:
             if model:
                 self._start(self._do_model_details, model)
 
-        def _handle_makerworld_prefetch(self, msg):
+        def _handle_profile_prefetch(self, msg):
             model = msg.get("model") or {}
             if model:
-                self._start(self._prefetch_makerworld_profiles, model)
+                self._start(self._prefetch_profile_choices, model)
 
         def _handle_resolve_import(self, msg):
             model = msg.get("model") or {}
             if model:
                 self._start(self._resolve_import, model)
 
-        def _handle_makerworld_choice(self, msg):
+        def _handle_profile_choice(self, msg):
             model = msg.get("model") or {}
             if model:
-                self._start(self._resolve_makerworld_choice, model, msg)
+                self._start(self._resolve_profile_choice, model, msg)
 
         def _handle_import_selected(self, msg):
             self._start(self._import_selected, msg.get("indices") or [])
@@ -4415,8 +4710,10 @@ if orca is not None:
                     }
                 )
                 return
-            if spec.key == "makerworld" and not model.get("_download_format"):
-                self._show_makerworld_choices(model)
+            if spec.key in ("makerworld", "crealitycloud") and not model.get(
+                "_download_format"
+            ):
+                self._show_profile_choices(model)
                 return
             files = self._list_model_files(spec, model)
             if files is None:
@@ -4432,16 +4729,33 @@ if orca is not None:
                 return
             self._begin_import(model, normalized)
 
-        def _show_makerworld_choices(self, model):
+        def _profile_choices(self, model):
+            spec = _platform_for_model(model)
+            if spec is None or spec.key not in ("makerworld", "crealitycloud"):
+                raise ValueError("This platform does not provide print profiles")
+            loader = getattr(spec.adapter, "get_download_choices", None)
+            if not callable(loader):
+                raise TypeError(f"{spec.display} does not provide download choices")
+            choices = loader(model, self.auth)
+            if not isinstance(choices, dict):
+                raise TypeError(f"{spec.display} returned invalid download choices")
+            return spec, choices
+
+        def _show_profile_choices(self, model):
             try:
-                choices = MakerWorldSearcher.get_download_choices(model, self.auth)
+                spec, choices = self._profile_choices(model)
             except AuthRequired as exc:
-                self.auth.logout("makerworld")
-                self._post_auth("auth_changed", "MakerWorld session expired.")
+                spec = _platform_for_model(model)
+                platform = spec.key if spec else ""
+                if platform:
+                    self.auth.logout(platform)
+                    self._post_auth(
+                        "auth_changed", f"{_display_name(platform)} session expired."
+                    )
                 self._post(
                     {
                         "action": "auth_required",
-                        "platform": "makerworld",
+                        "platform": platform,
                         "message": str(exc),
                         "model": model,
                     }
@@ -4451,31 +4765,76 @@ if orca is not None:
                 self._post(
                     {
                         "action": "error",
-                        "message": f"Could not load MakerWorld profiles: {exc}",
+                        "message": f"Could not load print profiles: {exc}",
                     }
                 )
                 return
             self._post(
                 {
-                    "action": "makerworld_choices",
+                    "action": "profile_choices",
                     "model": model,
+                    "picker_platform": spec.display,
                     **choices,
                 }
             )
 
-        def _prefetch_makerworld_profiles(self, model):
+        def _prefetch_profile_choices(self, model):
             try:
-                choices = MakerWorldSearcher.get_download_choices(model, self.auth)
+                spec, choices = self._profile_choices(model)
             except (AuthRequired, OSError, ValueError, RuntimeError, KeyError, TypeError):
-                self._post({"action": "makerworld_prefetch_failed", "model": model})
+                self._post({"action": "profile_prefetch_failed", "model": model})
                 return
             self._post(
                 {
-                    "action": "makerworld_prefetched",
+                    "action": "profile_prefetched",
                     "model": model,
+                    "picker_platform": spec.display,
                     **choices,
                 }
             )
+
+        def _resolve_profile_choice(self, model, msg):
+            spec = _platform_for_model(model)
+            if spec is None:
+                self._post({"action": "error", "message": "Invalid platform choice."})
+                return
+            if spec.key == "makerworld":
+                self._resolve_makerworld_choice(model, msg)
+                return
+            if spec.key != "crealitycloud":
+                self._post({"action": "error", "message": "Invalid platform choice."})
+                return
+            profile_id = str(msg.get("profile_id") or "")
+            download_format = str(msg.get("format") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", profile_id):
+                self._post(
+                    {"action": "error", "message": "Select a Creality print profile."}
+                )
+                return
+            if download_format == "raw_browser":
+                base_url = str(model.get("url") or "")
+                separator = "&" if "?" in base_url else "?"
+                url = base_url
+                if profile_id != "model-files":
+                    url += separator + "profileId=" + urllib.parse.quote(profile_id)
+                self._post(
+                    {
+                        "action": "browser_required",
+                        "message": (
+                            "Creality Cloud STL/CAD files require its official "
+                            "browser download flow."
+                        ),
+                        "url": url,
+                    }
+                )
+                return
+            if download_format != "3mf":
+                self._post({"action": "error", "message": "Select a download format."})
+                return
+            selected = dict(model)
+            selected["_profile_id"] = profile_id
+            selected["_download_format"] = "3mf"
+            self._resolve_import(selected)
 
         def _resolve_makerworld_choice(self, model, msg):
             spec = _platform_for_model(model)

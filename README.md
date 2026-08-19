@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.8.2**
+**Current plugin version: v0.8.3**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -17,7 +17,7 @@ The plugin opens a non-modal `Search 3D Models` window, lets you choose which po
 4. Open **Prepare**, press **Space**, choose **Search 3D Models**, and press Enter. In builds without Actions Speed Dial, launch the script from the Plugins UI.
 5. Tick the portals you want to search, enter a query, and press **Search**.
 6. Open a result and press **Import into OrcaSlicer**.
-7. If the model contains multiple files, select the files to import. For MakerWorld, select a print profile and download format first.
+7. If the model contains multiple files, select the files to import. For MakerWorld and Creality Cloud, select a print profile and download format first.
 
 The selected search portals are remembered by the embedded UI and restored the next time the search window is opened.
 
@@ -40,9 +40,9 @@ The selected search portals are remembered by the embedded UI and restored the n
 - Passwords are never persisted.
 - Single-file downloads import immediately.
 - Multi-file models show a checkbox list before downloading. Printables and Thingiverse files include their individual rendered thumbnail and an enlarged mouse-hover or keyboard-focus preview when the platform provides one.
-- Selecting a MakerWorld result preloads its print-profile metadata and images in the background; the importer reuses that cache.
-- MakerWorld profile thumbnails support an enlarged mouse-hover and keyboard-focus preview.
-- MakerWorld models show their available print profiles and let you choose direct 3MF import or the official browser flow for STL/CAD files.
+- Selecting a MakerWorld or Creality Cloud result preloads its print-profile metadata and images in the background; the importer reuses that cache.
+- Print-profile thumbnails support an enlarged mouse-hover and keyboard-focus preview.
+- MakerWorld and Creality Cloud models show their available print profiles and let you choose direct 3MF import or the official browser flow for STL/CAD files.
 - ZIP downloads are safely expanded and supported model files are imported.
 - Downloaded models are handed to the already-running OrcaSlicer instance and added to the current project.
 - Re-running `Search 3D Models` reuses the existing search window instead of opening duplicates.
@@ -59,7 +59,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 | **Yeggi** | Browser meta-search | Original portal | Interactive Turnstile check |
 | **Thangs** | Yes, JSON search | Browser | Cloudflare may require an interactive browser check |
 | **STLFinder** | Yes, when Cloudflare permits | Delegated to the original registered portal | Original portal credentials when required |
-| **Creality Cloud** | Yes | Yes, when a public STL/3MF/CAD URL is exposed | None |
+| **Creality Cloud** | Yes, JSON API | Selected signed 3MF profile; STL/CAD in browser | `model_token` from the user's official session for 3MF |
 | **MakerWorld / Bambu Lab** | Yes | Yes | Bambu/MakerWorld account session |
 | **Nexprint / Elegoo** | Yes | Yes | `auth_token` session cookie |
 | **Makeronline / Anycubic** | Yes | Yes | Anycubic access token / Anycubic Slicer Next session |
@@ -114,9 +114,11 @@ See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the wider platform survey: whic
 
 ### Creality Cloud
 
-- Public search uses the current model-tag pages; the removed legacy `/search/model` address is no longer used.
-- Public STL/3MF/CAD downloads are imported without a plugin login when a direct file URL is available.
-- Paid/subscription/browser-only downloads are opened on the official model page.
+- Public search uses Creality Cloud's current JSON model-search service with 30-result server pages, platform-native sorting, metrics, license values, and catalog totals.
+- Card thumbnails come from the API's normal model covers. The 10-by-10-pixel lazy-load blur placeholder is never selected as the result image.
+- Selecting a card loads every public Print Setting and its full profile thumbnail. Import then asks for a profile and either **3MF print profile** or **STL/CAD files**.
+- Direct 3MF import asks Creality Cloud for the official signed profile URL. Sign in on the official page and connect the `model_token` cookie value (or a Cookie header containing `model_token` and `model_user_id`); the password and browser profile are never read.
+- Original STL/CAD files, paid models, and other interactive flows stay on the official model page.
 
 ### MakerWorld / Bambu Lab
 
@@ -405,7 +407,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.8.2 validation gates are:
+The v0.8.3 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

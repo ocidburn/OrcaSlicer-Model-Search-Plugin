@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.8.3
+
+- Replaced Creality Cloud HTML card scraping with its current JSON model-search
+  service, including 30-result pagination, native sort mapping, metrics, totals,
+  licenses, authors, and full-size cover URLs.
+- Removed the accidental selection of Creality's 10-by-10-pixel blur placeholder
+  as a card image.
+- Added background loading of Creality Print Settings and profile images when a
+  card is selected, with profile-thumbnail enlargement on hover or focus.
+- Added explicit Creality profile and format selection at import time. Signed
+  3MF profiles import directly through the user's `model_token`; original
+  STL/CAD files remain in the official browser flow.
+- Added Creality account instructions and token normalization without reading
+  browser profiles or storing passwords.
+
 ## 0.8.2
 
 - Replaced the Thangs browser-search placeholder with its current JSON text-search

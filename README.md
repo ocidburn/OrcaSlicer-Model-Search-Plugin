@@ -69,6 +69,8 @@ The selected search portals are remembered by the embedded UI and restored the n
 
 A successful search result does not guarantee that the portal allows a direct programmatic download. Paid models, member-only models, CAPTCHA-protected downloads, checkout flows, or pages that do not expose a direct file URL are intentionally sent to **Open in browser** instead of being reported as a successful import.
 
+See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the wider platform survey: which catalogs are worth searching for 3D printing, how popular each one is, and why some well-known model sites are deliberately left out.
+
 ## Portal details
 
 ### Printables
@@ -349,7 +351,7 @@ Repository layout:
 src/       standalone plugin source
 tests/     unit and regression tests
 scripts/   repeatable validation helpers
-docs/      release history and legal notes
+docs/      release history, platform survey, and legal notes
 typings/   OrcaSlicer API type stubs
 .github/   cross-platform CI configuration
 ```

@@ -97,6 +97,22 @@ class CatalogSearchTests(unittest.TestCase):
                     "name": "Yak Mount",
                     "url": "https://www.myminifactory.com/object/3d-print-yak-mount-127830",
                     "designer": {"username": "maker"},
+                    "images": [
+                        {
+                            "is_primary": False,
+                            "thumbnail": {"url": "https://cdn.example/other-thumb.jpg"},
+                        },
+                        {
+                            "is_primary": True,
+                            "thumbnail": {"url": "https://cdn.example/yak-thumb.jpg"},
+                            "standard": {"url": "https://cdn.example/yak-standard.jpg"},
+                            "original": {"url": "https://cdn.example/yak-original.jpg"},
+                        },
+                    ],
+                    "license": (
+                        "MyMiniFactory Digital File Store License | "
+                        "Standard Digital File Store License"
+                    ),
                     "views": 50,
                     "likes": 4,
                 }
@@ -110,6 +126,40 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertEqual(rows[0]["name"], "Yak Mount")
         self.assertEqual(rows[0]["platform"], "MyMiniFactory")
         self.assertEqual(rows[0]["views"], 50)
+        self.assertEqual(
+            rows[0]["thumbnail_url"], "https://cdn.example/yak-thumb.jpg"
+        )
+        self.assertEqual(rows[0]["license"], "Standard Digital File Store License")
+        self.assertEqual(
+            rows[0]["license_url"],
+            "https://www.myminifactory.com/object-licensing",
+        )
+        self.assertIn("Non-commercial personal use", rows[0]["license_summary"])
+
+    def test_myminifactory_store_flag_supplies_license_fallback(self):
+        row = mod._myminifactory_result(
+            {
+                "id": 10,
+                "name": "Store model",
+                "license": "",
+                "licenses": [{"type": "store", "value": True}],
+            }
+        )
+        self.assertEqual(row["license"], "MyMiniFactory Digital File Store License")
+        self.assertNotEqual(row["license"], "Unknown")
+
+    def test_myminifactory_preserves_creative_commons_license_url(self):
+        row = mod._myminifactory_result(
+            {
+                "id": 11,
+                "name": "Free model",
+                "license": "Creative Commons - Attribution",
+            }
+        )
+        self.assertEqual(row["license"], "CC BY")
+        self.assertEqual(
+            row["license_url"], "https://creativecommons.org/licenses/by/4.0/"
+        )
 
     def test_thangs_search_uses_explicit_browser_fallback(self):
         rows = mod.ThangsSearcher.search("dragon", None)
@@ -509,10 +559,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_061(self):
+    def test_version_is_062(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.6.1"', head)
+        self.assertIn('# version = "0.6.2"', head)
 
 
 if __name__ == "__main__":

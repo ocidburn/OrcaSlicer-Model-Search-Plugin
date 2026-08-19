@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.6.1**
+**Current plugin version: v0.6.2**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -87,6 +87,7 @@ A successful search result does not guarantee that the portal allows a direct pr
 
 - Uses the documented MyMiniFactory API v2 and requires a personal API key.
 - API-key search provides model metadata, likes, views, and dates.
+- Search cards use the official primary image's nested thumbnail URL and show the API's `license` value. Store-only responses fall back to the documented MyMiniFactory Digital File Store License flag instead of displaying `Unknown`.
 - The documented API exposes archive downloads only to an OAuth-connected user; API-key-only and storefront downloads open the official model page.
 
 ### Thangs
@@ -371,7 +372,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.6.1 validation gates are:
+The v0.6.2 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.6.2
+
+- Fixed MyMiniFactory search cards by reading official nested image variants such as `images[].thumbnail.url` and preferring the primary image.
+- Fixed MyMiniFactory license metadata by reading the documented singular `license` field, normalizing its Digital File Store license, and using the `licenses[].type=store` flag only as a fallback.
+
 ## 0.6.1
 
 - Added client-side pagination for the merged result set with numbered pages, previous/next controls, visible result ranges, and 12/24/48-card page sizes.

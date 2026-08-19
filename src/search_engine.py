@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community model portals."
 # author = "Tommaso Bianchi"
-# version = "0.6.1"
+# version = "0.6.2"
 # ///
 
 import html
@@ -34,7 +34,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.6.1 "
+    "OrcaSlicer-Model-Search-Plugin/0.6.2 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -52,6 +52,8 @@ LICENSE_DESCRIPTIONS = {
     "PD": "Public domain. No restrictions.",
     "All Rights Reserved": "Personal use only. No redistribution or modification.",
     "Standard Digital File License": "Platform standard license. Check the model page for exact terms.",
+    "MyMiniFactory Digital File Store License": "MyMiniFactory store license. Check the model page for the current usage terms.",
+    "Standard Digital File Store License": "Non-commercial personal use only. Sharing files or derivatives and remixing are not allowed; check MyMiniFactory for the complete terms.",
     "MakerWorld Exclusive License": "MakerWorld exclusive license. Check the model page for exact terms.",
     "Exclusive": "Platform exclusive license. Check the model page for exact terms.",
 }
@@ -2327,11 +2329,65 @@ class Cults3DSearcher:
         )
 
 
+_MYMINIFACTORY_LICENSE_URL = "https://www.myminifactory.com/object-licensing"
+
+
+def _myminifactory_image_url(item):
+    images = item.get("images") or item.get("image") or []
+    if isinstance(images, dict):
+        images = [images]
+    usable = [image for image in images if isinstance(image, dict)]
+    primary = next((value for value in usable if value.get("is_primary")), None)
+    ordered = ([primary] if primary else []) + [
+        image for image in usable if image is not primary
+    ]
+    for image in ordered:
+        for key in ("thumbnail", "standard", "original", "thumbnail_url", "url"):
+            value = image.get(key)
+            if isinstance(value, dict):
+                value = value.get("url")
+            if value:
+                return value
+    return _coalesce(item.get("thumbnail_url"), item.get("image_url"))
+
+
+def _myminifactory_license(item):
+    value = item.get("license")
+    if isinstance(value, str):
+        name = _strip_html(value)
+        folded = name.casefold()
+        if "standard digital file store license" in folded:
+            return _parse_license(
+                "Standard Digital File Store License",
+                _MYMINIFACTORY_LICENSE_URL,
+            )
+        if "digital file store license" in folded:
+            return _parse_license(
+                "MyMiniFactory Digital File Store License",
+                _MYMINIFACTORY_LICENSE_URL,
+            )
+        if name:
+            return _parse_license(name)
+    if value:
+        return _license_from_api(value)
+
+    flags = item.get("licenses") or []
+    if any(
+        isinstance(flag, dict)
+        and flag.get("type") == "store"
+        and flag.get("value") is True
+        for flag in flags
+    ):
+        return _parse_license(
+            "MyMiniFactory Digital File Store License",
+            _MYMINIFACTORY_LICENSE_URL,
+        )
+    return _license_from_api(flags)
+
+
 def _myminifactory_result(item):
     designer = item.get("designer") or {}
-    images = item.get("images") or []
-    image = images[0] if images else {}
-    lic = _license_from_api(item.get("licenses"))
+    lic = _myminifactory_license(item)
     url = _coalesce(
         item.get("url"),
         default=f"https://www.myminifactory.com/object/{item.get('id', '')}",
@@ -2343,9 +2399,7 @@ def _myminifactory_result(item):
             designer.get("username"), designer.get("name"), default="Unknown"
         ),
         "platform": "MyMiniFactory",
-        "thumbnail_url": _coalesce(
-            image.get("thumbnail_url"), image.get("url")
-        ),
+        "thumbnail_url": _myminifactory_image_url(item),
         "license": lic["name"],
         "license_url": lic["url"],
         "license_summary": lic["summary"],

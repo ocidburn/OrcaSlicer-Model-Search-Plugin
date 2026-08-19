@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community model portals."
 # author = "Tommaso Bianchi"
-# version = "0.7.1"
+# version = "0.7.2"
 # ///
 
 import html
@@ -35,9 +35,27 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.7.1 "
+    "OrcaSlicer-Model-Search-Plugin/0.7.2 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
+_STANDARD_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
+    "Gecko/20100101 Firefox/140.0"
+)
+_HTML_ACCEPT = "text/html,application/xhtml+xml"
+_STANDARD_BROWSER_HTML_HEADERS = {
+    "User-Agent": _STANDARD_BROWSER_UA,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 _MAX_REDIRECTS = 5
@@ -182,6 +200,10 @@ class BrowserRequired(RuntimeError):
     def __init__(self, message, url=""):
         super().__init__(message)
         self.url = url
+
+
+class CloudflareChallenge(BrowserRequired):
+    """Cloudflare requires an interactive browser verification step."""
 
 
 class VerificationRequired(AuthError):
@@ -1053,32 +1075,64 @@ def _parse_catalog_html(raw):
     return parser
 
 
+def _is_cloudflare_challenge(response):
+    headers = response.headers or {}
+    if str(headers.get("cf-mitigated") or "").strip().casefold() == "challenge":
+        return True
+    if response.status_code not in (403, 429, 503):
+        return False
+    if "cloudflare" not in str(headers.get("server") or "").casefold():
+        return False
+    sample = str(getattr(response, "text", "") or "")[:20000].casefold()
+    return any(
+        marker in sample
+        for marker in (
+            "just a moment",
+            "challenge-platform",
+            "cf-chl-",
+            "attention required",
+        )
+    )
+
+
 def _fetch_html(url, auth=None, platform="", timeout=30):
     import requests
 
     session = (
         auth.session(platform) if auth is not None and platform else requests.Session()
     )
-    if auth is not None and platform:
-        response = auth.request(
-            platform,
-            "GET",
+
+    def request(headers):
+        if auth is not None and platform:
+            return auth.request(
+                platform,
+                "GET",
+                url,
+                session=session,
+                timeout=timeout,
+                allow_redirects=True,
+                headers=headers,
+            )
+        return session.get(
             url,
-            session=session,
             timeout=timeout,
             allow_redirects=True,
-            headers={"Accept": "text/html,application/xhtml+xml"},
+            headers=headers,
         )
-    else:
-        response = session.get(
-            url,
-            timeout=timeout,
-            allow_redirects=True,
-            headers={
-                "User-Agent": _BROWSER_UA,
-                "Accept": "text/html,application/xhtml+xml",
-            },
-        )
+
+    response = request({"User-Agent": _BROWSER_UA, "Accept": _HTML_ACCEPT})
+    if _is_cloudflare_challenge(response):
+        response.close()
+        response = request(dict(_STANDARD_BROWSER_HTML_HEADERS))
+        if _is_cloudflare_challenge(response):
+            challenged_url = response.url or url
+            response.close()
+            raise CloudflareChallenge(
+                "Cloudflare still requires browser verification after retrying "
+                "with a standard browser User-Agent. Open the page in your "
+                "browser and try the search again later.",
+                challenged_url,
+            )
     if response.status_code in (401, 403) and platform in ("grabcad", "cults3d"):
         display = _display_name(platform)
         raise AuthRequired(
@@ -1189,6 +1243,8 @@ def _catalog_search(
             if models:
                 return models
         except AuthRequired:
+            raise
+        except BrowserRequired:
             raise
         except (OSError, ValueError, RuntimeError) as exc:
             last_error = exc
@@ -3186,7 +3242,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 .accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account-head{display:flex;align-items:center;justify-content:space-between;gap:6px}.account strong{display:block;font-size:.86em}.auth-help{width:20px;height:20px;min-width:20px;padding:0!important;border:1px solid var(--orca-border,#666)!important;border-radius:50%!important;background:transparent!important;color:var(--orca-muted,#aaa)!important;font-size:.75em;font-weight:700;line-height:18px}.auth-help:hover,.auth-help:focus{border-color:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent,#4a9eff)!important;outline:none}.auth-tooltip{position:fixed;z-index:80;display:none;width:min(330px,calc(100vw - 24px));padding:9px 11px;border:1px solid var(--orca-border,#666);border-radius:7px;background:var(--orca-bg,#202020);color:var(--orca-fg,#eee);box-shadow:0 5px 20px rgba(0,0,0,.5);font-size:.76em;line-height:1.4;text-align:left;pointer-events:none}.auth-tooltip.active{display:block}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.search-options{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:-4px 0 10px;font-size:.82em}.search-options select{padding:5px 8px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.search-options label{display:flex;align-items:center;gap:5px}.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 6px}.source-head strong{font-size:.9em}.source-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.source-tools button{padding:4px 8px;font-size:.76em}.source-count{font-size:.76em;color:var(--orca-muted,#999)}.platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;margin-bottom:12px}.portal-option{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.84em;color:var(--orca-fg,#eee);cursor:pointer;user-select:none}.portal-option:hover{border-color:var(--orca-accent,#4a9eff)}.portal-option input{margin:0;accent-color:var(--orca-accent,#4a9eff)}
 #results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.result-image{opacity:0;transition:opacity .18s ease}.result-image.loaded{opacity:1}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.metrics{font-size:.72em;color:var(--orca-muted,#999);min-height:1.2em;margin-top:3px}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
 .pagination{display:none;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin:14px 0 4px}.pagination.active{display:flex}.pagination-summary{font-size:.8em;color:var(--orca-muted,#999);margin-right:4px}.pagination label{display:flex;align-items:center;gap:5px;font-size:.8em;color:var(--orca-muted,#999)}.pagination select{padding:5px 7px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.page-numbers{display:flex;align-items:center;gap:4px}.page-button{min-width:34px;padding:6px 8px}.page-button.current{background:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent-fg,#fff)!important;border-color:var(--orca-accent,#4a9eff)!important}.page-ellipsis{padding:0 2px;color:var(--orca-muted,#999)}
-.source-results{display:none;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px;margin:0 0 12px}.source-results.active{display:grid}.source-result{padding:7px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.75em}.source-result strong,.source-result span,.source-result small{display:block}.source-result span{color:var(--orca-muted,#999);margin-top:2px}.source-result small{color:#e78b8b;margin-top:3px;overflow-wrap:anywhere}.load-more-row{display:none;justify-content:center;margin:10px 0 4px}.load-more-row.active{display:flex}.load-more-row button{min-width:220px}
+.source-results{display:none;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px;margin:0 0 12px}.source-results.active{display:grid}.source-result{padding:7px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.75em}.source-result strong,.source-result span,.source-result small{display:block}.source-result span{color:var(--orca-muted,#999);margin-top:2px}.source-result small{color:#e78b8b;margin-top:3px;overflow-wrap:anywhere}.source-browser{margin-top:7px;padding:4px 8px;font-size:1em}.load-more-row{display:none;justify-content:center;margin:10px 0 4px}.load-more-row.active{display:flex}.load-more-row button{min-width:220px}
 .panel{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(650px,calc(100% - 32px));max-height:70vh;overflow:auto;z-index:20;padding:14px 34px 14px 14px;border:1px solid var(--orca-border,#444);border-radius:8px;background:var(--orca-bg,#1e1e1e);box-shadow:0 6px 28px rgba(0,0,0,.55);display:none}.panel.active{display:block}.close{position:absolute;right:8px;top:6px;background:none!important;font-size:1.35em;padding:2px 6px}.panel p{font-size:.86em;color:var(--orca-muted,#aaa);margin:6px 0}.panel a{color:var(--orca-accent,#4a9eff)}.responsibility{border-left:3px solid var(--orca-border,#444);padding:8px 10px;margin:10px 0;font-size:.78em;color:var(--orca-muted,#888)}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.file-modal{width:min(700px,calc(100% - 32px))}.file-list{max-height:46vh;overflow:auto;border:1px solid var(--orca-border,#555);border-radius:6px;margin:10px 0}.file-choice{display:grid;grid-template-columns:auto 96px minmax(0,1fr);align-items:center;gap:10px;padding:9px 10px;border-bottom:1px solid var(--orca-border,#444);cursor:pointer}.file-choice:last-child{border-bottom:0}.file-choice:has(input:checked){background:rgba(74,158,255,.06)}.file-choice input{margin:0}.file-preview,.file-preview-placeholder{width:96px;height:76px;border-radius:5px;background:#333}.file-preview{object-fit:cover;cursor:zoom-in}.file-preview:focus,.mw-cover:focus{outline:2px solid var(--orca-accent,#4a9eff);outline-offset:2px}.file-preview-placeholder{display:flex;align-items:center;justify-content:center;color:var(--orca-muted,#888);font-size:.7em}.file-details{min-width:0}.file-name{display:block;overflow-wrap:anywhere;font-weight:600;font-size:.86em}.file-meta{display:block;color:var(--orca-muted,#999);font-size:.75em;margin-top:4px}.file-tools{display:flex;gap:7px;margin:8px 0}.file-count{font-size:.8em;color:var(--orca-muted,#999)}.makerworld-modal{width:min(700px,calc(100% - 32px))}.mw-profiles{max-height:42vh;overflow:auto;margin:10px 0}.mw-profile{display:grid;grid-template-columns:auto 88px 1fr;gap:10px;align-items:center;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;margin:7px 0;cursor:pointer}.mw-profile:has(input:checked){border-color:var(--orca-accent,#4a9eff);background:rgba(74,158,255,.08)}.mw-profile input{margin:0}.mw-cover{width:88px;height:68px;object-fit:cover;border-radius:5px;background:#333;cursor:zoom-in}.image-preview{position:fixed;z-index:70;display:none;width:min(420px,55vw);max-height:65vh;object-fit:contain;border:1px solid var(--orca-border,#666);border-radius:8px;background:#222;box-shadow:0 8px 30px rgba(0,0,0,.7);pointer-events:none}.image-preview.active{display:block}.mw-title{display:block;font-weight:600;font-size:.88em}.mw-summary{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:.78em;line-height:1.3;margin-top:3px}.mw-meta{display:block;font-size:.75em;color:var(--orca-muted,#aaa);margin-top:4px}.mw-formats{display:grid;gap:7px;margin:10px 0}.mw-format{display:flex;gap:9px;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;cursor:pointer}.mw-format:has(input:checked){border-color:var(--orca-accent,#4a9eff)}.mw-format small{display:block;color:var(--orca-muted,#aaa);margin-top:2px}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
 @media(max-width:680px){.accounts{grid-template-columns:1fr}}
@@ -3282,7 +3338,8 @@ function renderResultPage(){var total=window._results.length,pages=Math.max(1,Ma
 function renderResults(models,resetPage){window._results=models||[];if(resetPage!==false)currentPage=1;renderResultPage()}
 function setResultPage(page){var pages=Math.max(1,Math.ceil(window._results.length/pageSize)),next=Math.max(1,Math.min(Number(page)||1,pages));if(next===currentPage)return;currentPage=next;closeDetail();renderResultPage();$('results').scrollIntoView({behavior:'smooth',block:'start'})}
 function changePageSize(){var value=parseInt($('page-size').value,10);pageSize=value===12||value===48?value:24;currentPage=1;closeDetail();renderResultPage()}
-function renderSourceResults(sources,more){var html='',moreCount=0;(sources||[]).forEach(function(s){var loaded=Number(s.loaded)||0,visible=Number(s.visible)||0,parts=[];if(s.total!=null)parts.push(loaded+' of '+Number(s.total)+' loaded');else parts.push(loaded+' loaded');if(visible!==loaded)parts.push(visible+' shown by filters');if(s.has_more){parts.push('more available');moreCount++}else if(!s.error){parts.push(s.paginated?'complete':'first page only')}html+='<div class="source-result'+(s.error?' error':'')+'"><strong>'+esc(s.display||s.key)+'</strong><span>'+esc(parts.join(' · '))+'</span>'+(s.error?'<small>'+esc(s.error)+'</small>':'')+'</div>'});$('source-results').innerHTML=html;$('source-results').classList.toggle('active',!!html);canLoadMore=!!more&&moreCount>0;$('load-more-row').classList.toggle('active',canLoadMore);$('load-more').disabled=false;$('load-more').textContent=moreCount===1?'Load next page from 1 portal':'Load next pages from '+moreCount+' portals'}
+function renderSourceResults(sources,more){var html='',moreCount=0;(sources||[]).forEach(function(s){var loaded=Number(s.loaded)||0,visible=Number(s.visible)||0,parts=[],browserUrl=safeUrl(s.browser_url);if(s.total!=null)parts.push(loaded+' of '+Number(s.total)+' loaded');else parts.push(loaded+' loaded');if(visible!==loaded)parts.push(visible+' shown by filters');if(s.has_more){parts.push('more available');moreCount++}else if(!s.error){parts.push(s.paginated?'complete':'first page only')}html+='<div class="source-result'+(s.error?' error':'')+'"><strong>'+esc(s.display||s.key)+'</strong><span>'+esc(parts.join(' · '))+'</span>'+(s.error?'<small>'+esc(s.error)+'</small>':'')+(browserUrl?'<button type="button" class="secondary source-browser" data-url="'+esc(browserUrl)+'">Open in browser</button>':'')+'</div>'});$('source-results').innerHTML=html;$('source-results').classList.toggle('active',!!html);canLoadMore=!!more&&moreCount>0;$('load-more-row').classList.toggle('active',canLoadMore);$('load-more').disabled=false;$('load-more').textContent=moreCount===1?'Load next page from 1 portal':'Load next pages from '+moreCount+' portals'}
+$('source-results').addEventListener('click',function(e){var button=e.target.closest&&e.target.closest('.source-browser');if(button)openExternal(button.dataset.url)});
 function loadMoreResults(){if(searching||!canLoadMore)return;searching=true;$('search-btn').disabled=true;$('load-more').disabled=true;$('load-more').textContent='Loading...';$('status').textContent='Loading next portal pages...';orca.postMessage({action:'search_more'})}
 function modelIdentity(m){return String((m&&m._platform_key)||platformKey(m&&m.platform)||'')+'|'+String((m&&m._thing_id)||(m&&m._model_id)||(m&&m.url)||'')}
 function preloadMakerWorldImages(key,profiles){var images=[];(profiles||[]).forEach(function(p){var url=safeUrl(p.cover);if(!url)return;var img=new Image();img.decoding='async';img.src=url;images.push(img)});makerWorldPreloadedImages[key]=images}
@@ -3747,6 +3804,20 @@ if orca is not None:
                         "has_more": has_more,
                         "paginated": spec.paginated_search,
                         "error": "",
+                        "browser_url": "",
+                    }
+                except BrowserRequired as exc:
+                    pages[key] = 0
+                    stats[key] = {
+                        "key": key,
+                        "display": spec.display,
+                        "loaded": 0,
+                        "page": 0,
+                        "total": None,
+                        "has_more": False,
+                        "paginated": spec.paginated_search,
+                        "error": str(exc),
+                        "browser_url": exc.url,
                     }
                 except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
                     pages[key] = 0
@@ -3759,6 +3830,7 @@ if orca is not None:
                         "has_more": False,
                         "paginated": spec.paginated_search,
                         "error": str(exc),
+                        "browser_url": "",
                     }
             detail_candidates = self._prepare_thingiverse_prefetch(
                 results, generation
@@ -3813,10 +3885,16 @@ if orca is not None:
                             "total": total if total is not None else source.get("total"),
                             "has_more": has_more and added > 0,
                             "error": "",
+                            "browser_url": "",
                         }
                     )
+                except BrowserRequired as exc:
+                    source["has_more"] = False
+                    source["error"] = str(exc)
+                    source["browser_url"] = exc.url
                 except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
                     source["error"] = str(exc)
+                    source["browser_url"] = ""
                 stats[key] = source
             detail_candidates = self._prepare_thingiverse_prefetch(
                 results, generation

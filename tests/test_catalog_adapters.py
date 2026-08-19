@@ -10,10 +10,13 @@ mod = load_plugin("search_engine_catalog")
 
 
 class FakeResponse:
-    def __init__(self, payload, status_code=200, headers=None):
+    def __init__(self, payload, status_code=200, headers=None, url="https://example.test/"):
         self.payload = payload
         self.status_code = status_code
         self.headers = headers or {}
+        self.url = url
+        self.text = payload if isinstance(payload, str) else ""
+        self.closed = False
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -21,6 +24,9 @@ class FakeResponse:
 
     def json(self):
         return self.payload
+
+    def close(self):
+        self.closed = True
 
 
 class CatalogSearchTests(unittest.TestCase):
@@ -92,6 +98,55 @@ class CatalogSearchTests(unittest.TestCase):
             rows = mod.Cults3DSearcher.search("benchy", None)
         self.assertEqual(rows[0]["platform"], "Cults3D")
         self.assertTrue(rows[0]["requires_auth"])
+
+    def test_html_fetch_retries_cloudflare_challenge_with_standard_browser_ua(self):
+        url = "https://cults3d.com/en/tags/benchy"
+        challenged = FakeResponse(
+            "<title>Just a moment...</title>",
+            status_code=403,
+            headers={"cf-mitigated": "challenge", "server": "cloudflare"},
+            url=url,
+        )
+        success = FakeResponse("<title>Models</title>", url=url)
+        session = mock.Mock()
+        session.get.side_effect = [challenged, success]
+
+        with mock.patch("requests.Session", return_value=session):
+            raw, final_url = mod._fetch_html(url)
+
+        self.assertEqual(raw, "<title>Models</title>")
+        self.assertEqual(final_url, url)
+        self.assertTrue(challenged.closed)
+        self.assertEqual(session.get.call_count, 2)
+        first_headers = session.get.call_args_list[0].kwargs["headers"]
+        retry_headers = session.get.call_args_list[1].kwargs["headers"]
+        self.assertEqual(first_headers["User-Agent"], mod._BROWSER_UA)
+        self.assertEqual(retry_headers["User-Agent"], mod._STANDARD_BROWSER_UA)
+
+    def test_html_fetch_surfaces_persistent_cloudflare_challenge_for_browser(self):
+        url = "https://cults3d.com/en/tags/benchy"
+        responses = [
+            FakeResponse(
+                "<title>Just a moment...</title>",
+                status_code=403,
+                headers={"cf-mitigated": "challenge", "server": "cloudflare"},
+                url=url,
+            )
+            for _ in range(2)
+        ]
+        session = mock.Mock()
+        session.get.side_effect = responses
+
+        with (
+            mock.patch("requests.Session", return_value=session),
+            self.assertRaises(mod.CloudflareChallenge) as raised,
+        ):
+            mod._fetch_html(url)
+
+        self.assertEqual(raised.exception.url, url)
+        self.assertIn("standard browser User-Agent", str(raised.exception))
+        self.assertEqual(session.get.call_count, 2)
+        self.assertTrue(all(response.closed for response in responses))
 
     def test_myminifactory_search_uses_official_api(self):
         payload = {
@@ -572,6 +627,12 @@ class RegistryAndUiTests(unittest.TestCase):
             },
         )
 
+    def test_source_errors_can_offer_a_safe_browser_fallback(self):
+        self.assertIn("browserUrl=safeUrl(s.browser_url)", mod.PAGE)
+        self.assertIn('class="secondary source-browser"', mod.PAGE)
+        self.assertIn("e.target.closest('.source-browser')", mod.PAGE)
+        self.assertIn("openExternal(button.dataset.url)", mod.PAGE)
+
     def test_thingiverse_background_details_update_cards_silently(self):
         self.assertIn("function applyModelDetails(m,silent)", mod.PAGE)
         self.assertIn("applyModelDetails(msg.model||{},!!msg.background)", mod.PAGE)
@@ -652,10 +713,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_071(self):
+    def test_version_is_072(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.7.1"', head)
+        self.assertIn('# version = "0.7.2"', head)
 
 
 if __name__ == "__main__":

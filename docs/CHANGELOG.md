@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.7.2
+
+- Added one HTML-only retry with standard browser navigation headers when a
+  response is explicitly marked `cf-mitigated: challenge` or matches a
+  Cloudflare challenge page.
+- Added a per-source **Open in browser** action when interactive Cloudflare
+  verification remains necessary after the retry.
+- Kept the plugin-identifying User-Agent unchanged for JSON/API traffic and
+  continued to leave CAPTCHA solving and other interactive checks to the user's
+  browser.
+
 ## 0.7.1
 
 - Fixed Thingiverse licenses remaining `Unknown` until the user opened each result card.

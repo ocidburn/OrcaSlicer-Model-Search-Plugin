@@ -140,6 +140,28 @@ class SpeedDialActionTests(unittest.TestCase):
             self.assertEqual(second["sources"][0]["loaded"], 2)
             self.assertEqual(second["sources"][0]["visible"], 2)
 
+    def test_search_reports_cloudflare_browser_fallback_url(self):
+        module, _ = load_with_fake_orca()
+        action = module.SearchEngineScript()
+        action.win = FakeWindow()
+        action._search_generation = 1
+        url = "https://cults3d.com/en/tags/benchy"
+
+        with mock.patch.object(
+            module.Cults3DSearcher,
+            "search",
+            side_effect=module.CloudflareChallenge("Browser verification required", url),
+        ):
+            action._do_search(
+                {"query": "benchy", "platforms": ["cults3d"], "options": {}},
+                1,
+            )
+
+        source = action.win.posts[-1]["sources"][0]
+        self.assertEqual(source["error"], "Browser verification required")
+        self.assertEqual(source["browser_url"], url)
+        self.assertFalse(source["has_more"])
+
     def test_unknown_thingiverse_license_is_loaded_in_background(self):
         module, _ = load_with_fake_orca()
         action = module.SearchEngineScript()

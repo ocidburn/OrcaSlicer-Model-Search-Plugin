@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.7.1**
+**Current plugin version: v0.7.2**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -158,6 +158,11 @@ Search is public, but Cults3D requires a signed-in account even for many free-fi
 The plugin sends those cookies only to allowed Cults3D hosts. If the saved session expires, the plugin asks you to refresh it.
 
 Cults3D paid/checkout flows remain in the browser.
+
+If Cloudflare challenges a catalog request, the plugin makes one compatibility
+retry with standard browser navigation headers. If Cloudflare still requires
+interactive verification, the Cults3D source status shows **Open in browser**;
+the plugin does not attempt to solve or bypass the challenge.
 
 ### GrabCAD
 
@@ -378,7 +383,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.7.1 validation gates are:
+The v0.7.2 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

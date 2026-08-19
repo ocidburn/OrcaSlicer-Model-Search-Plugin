@@ -806,6 +806,28 @@ def _cloudflare_challenge(url, auth=None, detail="", host=""):
 
 
 _LOGIN_TIMEOUT_SECONDS = 300
+_LOGIN_MAX_BODY_BYTES = 64 * 1024
+
+
+def _is_loopback_host(value):
+    """True when a Host or netloc names this machine's loopback interface.
+
+    Accepts every form a browser or a hand-typed URL may produce: any address
+    in 127.0.0.0/8, ``::1`` bracketed or not, and ``localhost``, in any case,
+    with or without a port or a trailing root dot.
+    """
+    host = str(value or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host.startswith("["):
+        host = host.partition("]")[0].lstrip("[")
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    host = host.rstrip(".")
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
 
 _LOGIN_PAGE_STYLE = (
     "body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:32px;"
@@ -867,6 +889,12 @@ class LoginReceiver:
             return ""
         host, port = server.server_address[:2]
         return f"http://{host}:{port}"
+
+    @property
+    def port(self):
+        with self._lock:
+            server = self._server
+        return server.server_address[1] if server is not None else 0
 
     @property
     def url(self):
@@ -944,30 +972,70 @@ def _login_handler(receiver):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(page)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Referrer-Policy", "same-origin")
             self.end_headers()
             self.wfile.write(page)
 
         def _is_local(self):
-            """Only this machine, and only pages this receiver served."""
-            host = self.headers.get("Host", "")
-            if not re.fullmatch(r"(?:127\.0\.0\.1|localhost)(?::\d+)?", host):
+            """Reject anything not addressed to this machine's loopback name.
+
+            This is the defence against DNS rebinding: a site that points its
+            own hostname at 127.0.0.1 still sends that hostname here.  It
+            deliberately ignores Referer -- a browser may carry one over from
+            the portal page the user just left, and rejecting that blocks a
+            perfectly ordinary navigation while adding nothing, because the
+            single-use state value is what actually guards this endpoint.
+            """
+            return _is_loopback_host(self.headers.get("Host"))
+
+        def _origin_allowed(self):
+            """Defence in depth for submissions: refuse a cross-site POST.
+
+            The single-use state value is what actually guards this endpoint;
+            this only turns away an obvious cross-site submission.  Two browser
+            behaviours matter here.  A browser states the relationship directly
+            in Sec-Fetch-Site, which is the most reliable signal available.  And
+            a browser may serialize the Origin of its own same-origin form post
+            as ``null``, so a null Origin cannot be treated as hostile on its
+            own -- rejecting it blocked the plugin's own hand-over page.
+            """
+            site = str(self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if site:
+                return site in ("same-origin", "none")
+            origin = str(self.headers.get("Origin") or "").strip()
+            if not origin or origin.lower() == "null":
+                return True
+            parsed = urllib.parse.urlsplit(origin)
+            if not _is_loopback_host(parsed.netloc):
                 return False
-            origin = receiver.origin
-            for name in ("Origin", "Referer"):
-                value = self.headers.get(name)
-                if value and origin and not value.startswith(origin):
-                    return False
-            return True
+            return parsed.port == receiver.port
 
         def _query(self):
             parsed = urllib.parse.urlsplit(self.path)
             return parsed.path, urllib.parse.parse_qs(parsed.query)
 
+        def _blocked(self):
+            """A dead-end 403 is impossible to diagnose; name what arrived."""
+            host = html.escape(str(self.headers.get("Host") or "(none)"))
+            self._reply(
+                403,
+                _login_page(
+                    "Blocked",
+                    "<p>This page answers only requests addressed to this "
+                    "machine over its loopback interface.</p>"
+                    f"<p>The request arrived with <code>Host: {host}</code>.</p>",
+                ),
+            )
+
         def do_GET(self):
             path, query = self._query()
             if not self._is_local():
-                self._reply(403, _login_page("Blocked", "<p>Local requests only.</p>"))
+                self._blocked()
+                return
+            if path == "/favicon.ico":
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
                 return
             if not receiver.valid_state(_first(query.get("state"))):
                 self._reply(
@@ -1012,14 +1080,43 @@ def _login_handler(receiver):
 
         def do_POST(self):
             if not self._is_local():
-                self._reply(403, _login_page("Blocked", "<p>Local requests only.</p>"))
+                self._blocked()
+                return
+            if not self._origin_allowed():
+                self._reply(
+                    403,
+                    _login_page(
+                        "Blocked",
+                        "<p>This submission came from another site.</p>",
+                    ),
+                )
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = 0
-            if length <= 0 or length > 64 * 1024:
+            if length <= 0:
                 self._reply(400, _login_page("Bad request", "<p>Empty submission.</p>"))
+                return
+            if length > _LOGIN_MAX_BODY_BYTES:
+                # Drain a bounded amount first: replying to a client that is
+                # still uploading gets the connection reset instead of the
+                # error page, which is exactly the kind of dead end this
+                # endpoint should not produce.
+                remaining = min(length, 4 * _LOGIN_MAX_BODY_BYTES)
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                self._reply(
+                    413,
+                    _login_page(
+                        "Too large",
+                        "<p>That is far more than a session value. Paste only "
+                        "the cookie or token itself.</p>",
+                    ),
+                )
                 return
             fields = urllib.parse.parse_qs(
                 self.rfile.read(length).decode("utf-8", "replace")

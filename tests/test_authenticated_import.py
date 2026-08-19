@@ -269,7 +269,7 @@ class ResolverTests(unittest.TestCase):
             ],
         }
         auth = FakeAuth(
-            "makerworld",
+            "not-authenticated",
             [
                 FakeResponse(data=design),
                 FakeResponse(
@@ -301,6 +301,7 @@ class ResolverTests(unittest.TestCase):
             },
             auth,
         )
+        self.assertFalse(auth.authenticated("makerworld"))
         self.assertEqual(
             [item["profile_id"] for item in choices["profiles"]], ["123", "456"]
         )

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.5.5
+
+- Added lazy search-result thumbnails with an `IntersectionObserver` fallback for embedded browsers without native lazy loading.
+- Added background MakerWorld print-profile metadata and image preloading when a result card is selected; Import reuses the cached choices.
+- Added enlarged mouse-hover and keyboard-focus previews for MakerWorld print-profile images.
+
 ## 0.5.4
 
 - Added a hover/focus help tooltip to every portal authentication card with portal-specific login, token, cookie, or API-key instructions.

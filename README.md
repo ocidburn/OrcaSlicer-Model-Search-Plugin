@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.5.4**
+**Current plugin version: v0.5.5**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -31,12 +31,15 @@ The selected search portals are remembered by the embedded UI and restored the n
 - Selected-source counter and protection against starting a search with no portal selected.
 - Search-source selection is persisted between launches.
 - Search results include model name, author, platform, thumbnail and license information when the platform exposes it.
+- Search-result thumbnails load lazily as cards approach the visible area.
 - One-click **Open in browser** fallback for downloads that require a portal checkout, membership flow, CAPTCHA, or other interactive browser step.
 - Separate per-portal authentication sessions where authentication is actually required.
 - Every authentication card includes a keyboard-accessible help tooltip with portal-specific connection instructions.
 - Passwords are never persisted.
 - Single-file downloads import immediately.
 - Multi-file models show a checkbox list before downloading.
+- Selecting a MakerWorld result preloads its print-profile metadata and images in the background; the importer reuses that cache.
+- MakerWorld profile thumbnails support an enlarged mouse-hover and keyboard-focus preview.
 - MakerWorld models show their available print profiles and let you choose direct 3MF import or the official browser flow for STL/CAD files.
 - ZIP downloads are safely expanded and supported model files are imported.
 - Downloaded models are handed to the already-running OrcaSlicer instance and added to the current project.
@@ -113,7 +116,7 @@ The account panel supports:
 
 Only the resulting session token is saved. The password is not stored.
 
-MakerWorld import lists the available print profiles with their title, creator, printer, layer settings, plate count, estimated print time, and rating when supplied by MakerWorld. The user explicitly selects a profile and then chooses:
+Selecting a MakerWorld card starts a public background request for its print-profile metadata and preloads the profile images. Import reuses the cached response, and hovering over or focusing a profile thumbnail shows a larger preview. MakerWorld import lists the available print profiles with their title, creator, printer, layer settings, plate count, estimated print time, and rating when supplied by MakerWorld. The user explicitly selects a profile and then chooses:
 
 - **3MF print profile** — asks MakerWorld for the authenticated signed profile URL and imports it directly.
 - **STL/CAD files** — opens the selected profile on MakerWorld for its signed-in browser download flow. Bambu's token API does not expose raw files to this plugin, so this option is never presented as a successful direct import.
@@ -380,7 +383,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.5.4 validation gates are:
+The v0.5.5 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

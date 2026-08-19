@@ -216,6 +216,41 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertEqual(action.win.posts[-1]["action"], "makerworld_choices")
         self.assertEqual(action.win.posts[-1]["profiles"][0]["profile_id"], "123")
 
+    def test_makerworld_card_selection_can_prefetch_profiles_without_login(self):
+        mod, action = self.make_action()
+        model = {
+            "platform": "MakerWorld",
+            "_platform_key": "makerworld",
+            "_model_id": 10,
+            "url": "https://makerworld.com/en/models/10",
+            "requires_auth": True,
+        }
+        choices = {
+            "profiles": [
+                {
+                    "profile_id": "123",
+                    "title": "Fast",
+                    "cover": "https://cdn.example/fast.webp",
+                }
+            ],
+            "default_profile_id": "123",
+            "formats": [{"id": "3mf", "label": "3MF", "available": True}],
+        }
+        with (
+            mock.patch.object(action.auth, "authenticated", return_value=False),
+            mock.patch.object(
+                mod.MakerWorldSearcher,
+                "get_download_choices",
+                return_value=choices,
+            ) as get_choices,
+        ):
+            action._prefetch_makerworld_profiles(model)
+        get_choices.assert_called_once_with(model, action.auth)
+        message = action.win.posts[-1]
+        self.assertEqual(message["action"], "makerworld_prefetched")
+        self.assertEqual(message["model"], model)
+        self.assertEqual(message["profiles"][0]["profile_id"], "123")
+
     def test_makerworld_3mf_choice_preserves_explicit_profile(self):
         _mod, action = self.make_action()
         model = {
@@ -253,6 +288,30 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertIn("resolve_makerworld_choice", mod.PAGE)
         self.assertIn("STL/CAD files", mod.PAGE)
         self.assertIn("mw-summary", mod.PAGE)
+
+    def test_ui_lazily_loads_search_result_images(self):
+        mod = load_module()
+        self.assertIn('class="result-image"', mod.PAGE)
+        self.assertIn('loading="lazy"', mod.PAGE)
+        self.assertIn('data-src="', mod.PAGE)
+        self.assertIn("IntersectionObserver", mod.PAGE)
+        self.assertIn("rootMargin:'240px 0px'", mod.PAGE)
+
+    def test_ui_prefetches_makerworld_profiles_and_images(self):
+        mod = load_module()
+        self.assertIn("prefetch_makerworld_profiles", mod.PAGE)
+        self.assertIn("makerworld_prefetched", mod.PAGE)
+        self.assertIn("makerWorldChoicesCache", mod.PAGE)
+        self.assertIn("makerWorldPreloadedImages", mod.PAGE)
+        self.assertIn("new Image()", mod.PAGE)
+
+    def test_ui_has_enlarged_makerworld_profile_preview(self):
+        mod = load_module()
+        self.assertIn('id="mw-image-preview"', mod.PAGE)
+        self.assertIn("showProfilePreview", mod.PAGE)
+        self.assertIn("cursor:zoom-in", mod.PAGE)
+        self.assertIn('onmouseenter="showProfilePreview(this)"', mod.PAGE)
+        self.assertIn('onfocus="showProfilePreview(this)"', mod.PAGE)
 
     def test_detail_import_panel_closes_on_click_outside(self):
         mod = load_module()

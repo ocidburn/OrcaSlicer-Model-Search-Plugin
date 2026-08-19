@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.5.8**
+**Current plugin version: v0.5.9**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -37,7 +37,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 - Every authentication card includes a keyboard-accessible help tooltip with portal-specific connection instructions.
 - Passwords are never persisted.
 - Single-file downloads import immediately.
-- Multi-file models show a checkbox list before downloading. Printables files include their individual rendered thumbnail and an enlarged mouse-hover or keyboard-focus preview when the platform provides one.
+- Multi-file models show a checkbox list before downloading. Printables and Thingiverse files include their individual rendered thumbnail and an enlarged mouse-hover or keyboard-focus preview when the platform provides one.
 - Selecting a MakerWorld result preloads its print-profile metadata and images in the background; the importer reuses that cache.
 - MakerWorld profile thumbnails support an enlarged mouse-hover and keyboard-focus preview.
 - MakerWorld models show their available print profiles and let you choose direct 3MF import or the official browser flow for STL/CAD files.
@@ -85,7 +85,7 @@ A successful search result does not guarantee that the portal allows a direct pr
 - Uses Thingiverse's official API instead of its client-rendered search page.
 - Create/open a Thingiverse developer app, paste its personal access token in the plugin, and enable the Thingiverse source.
 - Opening a result lazily loads its official license and complete download/view/print counters from the authenticated model-details API.
-- Downloadable files come from the same authenticated API.
+- Downloadable files, their sizes, and their individual render thumbnails come from the same authenticated API. The file picker shows a larger preview on mouse hover or keyboard focus.
 
 ### MyMiniFactory
 
@@ -384,7 +384,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.5.8 validation gates are:
+The v0.5.9 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community, museum, scientific, and space catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.5.8"
+# version = "0.5.9"
 # ///
 
 import html
@@ -34,7 +34,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.5.8 "
+    "OrcaSlicer-Model-Search-Plugin/0.5.9 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -2136,8 +2136,40 @@ def _thingiverse_thumbnail(item):
     direct = _coalesce(item.get("thumbnail"), item.get("preview_image"))
     if direct:
         return direct
+
+    default_image = item.get("default_image") or {}
+    if isinstance(default_image, dict):
+        sizes = default_image.get("sizes") or []
+        for preferred_size in ("large", "medium", "small", "tiny"):
+            for image in sizes:
+                if (
+                    isinstance(image, dict)
+                    and image.get("size") == preferred_size
+                    and image.get("url")
+                ):
+                    return image["url"]
+        if default_image.get("url"):
+            return default_image["url"]
+
     images = item.get("images") or []
-    return (images[0].get("url") or "") if images else ""
+    first_image = images[0] if images else {}
+    if isinstance(first_image, dict):
+        return first_image.get("url") or ""
+    return ""
+
+
+def _thingiverse_file_record(item):
+    records = _file_records(
+        [item],
+        ("download_url", "public_url", "url"),
+        ("name", "filename"),
+    )
+    if not records:
+        return None
+    record = records[0]
+    record["preview_url"] = _thingiverse_thumbnail(item)
+    record["size"] = item.get("size")
+    return record
 
 
 def _thingiverse_result(item):
@@ -2251,11 +2283,14 @@ class ThingiverseSearcher:
         if response.status_code in (401, 403):
             raise AuthRequired("Thingiverse rejected the saved API access token")
         response.raise_for_status()
-        return _file_records(
-            response.json(),
-            ("download_url", "public_url", "url"),
-            ("name", "filename"),
-        )
+        files = []
+        for item in response.json():
+            if not isinstance(item, dict):
+                continue
+            record = _thingiverse_file_record(item)
+            if record:
+                files.append(record)
+        return files
 
 
 class Cults3DSearcher:

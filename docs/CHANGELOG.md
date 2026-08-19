@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.9
+
+- Added official per-file Thingiverse render thumbnails and file sizes to the multi-file import picker.
+- Added enlarged mouse-hover and keyboard-focus previews for Thingiverse file images, with an official `default_image` fallback when a file thumbnail is absent.
+
 ## 0.5.8
 
 - Completed MakerOnline's registered OAuth URL with its official redirect URI, `read` scope, state, and language parameters.

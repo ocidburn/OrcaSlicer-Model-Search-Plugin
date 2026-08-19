@@ -207,7 +207,30 @@ class DownloadResolverTests(unittest.TestCase):
     def test_thingiverse_lists_files_through_official_api(self):
         model = {"url": "https://www.thingiverse.com/thing:7379392"}
         payload = [
-            {"name": "cube.stl", "download_url": "https://cdn.example/cube.stl"}
+            {
+                "name": "cube.stl",
+                "download_url": "https://cdn.example/cube.stl",
+                "thumbnail": "https://cdn.example/cube_thumb_medium.jpg",
+                "size": 4096,
+            },
+            {
+                "name": "base.stl",
+                "download_url": "https://cdn.example/base.stl",
+                "default_image": {
+                    "url": "https://cdn.example/base-original.jpg",
+                    "sizes": [
+                        {
+                            "size": "medium",
+                            "url": "https://cdn.example/base-medium.jpg",
+                        },
+                        {
+                            "size": "large",
+                            "url": "https://cdn.example/base-large.jpg",
+                        },
+                    ],
+                },
+                "size": 8192,
+            },
         ]
         with tempfile.TemporaryDirectory() as td:
             auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
@@ -215,6 +238,11 @@ class DownloadResolverTests(unittest.TestCase):
             with mock.patch.object(auth, "request", return_value=FakeResponse(payload)):
                 files = mod.ThingiverseSearcher.get_files(model, auth)
         self.assertEqual(files[0]["name"], "cube.stl")
+        self.assertEqual(
+            files[0]["preview_url"], "https://cdn.example/cube_thumb_medium.jpg"
+        )
+        self.assertEqual(files[0]["size"], 4096)
+        self.assertEqual(files[1]["preview_url"], "https://cdn.example/base-large.jpg")
 
     def test_cults_requires_account_before_files(self):
         model = {"url": "https://cults3d.com/en/3d-model/tool/free-model"}
@@ -466,10 +494,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_058(self):
+    def test_version_is_059(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.5.8"', head)
+        self.assertIn('# version = "0.5.9"', head)
 
 
 if __name__ == "__main__":

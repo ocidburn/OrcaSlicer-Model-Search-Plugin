@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.4
+
+- Added a hover/focus help tooltip to every portal authentication card with portal-specific login, token, cookie, or API-key instructions.
+- Reused the same instruction registry inside the account dialog so the short tooltip and detailed authorization flow cannot drift apart.
+
 ## 0.5.3
 
 - Fixed MakerWorld's complete-profile response normalization so profile covers, titles, authors, descriptions, ratings, and print settings are taken from the populated response fields instead of an empty nested placeholder.

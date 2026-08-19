@@ -362,6 +362,20 @@ class RegistryAndUiTests(unittest.TestCase):
         ):
             self.assertIn(f'id="auth-{platform}"', mod.PAGE)
 
+    def test_every_authenticated_card_has_instruction_tooltip(self):
+        import re
+
+        expected = {spec.key for spec in mod._PLATFORM_SPECS if spec.requires_auth}
+        actual = set(
+            re.findall(r'class="auth-help" data-platform="([^"]+)"', mod.PAGE)
+        )
+        self.assertEqual(actual, expected)
+        self.assertIn('id="auth-tooltip"', mod.PAGE)
+        self.assertIn('role="tooltip"', mod.PAGE)
+        self.assertIn("function showAuthHelp(button)", mod.PAGE)
+        for platform in expected:
+            self.assertIn(f"{platform}:", mod.PAGE)
+
     def test_every_available_searcher_has_portal_checkbox(self):
         import re
 
@@ -441,10 +455,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_053(self):
+    def test_version_is_054(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.5.3"', head)
+        self.assertIn('# version = "0.5.4"', head)
 
 
 if __name__ == "__main__":

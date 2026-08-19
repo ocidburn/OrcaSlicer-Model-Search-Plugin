@@ -237,6 +237,33 @@ class ResolverTests(unittest.TestCase):
         self.assertIn("/user/profile/3601086", auth.calls[1][2])
         self.assertEqual(auth.calls[1][3]["params"]["model_id"], "US2bb73b106683e5")
 
+    def test_makerworld_adds_3mf_extension_to_decimal_profile_name(self):
+        profile_name = "0.2mm layer_ 2 walls_ 10_ infill"
+        design = {
+            "modelId": "MID",
+            "title": "Cup",
+            "instances": [{"profileId": 123, "title": profile_name}],
+        }
+        signed = {
+            "url": "https://makerworld.bblmw.com/download?signature=test",
+            "name": profile_name,
+        }
+        auth = FakeAuth(
+            "makerworld", [FakeResponse(data=design), FakeResponse(data=signed)]
+        )
+        files = mod.MakerWorldSearcher.get_files(
+            {
+                "platform": "MakerWorld",
+                "_model_id": 10,
+                "_profile_id": "123",
+                "_download_format": "3mf",
+                "url": "https://makerworld.com/en/models/10",
+            },
+            auth,
+        )
+        self.assertEqual(files[0]["name"], profile_name + ".3mf")
+        self.assertTrue(files[0]["name"].casefold().endswith(".3mf"))
+
     def test_makerworld_lists_profiles_and_formats_before_downloading(self):
         design = {
             "modelId": "MID",

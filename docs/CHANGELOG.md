@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.6
+
+- Fixed MakerWorld 3MF downloads whose print-profile names contain decimal dots, such as `0.2mm layer`, being saved without the required `.3mf` extension and therefore skipped by OrcaSlicer import.
+
 ## 0.5.5
 
 - Added lazy search-result thumbnails with an `IntersectionObserver` fallback for embedded browsers without native lazy loading.

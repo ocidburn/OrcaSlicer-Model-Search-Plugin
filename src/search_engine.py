@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community, museum, scientific, and space catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.5.5"
+# version = "0.5.6"
 # ///
 
 import html
@@ -34,7 +34,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.5.5 "
+    "OrcaSlicer-Model-Search-Plugin/0.5.6 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -2104,7 +2104,8 @@ class MakerWorldSearcher:
             or design.get("title")
             or f"makerworld_{design_id}.3mf"
         )
-        if not os.path.splitext(name)[1]:
+        name = _safe_filename(name, f"makerworld_{design_id}.3mf")
+        if not name.casefold().endswith(".3mf"):
             name += ".3mf"
         return [{"name": name, "url": url, "signed": True}]
 

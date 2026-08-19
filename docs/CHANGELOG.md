@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.7.1
+
+- Fixed Thingiverse licenses remaining `Unknown` until the user opened each result card.
+- Added automatic background hydration of missing Thingiverse licenses and complete metrics, limited to four concurrent official API requests and skipped when the search response already supplies a license.
+- Kept background failures silent and retryable from the card while preventing stale results from an older search from overwriting the active result set.
+
 ## 0.7.0
 
 - Added real server-side pagination for Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, and MyMiniFactory, using each service's page or offset parameter.

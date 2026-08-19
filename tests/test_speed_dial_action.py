@@ -140,6 +140,55 @@ class SpeedDialActionTests(unittest.TestCase):
             self.assertEqual(second["sources"][0]["loaded"], 2)
             self.assertEqual(second["sources"][0]["visible"], 2)
 
+    def test_unknown_thingiverse_license_is_loaded_in_background(self):
+        module, _ = load_with_fake_orca()
+        action = module.SearchEngineScript()
+        action.win = FakeWindow()
+        action._search_generation = 3
+        model = {
+            "_platform_key": "thingiverse",
+            "_thing_id": 42,
+            "platform": "Thingiverse",
+            "name": "Holder",
+            "url": "https://www.thingiverse.com/thing:42",
+            "license": "Unknown",
+            "_details_available": True,
+            "_details_loaded": False,
+        }
+        action._search_results = [model]
+        candidates = action._prepare_thingiverse_prefetch(
+            action._search_results, 3
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(action._search_results[0]["_details_loading"])
+
+        details = {
+            **model,
+            "license": "CC BY",
+            "license_url": "https://creativecommons.org/licenses/by/4.0/",
+            "_details_loaded": True,
+        }
+        with mock.patch.object(
+            module.ThingiverseSearcher, "get_details", return_value=details
+        ):
+            action._prefetch_thingiverse_details(3, candidates)
+
+        self.assertEqual(action._search_results[0]["license"], "CC BY")
+        self.assertFalse(action._search_results[0]["_details_loading"])
+        self.assertTrue(action.win.posts[-1]["background"])
+        self.assertEqual(action.win.posts[-1]["model"]["license"], "CC BY")
+
+    def test_known_thingiverse_license_skips_background_request(self):
+        module, _ = load_with_fake_orca()
+        action = module.SearchEngineScript()
+        model = {
+            "_platform_key": "thingiverse",
+            "_thing_id": 7,
+            "license": "CC0",
+            "_details_loaded": False,
+        }
+        self.assertEqual(action._prepare_thingiverse_prefetch([model], 1), [])
+
 
 if __name__ == "__main__":
     unittest.main()

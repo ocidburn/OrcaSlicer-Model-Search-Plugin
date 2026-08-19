@@ -572,6 +572,11 @@ class RegistryAndUiTests(unittest.TestCase):
             },
         )
 
+    def test_thingiverse_background_details_update_cards_silently(self):
+        self.assertIn("function applyModelDetails(m,silent)", mod.PAGE)
+        self.assertIn("applyModelDetails(msg.model||{},!!msg.background)", mod.PAGE)
+        self.assertIn("m._details_error&&!silent", mod.PAGE)
+
     def test_search_page_helpers_clamp_and_deduplicate(self):
         self.assertEqual(mod._search_page_number({"page": 0}), 1)
         self.assertEqual(mod._search_page_number({"page": 1000}), 100)
@@ -647,10 +652,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_070(self):
+    def test_version_is_071(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.7.0"', head)
+        self.assertIn('# version = "0.7.1"', head)
 
 
 if __name__ == "__main__":

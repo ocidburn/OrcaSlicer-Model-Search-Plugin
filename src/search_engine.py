@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community model portals."
 # author = "Tommaso Bianchi"
-# version = "0.7.0"
+# version = "0.7.1"
 # ///
 
 import html
@@ -23,6 +23,7 @@ import time
 import urllib.parse
 import webbrowser
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, ClassVar
@@ -34,12 +35,13 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.7.0 "
+    "OrcaSlicer-Model-Search-Plugin/0.7.1 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 _MAX_REDIRECTS = 5
+_DETAIL_PREFETCH_WORKERS = 4
 
 LICENSE_DESCRIPTIONS = {
     "CC BY": "Share and adapt for any purpose. Must credit the author.",
@@ -2320,8 +2322,8 @@ class ThingiverseSearcher:
         results = [_thingiverse_result(item) for item in items]
         for result in results:
             # Search hits are intentionally compact and omit the license and
-            # complete counters. Load them from /things/{id} only when the user
-            # opens a card, avoiding one API request per search result.
+            # complete counters. The search coordinator hydrates unknown
+            # licenses in a bounded background worker pool.
             result["_details_available"] = True
             result["_details_loaded"] = False
         total = payload.get("total") if isinstance(payload, dict) else None
@@ -3289,7 +3291,7 @@ function prefetchMakerWorld(m){if(!m||platformKey(m.platform)!=='makerworld')ret
 function openModelDetail(m){var load=m._details_available&&!m._details_loaded&&!m._details_loading;if(load)m._details_loading=true;showDetail(m,true);prefetchMakerWorld(m);if(load)orca.postMessage({action:'model_details',model:m})}
 $('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)openModelDetail(m)});
 function showDetail(m,open){selectedModel=m;var loading=!!m._details_loading;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-metrics').innerHTML=metricText(m)?'<strong>Metrics:</strong> '+esc(metricText(m)):'';$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(loading?'Loading...':(m.license||'Unknown'))+'</span>';$('det-summary').textContent=loading?'Loading the official license and complete metrics...':(m.license_summary||'No license information available.');var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=m.result_type==='search_link';b.textContent=m.result_type==='search_link'?'Browser search only':(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
-function applyModelDetails(m){m._details_loading=false;var idx=-1;for(var i=0;i<(window._results||[]).length;i++){if(modelIdentity(window._results[i])===modelIdentity(m)){idx=i;break}}if(idx>=0){window._results[idx]=m;renderResults(window._results,false)}if(selectedModel&&modelIdentity(selectedModel)===modelIdentity(m))showDetail(m,false);if(m._details_error)$('status').textContent='Could not load model details: '+m._details_error}
+function applyModelDetails(m,silent){m._details_loading=false;var idx=-1;for(var i=0;i<(window._results||[]).length;i++){if(modelIdentity(window._results[i])===modelIdentity(m)){idx=i;break}}if(idx>=0){window._results[idx]=m;renderResults(window._results,false)}if(selectedModel&&modelIdentity(selectedModel)===modelIdentity(m))showDetail(m,false);if(m._details_error&&!silent)$('status').textContent='Could not load model details: '+m._details_error}
 function closeDetail(){$('detail').classList.remove('active')}
 document.addEventListener('pointerdown',function(e){var d=$('detail');if(!d||!d.classList.contains('active'))return;if(d.contains(e.target))return;closeDetail()},true);
 $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;e.preventDefault();openExternal(a.getAttribute('href'))});
@@ -3324,7 +3326,7 @@ orca.onMessage(function(msg){
   if(msg.action==='results'){
     searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[],msg.append?false:true);renderSourceResults(msg.sources||[],msg.can_load_more);
   }else if(msg.action==='model_details'){
-    applyModelDetails(msg.model||{});
+    applyModelDetails(msg.model||{},!!msg.background);
   }else if(msg.action==='auth_status'||msg.action==='auth_changed'){
     updateAuth(msg.states||{});$('auth-submit').disabled=false;
     if(msg.action==='auth_changed'){
@@ -3392,6 +3394,8 @@ if orca is not None:
             self._search_results = []
             self._search_pages = {}
             self._search_stats = {}
+            self._detail_prefetch_lock = threading.RLock()
+            self._detail_prefetch_inflight = set()
 
         def get_name(self):
             return "Search 3D Models"
@@ -3626,6 +3630,91 @@ if orca is not None:
                 "can_load_more": any(source.get("has_more") for source in sources),
             }
 
+        def _prepare_thingiverse_prefetch(self, results, generation):
+            candidates = []
+            with self._detail_prefetch_lock:
+                for item in results:
+                    if item.get("_platform_key") != "thingiverse":
+                        continue
+                    license_name = str(item.get("license") or "").strip().casefold()
+                    if license_name not in ("", "unknown"):
+                        continue
+                    if item.get("_details_loaded"):
+                        continue
+                    key = (generation, _result_identity(item))
+                    if key in self._detail_prefetch_inflight:
+                        continue
+                    self._detail_prefetch_inflight.add(key)
+                    item["_details_loading"] = True
+                    candidates.append(dict(item))
+            return candidates
+
+        def _release_detail_prefetch(self, generation, candidates):
+            with self._detail_prefetch_lock:
+                for model in candidates:
+                    self._detail_prefetch_inflight.discard(
+                        (generation, _result_identity(model))
+                    )
+
+        def _load_model_details(self, model):
+            result = dict(model)
+            spec = _platform_for_model(model)
+            loader = getattr(spec.adapter, "get_details", None) if spec else None
+            if not callable(loader):
+                result["_details_loaded"] = True
+            else:
+                try:
+                    loaded = loader(model, self.auth)
+                    if not isinstance(loaded, dict):
+                        raise TypeError("Model detail loader returned invalid data")
+                    result = loaded
+                except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+                    result["_details_loaded"] = True
+                    result["_details_error"] = str(exc)
+            result["_details_loading"] = False
+            return result
+
+        def _cache_model_details(self, result, generation=None):
+            identity = _result_identity(result)
+            with self._search_lock:
+                if generation is not None and generation != self._search_generation:
+                    return False
+                for index, item in enumerate(self._search_results):
+                    if _result_identity(item) == identity:
+                        self._search_results[index] = dict(result)
+                        return True
+            return False
+
+        def _prefetch_thingiverse_details(self, generation, candidates):
+            with ThreadPoolExecutor(max_workers=_DETAIL_PREFETCH_WORKERS) as executor:
+                futures = {
+                    executor.submit(self._load_model_details, model): model
+                    for model in candidates
+                }
+                for future in as_completed(futures):
+                    model = futures[future]
+                    try:
+                        result = future.result()
+                    except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                        result = dict(model)
+                        result["_details_loaded"] = False
+                        result["_details_loading"] = False
+                    key = (generation, _result_identity(model))
+                    with self._detail_prefetch_lock:
+                        self._detail_prefetch_inflight.discard(key)
+                    if result.get("_details_error"):
+                        result = dict(model)
+                        result["_details_loaded"] = False
+                        result["_details_loading"] = False
+                    if self._cache_model_details(result, generation):
+                        self._post(
+                            {
+                                "action": "model_details",
+                                "model": result,
+                                "background": True,
+                            }
+                        )
+
         def _do_search(self, msg, generation):
             query = str(msg.get("query") or "").strip()
             options = msg.get("options") if isinstance(msg.get("options"), dict) else {}
@@ -3671,8 +3760,12 @@ if orca is not None:
                         "paginated": spec.paginated_search,
                         "error": str(exc),
                     }
+            detail_candidates = self._prepare_thingiverse_prefetch(
+                results, generation
+            )
             with self._search_lock:
                 if generation != self._search_generation:
+                    self._release_detail_prefetch(generation, detail_candidates)
                     return
                 self._search_query = query
                 self._search_platforms = platforms
@@ -3682,6 +3775,12 @@ if orca is not None:
                 self._search_stats = stats
                 self._search_loading_more = False
             self._post(self._search_payload(append=False))
+            if detail_candidates:
+                self._start(
+                    self._prefetch_thingiverse_details,
+                    generation,
+                    detail_candidates,
+                )
 
         def _do_search_more(self, generation):
             with self._search_lock:
@@ -3719,37 +3818,28 @@ if orca is not None:
                 except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
                     source["error"] = str(exc)
                 stats[key] = source
+            detail_candidates = self._prepare_thingiverse_prefetch(
+                results, generation
+            )
             with self._search_lock:
                 if generation != self._search_generation:
+                    self._release_detail_prefetch(generation, detail_candidates)
                     return
                 self._search_results = results
                 self._search_pages = pages
                 self._search_stats = stats
                 self._search_loading_more = False
             self._post(self._search_payload(append=True))
+            if detail_candidates:
+                self._start(
+                    self._prefetch_thingiverse_details,
+                    generation,
+                    detail_candidates,
+                )
 
         def _do_model_details(self, model):
-            result = dict(model)
-            spec = _platform_for_model(model)
-            loader = getattr(spec.adapter, "get_details", None) if spec else None
-            if not callable(loader):
-                result["_details_loaded"] = True
-            else:
-                try:
-                    loaded = loader(model, self.auth)
-                    if not isinstance(loaded, dict):
-                        raise TypeError("Model detail loader returned invalid data")
-                    result = loaded
-                except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-                    result["_details_loaded"] = True
-                    result["_details_error"] = str(exc)
-            result["_details_loading"] = False
-            identity = _result_identity(result)
-            with self._search_lock:
-                for index, item in enumerate(self._search_results):
-                    if _result_identity(item) == identity:
-                        self._search_results[index] = dict(result)
-                        break
+            result = self._load_model_details(model)
+            self._cache_model_details(result)
             self._post({"action": "model_details", "model": result})
 
         def _resolve_import(self, model):

@@ -380,9 +380,12 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertEqual(
             mod._PLATFORMS["makeronline"].login_url,
             "https://cas.anycubic.com/login/oauth/authorize"
-            "?client_id=69ce24b6eaf78e597ac0&response_type=code",
+            "?client_id=69ce24b6eaf78e597ac0&response_type=code"
+            "&redirect_uri=https%3A%2F%2Fwww.makeronline.com%2Fen%2F"
+            "&scope=read&state=ac_maker_online&lang=en",
         )
-        self.assertIn("Browser login alone does not connect this plugin", mod.PAGE)
+        self.assertIn("copy the mo_access_token cookie value", mod.PAGE)
+        self.assertIn("MakerOnline mo_access_token value or Cookie header", mod.PAGE)
 
     def test_every_available_searcher_has_portal_checkbox(self):
         import re
@@ -463,10 +466,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_057(self):
+    def test_version_is_058(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.5.7"', head)
+        self.assertIn('# version = "0.5.8"', head)
 
 
 if __name__ == "__main__":

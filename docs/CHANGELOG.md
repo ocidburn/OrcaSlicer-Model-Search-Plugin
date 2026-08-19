@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.5.8
+
+- Completed MakerOnline's registered OAuth URL with its official redirect URI, `read` scope, state, and language parameters.
+- Added explicit normalization for a copied MakerOnline `mo_access_token` cookie or Cookie header while keeping browser-profile access out of the plugin.
+- Added per-file Printables render thumbnails, file sizes, and enlarged mouse-hover or keyboard-focus previews to the multi-file import picker.
+
 ## 0.5.7
 
 - Updated MakerOnline's official-login button from the old generic user-center page to Anycubic's current `cas.anycubic.com` OAuth authorization endpoint and clarified that the plugin still needs a Slicer Next session import or access token.

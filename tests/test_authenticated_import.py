@@ -100,6 +100,12 @@ class AuthStoreTests(unittest.TestCase):
         self.assertEqual(
             mod.AuthManager.normalize_token("makeronline", "XX-Token: AC123"), "AC123"
         )
+        self.assertEqual(
+            mod.AuthManager.normalize_token(
+                "makeronline", "Cookie: lang=en; mo_access_token=AC456; theme=dark"
+            ),
+            "AC456",
+        )
 
     def test_auth_headers_are_not_sent_to_external_cdn(self):
         with tempfile.TemporaryDirectory() as td:
@@ -166,7 +172,15 @@ class ResolverTests(unittest.TestCase):
                 "data": {
                     "print": {
                         "stls": [
-                            {"id": "789571", "name": "Phone Stand.stl", "fileSize": 42}
+                            {
+                                "id": "789571",
+                                "name": "Phone Stand.stl",
+                                "fileSize": 42,
+                                "filePreviewPath": (
+                                    "media/prints/187125/stls/789571/"
+                                    "phone-stand_preview.png"
+                                ),
+                            }
                         ]
                     }
                 }
@@ -199,7 +213,12 @@ class ResolverTests(unittest.TestCase):
             "https://files.printables.com/canonical/phone-stand.stl",
         )
         self.assertTrue(files[0]["signed"])
+        self.assertEqual(
+            files[0]["preview_url"],
+            "https://media.printables.com/media/prints/187125/stls/789571/phone-stand_preview.png",
+        )
         self.assertNotIn("Phone%20Stand.stl", files[0]["url"])
+        self.assertIn("filePreviewPath", post.call_args_list[0].kwargs["json"]["query"])
         mutation = post.call_args_list[1].kwargs["json"]
         self.assertIn("getDownloadLink", mutation["query"])
         self.assertEqual(

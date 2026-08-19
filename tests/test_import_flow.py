@@ -133,7 +133,12 @@ class MultiFileSelectionTests(unittest.TestCase):
         mod, action = self.make_action()
         model = {"platform": "Printables", "name": "Demo", "requires_auth": False}
         resolver = lambda model, auth: [
-            {"name": "part-a.stl", "url": "https://cdn.example/a.stl"},
+            {
+                "name": "part-a.stl",
+                "url": "https://cdn.example/a.stl",
+                "preview_url": "https://media.printables.com/a.png",
+                "size": 1024,
+            },
             {"name": "part-b.stl", "url": "https://cdn.example/b.stl"},
         ]
         with (
@@ -150,6 +155,11 @@ class MultiFileSelectionTests(unittest.TestCase):
             [x["name"] for x in msg["files"]], ["part-a.stl", "part-b.stl"]
         )
         self.assertEqual([x["index"] for x in msg["files"]], [0, 1])
+        self.assertEqual(
+            msg["files"][0]["preview_url"], "https://media.printables.com/a.png"
+        )
+        self.assertEqual(msg["files"][0]["size"], 1024)
+        self.assertEqual(msg["files"][1]["preview_url"], "")
 
     def test_single_resolved_file_imports_immediately(self):
         mod, action = self.make_action()
@@ -163,7 +173,17 @@ class MultiFileSelectionTests(unittest.TestCase):
         ):
             action._resolve_import(model)
         download.assert_called_once()
-        self.assertEqual(download.call_args.args[1], files)
+        self.assertEqual(
+            download.call_args.args[1],
+            [
+                {
+                    "name": "only.stl",
+                    "url": "https://cdn.example/only.stl",
+                    "preview_url": "",
+                    "size": None,
+                }
+            ],
+        )
 
     def test_only_checked_indices_are_downloaded(self):
         _mod, action = self.make_action()
@@ -188,6 +208,11 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertIn("import_selected", mod.PAGE)
         self.assertIn("Select all", mod.PAGE)
         self.assertIn("Select none", mod.PAGE)
+        self.assertIn('class="file-preview"', mod.PAGE)
+        self.assertIn("f.preview_url", mod.PAGE)
+        self.assertIn('loading="lazy"', mod.PAGE)
+        self.assertIn('onmouseenter="showImagePreview(this)"', mod.PAGE)
+        self.assertIn('onfocus="showImagePreview(this)"', mod.PAGE)
 
     def test_makerworld_import_opens_profile_and_format_picker(self):
         mod, action = self.make_action()
@@ -307,11 +332,11 @@ class MultiFileSelectionTests(unittest.TestCase):
 
     def test_ui_has_enlarged_makerworld_profile_preview(self):
         mod = load_module()
-        self.assertIn('id="mw-image-preview"', mod.PAGE)
-        self.assertIn("showProfilePreview", mod.PAGE)
+        self.assertIn('id="image-preview"', mod.PAGE)
+        self.assertIn("showImagePreview", mod.PAGE)
         self.assertIn("cursor:zoom-in", mod.PAGE)
-        self.assertIn('onmouseenter="showProfilePreview(this)"', mod.PAGE)
-        self.assertIn('onfocus="showProfilePreview(this)"', mod.PAGE)
+        self.assertIn('onmouseenter="showImagePreview(this)"', mod.PAGE)
+        self.assertIn('onfocus="showImagePreview(this)"', mod.PAGE)
 
     def test_detail_import_panel_closes_on_click_outside(self):
         mod = load_module()

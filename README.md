@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.5.7**
+**Current plugin version: v0.5.8**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -37,7 +37,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 - Every authentication card includes a keyboard-accessible help tooltip with portal-specific connection instructions.
 - Passwords are never persisted.
 - Single-file downloads import immediately.
-- Multi-file models show a checkbox list before downloading.
+- Multi-file models show a checkbox list before downloading. Printables files include their individual rendered thumbnail and an enlarged mouse-hover or keyboard-focus preview when the platform provides one.
 - Selecting a MakerWorld result preloads its print-profile metadata and images in the background; the importer reuses that cache.
 - MakerWorld profile thumbnails support an enlarged mouse-hover and keyboard-focus preview.
 - MakerWorld models show their available print profiles and let you choose direct 3MF import or the official browser flow for STL/CAD files.
@@ -78,7 +78,7 @@ A successful search result does not guarantee that the portal allows a direct pr
 - Public search through Printables.
 - No login is required for public model files.
 - The plugin requests every file's canonical temporary URL through Printables' `getDownloadLink` mutation. It never guesses a storage URL from filename capitalization, spaces, or hyphens.
-- Available STL files can be selected and imported into the active OrcaSlicer project.
+- Available STL files can be selected and imported into the active OrcaSlicer project. The picker uses Printables' per-file `filePreviewPath` renders and shows a larger preview on mouse hover or keyboard focus.
 
 ### Thingiverse
 
@@ -138,13 +138,13 @@ Search is public. Import requires an Anycubic/Makeronline access token.
 
 Supported connection methods:
 
-- **Open official login** — opens Anycubic's current `cas.anycubic.com` OAuth authorization page. Completing browser login does not by itself pass the OAuth code back to this plugin.
+- **Open official login** — opens Anycubic's registered MakerOnline OAuth flow with its required `redirect_uri`, `scope=read`, and `state=ac_maker_online` parameters. After the browser returns to MakerOnline, copy the `mo_access_token` cookie value (or its Cookie header), paste it into the plugin, and connect.
 - **Import from Anycubic Slicer Next** — the plugin checks known local Slicer Next configuration locations for an `access_token`.
-- Paste an existing access token from an authenticated Anycubic/Makeronline session.
+- Paste an existing access token from an authenticated Anycubic/Makeronline session. The field accepts a raw token, `mo_access_token=...`, a copied Cookie header, `XX-Token: ...`, or `Authorization: Bearer ...`.
 
 The old direct `api.cloud.anycubic.com` email/password flow is intentionally not used.
 
-If Slicer Next stores the session in an encrypted/unsupported location, paste the token manually.
+MakerOnline completes its OAuth code exchange on the MakerOnline origin and stores the result in `mo_access_token`. OrcaSlicer's plugin UI does not expose the system browser's cookie store, so the plugin deliberately requires an explicit token paste instead of reading browser profiles. If Slicer Next stores the session in an encrypted/unsupported location, use the same explicit token method.
 
 ### Cults3D
 
@@ -384,7 +384,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.5.7 validation gates are:
+The v0.5.8 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

@@ -205,7 +205,15 @@ class BrowserRequired(RuntimeError):
 
 
 class CloudflareChallenge(BrowserRequired):
-    """Cloudflare requires an interactive browser verification step."""
+    """Cloudflare requires an interactive browser verification step.
+
+    `url` is the page a human should open; `host` is the host whose check is
+    failing.  They differ when a site's API lives on its own subdomain.
+    """
+
+    def __init__(self, message, url="", host=""):
+        super().__init__(message, url)
+        self.host = host or _url_host(url)
 
 
 class VerificationRequired(AuthError):
@@ -455,7 +463,14 @@ def _filter_and_sort_results(results, options=None):
 
 
 def _source_stats(
-    spec, *, page=0, total=None, has_more=False, error="", browser_url=""
+    spec,
+    *,
+    page=0,
+    total=None,
+    has_more=False,
+    error="",
+    browser_url="",
+    cloudflare_host="",
 ):
     """Create one search-source status row; loaded is filled after merging."""
     return {
@@ -468,6 +483,7 @@ def _source_stats(
         "paginated": spec.paginated_search,
         "error": error,
         "browser_url": browser_url,
+        "cloudflare_host": cloudflare_host,
     }
 
 
@@ -647,11 +663,151 @@ def _reject_obvious_local_target(url):
         raise ValueError("Refusing a private/local download URL")
 
 
+class CloudflareClearance:
+    """Replay a Cloudflare check that a human completed in their own browser.
+
+    Nothing here solves, answers, or circumvents a challenge.  The user opens
+    the protected page, passes the check themselves, and copies the resulting
+    clearance in.  Cloudflare binds that clearance to the exact browser
+    User-Agent and to the client IP address, so the cookie and the User-Agent
+    are stored and replayed as a pair -- replaying the cookie under a different
+    User-Agent is the usual reason a pasted clearance silently does nothing.
+    """
+
+    COOKIE = "cf_clearance"
+    STORE_KEY = "__cloudflare__"
+
+    def __init__(self, store=None):
+        self.store = store or AuthStore()
+
+    def _records(self):
+        data = self.store.get(self.STORE_KEY)
+        return {
+            str(host): dict(record)
+            for host, record in data.items()
+            if isinstance(record, dict)
+        }
+
+    @staticmethod
+    def normalize_host(target):
+        host = _url_host(target)
+        if host:
+            return host
+        host = str(target or "").strip().lower().strip(".")
+        return host if re.fullmatch(r"[a-z0-9.-]{1,253}", host or "") else ""
+
+    @classmethod
+    def parse_cookie(cls, value):
+        text = str(value or "").strip()
+        if text.lower().startswith("cookie:"):
+            text = text.split(":", 1)[1].strip()
+        match = re.search(r"(?:^|[;\s])cf_clearance=([^;\s]+)", text)
+        if match:
+            return match.group(1).strip()
+        # A bare cookie value is accepted; some other cookie pair is not.
+        return "" if "=" in text or " " in text else text
+
+    def save(self, target, cookie, user_agent):
+        host = self.normalize_host(target)
+        if not host:
+            raise AuthError("A Cloudflare-protected host is required")
+        token = self.parse_cookie(cookie)
+        if not token:
+            raise AuthError(
+                "Paste the cf_clearance cookie from the browser tab that passed "
+                "the check"
+            )
+        agent = " ".join(str(user_agent or "").split())
+        if not agent:
+            raise AuthError(
+                "The browser User-Agent is required: Cloudflare ties the "
+                "clearance to it, so the cookie alone will not be accepted"
+            )
+        record = {
+            "cf_clearance": token,
+            "user_agent": agent,
+            "saved_at": int(time.time()),
+        }
+        records = self._records()
+        records[host] = record
+        self.store.set(self.STORE_KEY, records)
+        return dict(record, host=host)
+
+    def for_url(self, url):
+        """Return the clearance covering this URL's host, if one is stored.
+
+        A clearance saved for a parent domain also covers its subdomains,
+        matching how the browser scopes the cookie it was copied from.
+        """
+        host = _url_host(url)
+        if not host:
+            return {}
+        for candidate, record in self._records().items():
+            if _host_matches(host, (candidate,)):
+                return record
+        return {}
+
+    def apply(self, url, headers):
+        """Pin the stored User-Agent into headers; return cookies for the host."""
+        record = self.for_url(url)
+        token = record.get("cf_clearance") or ""
+        agent = record.get("user_agent") or ""
+        if not token or not agent:
+            return {}
+        # Cloudflare validates the clearance against the agent that earned it.
+        headers["User-Agent"] = agent
+        return {self.COOKIE: token}
+
+    def forget(self, target):
+        host = self.normalize_host(target)
+        records = self._records()
+        removed = [name for name in records if host and _host_matches(host, (name,))]
+        if not removed:
+            return False
+        for name in removed:
+            records.pop(name, None)
+        self.store.set(self.STORE_KEY, records)
+        return True
+
+    def status(self):
+        return [
+            {
+                "host": host,
+                "user_agent": record.get("user_agent", ""),
+                "saved_at": record.get("saved_at"),
+            }
+            for host, record in sorted(self._records().items())
+        ]
+
+
+def _cloudflare_challenge(url, auth=None, detail="", host=""):
+    """Report a challenge, retiring a stored clearance that stopped working."""
+    host = host or _url_host(url)
+    stale = bool(auth is not None and host and auth.clearance.forget(host))
+    if stale:
+        message = (
+            f"The saved Cloudflare verification for {host} is no longer accepted "
+            "and has been removed. A clearance expires after a while and is tied "
+            "to your IP address and browser User-Agent, so it stops working if "
+            "any of those changed. Pass the check again in your browser and add "
+            "the new clearance."
+        )
+    else:
+        message = detail or (
+            f"{host or 'This catalog'} is asking for a Cloudflare browser check. "
+            "Open the page, complete the verification yourself, then add the "
+            "cf_clearance cookie together with your browser User-Agent under "
+            "Cloudflare verification."
+        )
+    return CloudflareChallenge(message, url, host)
+
+
 class AuthManager:
     BAMBU_LOGIN = "https://api.bambulab.com/v1/user-service/user/login"
 
     def __init__(self, store=None):
         self.store = store or AuthStore()
+        self.clearance = CloudflareClearance(self.store)
 
     def credential(self, platform):
         return self.store.get(platform)
@@ -814,6 +970,19 @@ class AuthManager:
                         )
         return session
 
+    def _apply_clearance(self, session, url, headers):
+        """Attach a human-completed Cloudflare clearance for this exact host."""
+        cookies = self.clearance.apply(url, headers)
+        if not cookies:
+            return
+        # Scope to the exact host so a later redirect cannot carry it elsewhere.
+        session.cookies.set(
+            CloudflareClearance.COOKIE,
+            cookies[CloudflareClearance.COOKIE],
+            domain=_url_host(url),
+            path="/",
+        )
+
     def request(self, platform, method, url, session=None, **kwargs):
         """Request a URL while rebuilding scoped auth headers after every redirect."""
         import requests
@@ -833,6 +1002,7 @@ class AuthManager:
             _reject_obvious_local_target(current_url)
             headers = self._request_headers(platform, current_url)
             headers.update(supplied)
+            self._apply_clearance(session, current_url, headers)
             response = session.request(
                 current_method,
                 current_url,
@@ -1179,13 +1349,7 @@ def _fetch_html(url, auth=None, platform="", timeout=30):
             response.close()
             response = request(dict(_STANDARD_BROWSER_HTML_HEADERS))
             if _is_cloudflare_challenge(response):
-                challenged_url = response.url or url
-                raise CloudflareChallenge(
-                    "Cloudflare still requires browser verification after retrying "
-                    "with a standard browser User-Agent. Open the page in your "
-                    "browser and try the search again later.",
-                    challenged_url,
-                )
+                raise _cloudflare_challenge(response.url or url, manager)
         if response.status_code in (401, 403) and _session_recheck(platform):
             display = _display_name(platform)
             raise AuthRequired(
@@ -3177,19 +3341,25 @@ class ThangsSearcher:
         return f"{ThangsSearcher.BASE}/search/{urllib.parse.quote(query, safe='')}?scope=thangs"
 
     @staticmethod
-    def _request(params, query):
+    def _request(params, query, auth=None):
         import requests
 
+        manager = auth if isinstance(auth, AuthManager) else AuthManager()
+
         def request(user_agent):
+            headers = {
+                "User-Agent": user_agent,
+                "Accept": "application/json,text/plain,*/*",
+                "Origin": ThangsSearcher.BASE,
+                "Referer": ThangsSearcher.BASE + "/",
+            }
+            # A stored clearance pins its own User-Agent; that is deliberate.
+            cookies = manager.clearance.apply(ThangsSearcher.SEARCH_URL, headers)
             return requests.get(
                 ThangsSearcher.SEARCH_URL,
                 params=params,
-                headers={
-                    "User-Agent": user_agent,
-                    "Accept": "application/json,text/plain,*/*",
-                    "Origin": ThangsSearcher.BASE,
-                    "Referer": ThangsSearcher.BASE + "/",
-                },
+                headers=headers,
+                cookies=cookies,
                 timeout=30,
             )
 
@@ -3199,9 +3369,17 @@ class ThangsSearcher:
             response = request(_STANDARD_BROWSER_UA)
             if _is_cloudflare_challenge(response):
                 response.close()
-                raise CloudflareChallenge(
-                    "The official Thangs API still requires interactive Cloudflare verification after the standard browser retry.",
+                raise _cloudflare_challenge(
                     ThangsSearcher._browser_url(query),
+                    manager,
+                    host=_url_host(ThangsSearcher.SEARCH_URL),
+                    detail=(
+                        "The official Thangs API is asking for a Cloudflare "
+                        "browser check. Open Thangs, complete the verification "
+                        "yourself, then add the cf_clearance cookie and your "
+                        "browser User-Agent for "
+                        f"{_url_host(ThangsSearcher.SEARCH_URL)}."
+                    ),
                 )
         response.raise_for_status()
         return response.json()
@@ -3225,6 +3403,7 @@ class ThangsSearcher:
                 "sort": api_sort,
             },
             query,
+            context,
         )
         results = [
             _thangs_result(item)
@@ -4432,7 +4611,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 .accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account-head{display:flex;align-items:center;justify-content:space-between;gap:6px}.account strong{display:block;font-size:.86em}.auth-help{width:20px;height:20px;min-width:20px;padding:0!important;border:1px solid var(--orca-border,#666)!important;border-radius:50%!important;background:transparent!important;color:var(--orca-muted,#aaa)!important;font-size:.75em;font-weight:700;line-height:18px}.auth-help:hover,.auth-help:focus{border-color:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent,#4a9eff)!important;outline:none}.auth-tooltip{position:fixed;z-index:80;display:none;width:min(330px,calc(100vw - 24px));padding:9px 11px;border:1px solid var(--orca-border,#666);border-radius:7px;background:var(--orca-bg,#202020);color:var(--orca-fg,#eee);box-shadow:0 5px 20px rgba(0,0,0,.5);font-size:.76em;line-height:1.4;text-align:left;pointer-events:none}.auth-tooltip.active{display:block}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.search-options{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:-4px 0 10px;font-size:.82em}.search-options select{padding:5px 8px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.search-options label{display:flex;align-items:center;gap:5px}.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 6px}.source-head strong{font-size:.9em}.source-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.source-tools button{padding:4px 8px;font-size:.76em}.source-count{font-size:.76em;color:var(--orca-muted,#999)}.platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;margin-bottom:12px}.portal-option{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.84em;color:var(--orca-fg,#eee);cursor:pointer;user-select:none}.portal-option:hover{border-color:var(--orca-accent,#4a9eff)}.portal-option input{margin:0;accent-color:var(--orca-accent,#4a9eff)}
 #results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.result-image{opacity:0;transition:opacity .18s ease}.result-image.loaded{opacity:1}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.metrics{font-size:.72em;color:var(--orca-muted,#999);min-height:1.2em;margin-top:3px}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
 .pagination{display:none;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin:14px 0 4px}.pagination.active{display:flex}.pagination-summary{font-size:.8em;color:var(--orca-muted,#999);margin-right:4px}.pagination label{display:flex;align-items:center;gap:5px;font-size:.8em;color:var(--orca-muted,#999)}.pagination select{padding:5px 7px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.page-numbers{display:flex;align-items:center;gap:4px}.page-button{min-width:34px;padding:6px 8px}.page-button.current{background:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent-fg,#fff)!important;border-color:var(--orca-accent,#4a9eff)!important}.page-ellipsis{padding:0 2px;color:var(--orca-muted,#999)}
-.source-results{display:none;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px;margin:0 0 12px}.source-results.active{display:grid}.source-result{padding:7px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.75em}.source-result strong,.source-result span,.source-result small{display:block}.source-result span{color:var(--orca-muted,#999);margin-top:2px}.source-result small{color:#e78b8b;margin-top:3px;overflow-wrap:anywhere}.source-browser{margin-top:7px;padding:4px 8px;font-size:1em}.load-more-row{display:none;justify-content:center;margin:10px 0 4px}.load-more-row.active{display:flex}.load-more-row button{min-width:220px}
+.source-results{display:none;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px;margin:0 0 12px}.source-results.active{display:grid}.source-result{padding:7px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.75em}.source-result strong,.source-result span,.source-result small{display:block}.source-result span{color:var(--orca-muted,#999);margin-top:2px}.source-result small{color:#e78b8b;margin-top:3px;overflow-wrap:anywhere}.source-browser{margin-top:7px;padding:4px 8px;font-size:1em}.load-more-row{display:none;justify-content:center;margin:10px 0 4px}.load-more-row.active{display:flex}.load-more-row button{min-width:220px}.cf-list{margin:8px 0 2px;font-size:.76em}.cf-head{color:var(--orca-muted,#999);margin-bottom:4px}.cf-row{display:flex;gap:8px;align-items:baseline;padding:3px 0;border-top:1px solid var(--orca-border,#3a3a3a)}.cf-row strong{flex:0 0 auto}.cf-row span{color:var(--orca-muted,#999);overflow-wrap:anywhere}.source-verify{margin-top:7px;margin-left:6px;padding:4px 8px;font-size:1em}
 .panel{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(650px,calc(100% - 32px));max-height:70vh;overflow:auto;z-index:20;padding:14px 34px 14px 14px;border:1px solid var(--orca-border,#444);border-radius:8px;background:var(--orca-bg,#1e1e1e);box-shadow:0 6px 28px rgba(0,0,0,.55);display:none}.panel.active{display:block}.close{position:absolute;right:8px;top:6px;background:none!important;font-size:1.35em;padding:2px 6px}.panel p{font-size:.86em;color:var(--orca-muted,#aaa);margin:6px 0}.panel a{color:var(--orca-accent,#4a9eff)}.responsibility{border-left:3px solid var(--orca-border,#444);padding:8px 10px;margin:10px 0;font-size:.78em;color:var(--orca-muted,#888)}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.file-modal{width:min(700px,calc(100% - 32px))}.file-list{max-height:46vh;overflow:auto;border:1px solid var(--orca-border,#555);border-radius:6px;margin:10px 0}.file-choice{display:grid;grid-template-columns:auto 96px minmax(0,1fr);align-items:center;gap:10px;padding:9px 10px;border-bottom:1px solid var(--orca-border,#444);cursor:pointer}.file-choice:last-child{border-bottom:0}.file-choice:has(input:checked){background:rgba(74,158,255,.06)}.file-choice input{margin:0}.file-preview,.file-preview-placeholder{width:96px;height:76px;border-radius:5px;background:#333}.file-preview{object-fit:cover;cursor:zoom-in}.file-preview:focus,.mw-cover:focus{outline:2px solid var(--orca-accent,#4a9eff);outline-offset:2px}.file-preview-placeholder{display:flex;align-items:center;justify-content:center;color:var(--orca-muted,#888);font-size:.7em}.file-details{min-width:0}.file-name{display:block;overflow-wrap:anywhere;font-weight:600;font-size:.86em}.file-meta{display:block;color:var(--orca-muted,#999);font-size:.75em;margin-top:4px}.file-tools{display:flex;gap:7px;margin:8px 0}.file-count{font-size:.8em;color:var(--orca-muted,#999)}.makerworld-modal{width:min(700px,calc(100% - 32px))}.mw-profiles{max-height:42vh;overflow:auto;margin:10px 0}.mw-profile{display:grid;grid-template-columns:auto 88px 1fr;gap:10px;align-items:center;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;margin:7px 0;cursor:pointer}.mw-profile:has(input:checked){border-color:var(--orca-accent,#4a9eff);background:rgba(74,158,255,.08)}.mw-profile input{margin:0}.mw-cover{width:88px;height:68px;object-fit:cover;border-radius:5px;background:#333;cursor:zoom-in}.image-preview{position:fixed;z-index:70;display:none;width:min(420px,55vw);max-height:65vh;object-fit:contain;border:1px solid var(--orca-border,#666);border-radius:8px;background:#222;box-shadow:0 8px 30px rgba(0,0,0,.7);pointer-events:none}.image-preview.active{display:block}.mw-title{display:block;font-weight:600;font-size:.88em}.mw-summary{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:.78em;line-height:1.3;margin-top:3px}.mw-meta{display:block;font-size:.75em;color:var(--orca-muted,#aaa);margin-top:4px}.mw-formats{display:grid;gap:7px;margin:10px 0}.mw-format{display:flex;gap:9px;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;cursor:pointer}.mw-format:has(input:checked){border-color:var(--orca-accent,#4a9eff)}.mw-format small{display:block;color:var(--orca-muted,#aaa);margin-top:2px}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
 @media(max-width:680px){.accounts{grid-template-columns:1fr}}
@@ -4487,6 +4666,15 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
   <div class="field"><label id="token-label">Session/access token (alternative)</label><input id="auth-token" type="password" autocomplete="off"></div>
   <div class="button-row"><button id="auth-submit" onclick="submitAuth()">Connect</button><button id="official-login" class="secondary" onclick="openOfficialLogin()">Open official login</button><button id="import-anycubic" class="secondary" style="display:none" onclick="importAnycubic()">Import from Anycubic Slicer Next</button><button id="auth-logout" class="danger" onclick="logoutAuth()">Forget session</button><button class="secondary" onclick="closeAuth()">Cancel</button></div>
 </div>
+<div id="cloudflare-modal" class="auth-modal">
+  <h2 style="margin:0 0 5px;font-size:1.05em">Cloudflare verification</h2>
+  <div class="auth-note">Some catalogs put a Cloudflare check in front of their pages. This plugin does not answer that check for you. Open the site, pass the verification yourself, then copy the resulting <code>cf_clearance</code> cookie and the exact User-Agent of that browser here, so the plugin's requests are recognised as the same verified browser. Cloudflare ties a clearance to your IP address and to that User-Agent, and retires it after a while &mdash; when it stops working the plugin discards it and asks again.</div>
+  <div class="field"><label>Protected host</label><input id="cf-host" autocomplete="off" placeholder="example.com"></div>
+  <div class="field"><label>cf_clearance cookie value (or a Cookie header containing it)</label><input id="cf-cookie" type="password" autocomplete="off"></div>
+  <div class="field"><label>User-Agent of the browser that passed the check</label><input id="cf-agent" autocomplete="off" placeholder="Copy from that browser &mdash; not from this window"></div>
+  <div id="cf-list" class="cf-list"></div>
+  <div class="button-row"><button id="cf-submit" onclick="submitCloudflare()">Save verification</button><button id="cf-open" class="secondary" onclick="openCloudflareSite()">Open the page</button><button id="cf-forget" class="danger" onclick="forgetCloudflare()">Forget host</button><button class="secondary" onclick="closeCloudflare()">Cancel</button></div>
+</div>
 <div id="file-modal" class="auth-modal file-modal">
   <h2 style="margin:0 0 5px;font-size:1.05em">Choose files to import</h2>
   <div class="auth-note">This model contains multiple downloadable files. Select the files that should be downloaded and added to the current OrcaSlicer project.</div>
@@ -4534,8 +4722,8 @@ function renderResultPage(){var total=window._results.length,pages=Math.max(1,Ma
 function renderResults(models,resetPage){window._results=models||[];if(resetPage!==false)currentPage=1;renderResultPage()}
 function setResultPage(page){var pages=Math.max(1,Math.ceil(window._results.length/pageSize)),next=Math.max(1,Math.min(Number(page)||1,pages));if(next===currentPage)return;currentPage=next;closeDetail();renderResultPage();$('results').scrollIntoView({behavior:'smooth',block:'start'})}
 function changePageSize(){var value=parseInt($('page-size').value,10);pageSize=[100,150,200,250,300].indexOf(value)>=0?value:100;currentPage=1;closeDetail();renderResultPage()}
-function renderSourceResults(sources,more){var html='',moreCount=0;(sources||[]).forEach(function(s){var loaded=Number(s.loaded)||0,visible=Number(s.visible)||0,parts=[],browserUrl=safeUrl(s.browser_url);if(s.total!=null)parts.push(loaded+' of '+Number(s.total)+' loaded');else parts.push(loaded+' loaded');if(visible!==loaded)parts.push(visible+' shown by filters');if(s.has_more){parts.push('more available');moreCount++}else if(!s.error){parts.push(s.paginated?'complete':'first page only')}html+='<div class="source-result'+(s.error?' error':'')+'"><strong>'+esc(s.display||s.key)+'</strong><span>'+esc(parts.join(' · '))+'</span>'+(s.error?'<small>'+esc(s.error)+'</small>':'')+(browserUrl?'<button type="button" class="secondary source-browser" data-url="'+esc(browserUrl)+'">Open in browser</button>':'')+'</div>'});$('source-results').innerHTML=html;$('source-results').classList.toggle('active',!!html);canLoadMore=!!more&&moreCount>0;$('load-more-row').classList.toggle('active',canLoadMore);$('load-more').disabled=false;$('load-more').textContent=moreCount===1?'Load next page from 1 portal':'Load next pages from '+moreCount+' portals'}
-$('source-results').addEventListener('click',function(e){var button=e.target.closest&&e.target.closest('.source-browser');if(button)openExternal(button.dataset.url)});
+function renderSourceResults(sources,more){var html='',moreCount=0;(sources||[]).forEach(function(s){var loaded=Number(s.loaded)||0,visible=Number(s.visible)||0,parts=[],browserUrl=safeUrl(s.browser_url);if(s.total!=null)parts.push(loaded+' of '+Number(s.total)+' loaded');else parts.push(loaded+' loaded');if(visible!==loaded)parts.push(visible+' shown by filters');if(s.has_more){parts.push('more available');moreCount++}else if(!s.error){parts.push(s.paginated?'complete':'first page only')}html+='<div class="source-result'+(s.error?' error':'')+'"><strong>'+esc(s.display||s.key)+'</strong><span>'+esc(parts.join(' · '))+'</span>'+(s.error?'<small>'+esc(s.error)+'</small>':'')+(browserUrl?'<button type="button" class="secondary source-browser" data-url="'+esc(browserUrl)+'">Open in browser</button>':'')+(s.cloudflare_host?'<button type="button" class="secondary source-verify" data-host="'+esc(s.cloudflare_host)+'" data-url="'+esc(browserUrl)+'">Add Cloudflare verification</button>':'')+'</div>'});$('source-results').innerHTML=html;$('source-results').classList.toggle('active',!!html);canLoadMore=!!more&&moreCount>0;$('load-more-row').classList.toggle('active',canLoadMore);$('load-more').disabled=false;$('load-more').textContent=moreCount===1?'Load next page from 1 portal':'Load next pages from '+moreCount+' portals'}
+$('source-results').addEventListener('click',function(e){if(!e.target.closest)return;var verify=e.target.closest('.source-verify');if(verify){openCloudflare(verify.dataset.host,verify.dataset.url);return}var button=e.target.closest('.source-browser');if(button)openExternal(button.dataset.url)});
 function loadMoreResults(){if(searching||!canLoadMore)return;searching=true;$('search-btn').disabled=true;$('load-more').disabled=true;$('load-more').textContent='Loading...';$('status').textContent='Loading next portal pages...';orca.postMessage({action:'search_more'})}
 function modelIdentity(m){return String((m&&m._platform_key)||platformKey(m&&m.platform)||'')+'|'+String((m&&m._thing_id)||(m&&m._model_id)||(m&&m.url)||'')}
 function preloadMakerWorldImages(key,profiles){var images=[];(profiles||[]).forEach(function(p){var url=safeUrl(p.cover);if(!url)return;var img=new Image();img.decoding='async';img.src=url;images.push(img)});makerWorldPreloadedImages[key]=images}
@@ -4550,14 +4738,21 @@ document.addEventListener('pointerdown',function(e){var d=$('detail');if(!d||!d.
 $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;e.preventDefault();openExternal(a.getAttribute('href'))});
 function licenseClass(l){if(/CC|Creative Commons|CC0|Public Domain/i.test(l||''))return'license-cc';if(/All Rights Reserved|Standard Digital|Exclusive/i.test(l||''))return'license-arr';return''}
 function openExternal(url){orca.postMessage({action:'open_external',url:url})}
+var cloudflareUrl='';
+function renderCloudflare(list){var rows='';(list||[]).forEach(function(c){rows+='<div class="cf-row"><strong>'+esc(c.host)+'</strong><span>'+esc(String(c.user_agent||'').slice(0,90))+'</span></div>'});$('cf-list').innerHTML=rows?('<div class="cf-head">Stored verifications</div>'+rows):'<div class="cf-head">No verification stored yet.</div>'}
+function openCloudflare(host,url){cloudflareUrl=safeUrl(url)||'';$('cf-host').value=host||'';$('cf-cookie').value='';$('cf-agent').value='';$('cf-submit').disabled=false;$('cloudflare-modal').classList.add('active');$('modal-bg').classList.add('active');$('cf-open').style.display=cloudflareUrl?'':'none'}
+function closeCloudflare(){$('cloudflare-modal').classList.remove('active');$('cf-cookie').value='';syncBackdrop()}
+function openCloudflareSite(){if(cloudflareUrl)openExternal(cloudflareUrl)}
+function submitCloudflare(){var host=$('cf-host').value.trim(),cookie=$('cf-cookie').value.trim(),agent=$('cf-agent').value.trim();if(!host){$('status').textContent='Enter the Cloudflare-protected host.';return}if(!cookie){$('status').textContent='Paste the cf_clearance cookie from the tab that passed the check.';return}if(!agent){$('status').textContent='The User-Agent is required: Cloudflare ties the clearance to it.';return}orca.postMessage({action:'cloudflare_save',host:host,cookie:cookie,user_agent:agent});$('cf-submit').disabled=true;$('status').textContent='Saving Cloudflare verification...'}
+function forgetCloudflare(){var host=$('cf-host').value.trim();if(!host){$('status').textContent='Enter the host to forget.';return}orca.postMessage({action:'cloudflare_forget',host:host})}
 function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedModel.download_url)}
 function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var platform=platformKey(selectedModel.platform);if(!selectedModel._download_format&&(platform==='makerworld'||platform==='crealitycloud'||platform==='nexprint')){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id,picker_platform:cached.picker_platform});$('status').textContent='Select a '+cached.picker_platform+' print profile and file format.';return}}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
 function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory'||p==='crealitycloud'||p==='thangs');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API',crealitycloud:'Creality Cloud account',thangs:'Thangs account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='makeronline'?'MakerOnline mo_access_token value or Cookie header':p==='crealitycloud'?'Creality model_token value or Cookie header':p==='thangs'?'Thangs Bearer access token':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=AUTH_HELP[p]||'Use the account credentials supplied by the selected platform.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
-function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active')||$('makerworld-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
+function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active')||$('cloudflare-modal').classList.contains('active')||$('makerworld-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
 function closeAuth(){$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
 function closeFilePicker(){$('file-modal').classList.remove('active');hideImagePreview(null,true);pendingFiles=[];syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
 function closeMakerWorldPicker(){$('makerworld-modal').classList.remove('active');hideImagePreview(null,true);pendingMakerWorldModel=null;syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
-function closeTopModal(){if($('file-modal').classList.contains('active'))closeFilePicker();else if($('makerworld-modal').classList.contains('active'))closeMakerWorldPicker();else closeAuth()}
+function closeTopModal(){if($('file-modal').classList.contains('active'))closeFilePicker();else if($('makerworld-modal').classList.contains('active'))closeMakerWorldPicker();else if($('cloudflare-modal').classList.contains('active'))closeCloudflare();else closeAuth()}
 function updateFileCount(){var all=document.querySelectorAll('#file-list input[type=checkbox]');var checked=document.querySelectorAll('#file-list input[type=checkbox]:checked');$('file-count').textContent=checked.length+' / '+all.length+' selected';$('file-import').disabled=checked.length===0}
 function formatBytes(v){v=Number(v);if(!isFinite(v)||v<0)return'';var units=['B','KB','MB','GB'],i=0;while(v>=1024&&i<units.length-1){v/=1024;i++}return(v>=10||i===0?Math.round(v):Math.round(v*10)/10)+' '+units[i]}
 function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){var name=f.name||('File '+(Number(f.index)+1)),image=safeUrl(f.preview_url),preview=image?'<img class="file-preview" src="'+esc(image)+'" loading="lazy" decoding="async" alt="'+esc(name)+' preview" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="file-preview-placeholder">No preview</span>',meta=formatBytes(f.size);html+='<label class="file-choice"><input type="checkbox" checked value="'+Number(f.index)+'" onchange="updateFileCount()">'+preview+'<span class="file-details"><span class="file-name">'+esc(name)+'</span>'+(meta?'<span class="file-meta">'+esc(meta)+'</span>':'')+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
@@ -4580,8 +4775,11 @@ orca.onMessage(function(msg){
     searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[],msg.append?false:true);renderSourceResults(msg.sources||[],msg.can_load_more);
   }else if(msg.action==='model_details'){
     applyModelDetails(msg.model||{},!!msg.background);
+  }else if(msg.action==='cloudflare_required'){
+    $('status').textContent=msg.message||'Cloudflare verification is required.';openCloudflare(msg.host||'',msg.url||'');
   }else if(msg.action==='auth_status'||msg.action==='auth_changed'){
-    updateAuth(msg.states||{});$('auth-submit').disabled=false;
+    updateAuth(msg.states||{});renderCloudflare(msg.cloudflare);$('auth-submit').disabled=false;$('cf-submit').disabled=false;
+    if($('cloudflare-modal').classList.contains('active')&&msg.action==='auth_changed')closeCloudflare();
     if(msg.action==='auth_changed'){
       closeAuth();$('status').textContent=msg.message||'Account session updated.';
       if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}
@@ -4687,7 +4885,12 @@ if orca is not None:
 
         def _post_auth(self, action="auth_status", message=""):
             self._post(
-                {"action": action, "states": self.auth.status(), "message": message}
+                {
+                    "action": action,
+                    "states": self.auth.status(),
+                    "cloudflare": self.auth.clearance.status(),
+                    "message": message,
+                }
             )
 
         @staticmethod
@@ -4710,6 +4913,8 @@ if orca is not None:
                 "auth_logout": self._handle_auth_logout,
                 "auth_open_login": self._handle_auth_open_login,
                 "auth_import_anycubic": self._handle_auth_import_anycubic,
+                "cloudflare_save": self._handle_cloudflare_save,
+                "cloudflare_forget": self._handle_cloudflare_forget,
             }.get(msg.get("action", ""))
             if handler is not None:
                 handler(msg)
@@ -4775,6 +4980,40 @@ if orca is not None:
 
         def _handle_auth_import_anycubic(self, _msg):
             self._start(self._do_import_anycubic)
+
+        def _handle_cloudflare_save(self, msg):
+            self._start(self._do_cloudflare_save, msg)
+
+        def _handle_cloudflare_forget(self, msg):
+            host = CloudflareClearance.normalize_host(msg.get("host") or "")
+            removed = self.auth.clearance.forget(host) if host else False
+            self._post_auth(
+                "auth_changed",
+                f"Cloudflare verification for {host} removed."
+                if removed
+                else "No stored Cloudflare verification matched that host.",
+            )
+
+        def _do_cloudflare_save(self, msg):
+            """Store a clearance the user obtained by passing the check itself."""
+            try:
+                record = self.auth.clearance.save(
+                    msg.get("host") or msg.get("url") or "",
+                    msg.get("cookie") or "",
+                    msg.get("user_agent") or "",
+                )
+            except (AuthError, OSError, ValueError) as exc:
+                self._post({"action": "error", "message": str(exc)})
+                return
+            finally:
+                # The clearance is a session secret; drop the inbound copy.
+                msg.pop("cookie", None)
+            self._post_auth(
+                "auth_changed",
+                f"Cloudflare verification stored for {record['host']}. "
+                "It expires on Cloudflare's schedule and is tied to this "
+                "machine's IP address and the User-Agent you supplied.",
+            )
 
         @staticmethod
         def _token_login_error(platform):
@@ -4876,7 +5115,12 @@ if orca is not None:
             except BrowserRequired as exc:
                 return (
                     None,
-                    _source_stats(spec, error=str(exc), browser_url=exc.url),
+                    _source_stats(
+                        spec,
+                        error=str(exc),
+                        browser_url=exc.url,
+                        cloudflare_host=getattr(exc, "host", ""),
+                    ),
                     True,
                 )
             except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
@@ -5357,6 +5601,16 @@ if orca is not None:
                         "platform": spec.key,
                         "message": str(exc),
                         "model": model,
+                    }
+                )
+                return None
+            except CloudflareChallenge as exc:
+                self._post(
+                    {
+                        "action": "cloudflare_required",
+                        "message": str(exc),
+                        "url": exc.url or model.get("url", ""),
+                        "host": exc.host,
                     }
                 )
                 return None

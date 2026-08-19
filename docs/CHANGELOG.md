@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Added a Cloudflare verification hand-off. The plugin does not solve or bypass
+  a challenge; the user passes it in their own browser and the resulting
+  `cf_clearance` cookie is replayed together with the User-Agent it is bound to.
+- Cloudflare challenges now report the host that is actually blocked, which can
+  differ from the page a human should open: Thangs serves search from
+  `production-api.thangs.com` while the check is passed on `thangs.com`.
+- A stored clearance that stops being accepted is discarded with an explanation
+  (expiry, IP change, or User-Agent mismatch) instead of being retried.
+- Clearance cookies are scoped to the host they were earned on, so a redirect
+  cannot carry them to a CDN or any other host, and the pinned User-Agent
+  applies only to requests for that host.
+- Blocked search sources expose an **Add Cloudflare verification** action, and
+  the import path reports `cloudflare_required` separately from other
+  browser-only flows.
+
 ## 0.8.8
 
 - Increased the default client-side result page size to 100 cards and replaced

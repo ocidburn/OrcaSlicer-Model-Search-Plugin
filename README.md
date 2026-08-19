@@ -316,7 +316,44 @@ Typical OrcaSlicer data directories:
 - Linux: `~/.config/OrcaSlicer`
 - macOS: `~/Library/Application Support/OrcaSlicer`
 
-The auth store writes tokens/session values only. Password-like fields are stripped before persistence.
+The auth store writes tokens/session values only. Password-like fields are stripped before persistence. Cloudflare clearances are kept in the same file, keyed by host, alongside the User-Agent they are bound to.
+
+## Cloudflare verification
+
+Some catalogs put a Cloudflare browser check in front of their pages. **The
+plugin does not solve, answer, or work around that check.** It hands the check
+back to you and can then reuse the result.
+
+When a search or import is blocked, the plugin names the host that is asking
+and offers **Add Cloudflare verification**. The flow is:
+
+1. Open the page in your own browser and pass the check yourself.
+2. In that same tab, copy the `cf_clearance` cookie value (a full `Cookie`
+   header containing it is also accepted).
+3. Copy that browser's `User-Agent` string.
+4. Paste the host, the cookie, and the User-Agent into the panel and save.
+
+Both halves are required. Cloudflare binds a clearance to the exact User-Agent
+that earned it, so the cookie on its own is refused - that mismatch is the
+usual reason a pasted clearance appears to do nothing. The panel deliberately
+does **not** prefill the User-Agent from the plugin window, because the
+embedded webview is not the browser that passed the check.
+
+What to expect:
+
+- A clearance is tied to your current IP address and expires on Cloudflare's
+  own schedule. Changing network, or simply waiting long enough, invalidates it.
+- When a stored clearance stops being accepted, the plugin discards it and says
+  so instead of retrying a dead session.
+- A clearance saved for a domain also covers its subdomains, matching how the
+  browser scopes the cookie. This matters for catalogs whose API lives
+  elsewhere: Thangs serves search from `production-api.thangs.com`, so a
+  clearance saved for `thangs.com` covers it.
+- The cookie is attached only to the host it was saved for. Redirects to a CDN
+  or any other host never carry it.
+
+Stored verifications live in the same `sessions.json` as portal sessions and
+can be removed from the panel with **Forget host**.
 
 ## Security behavior
 

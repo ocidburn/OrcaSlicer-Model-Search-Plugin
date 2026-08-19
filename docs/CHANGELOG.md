@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.8.9
+
+- Added an enlarged mouse-hover and keyboard-focus preview to every search-result
+  thumbnail while preserving intersection-based lazy loading.
+
 - Added a browser sign-in hand-off. **Sign in in browser** opens the portal's
   login together with a short finish page served on loopback, so a session
   reaches OrcaSlicer without switching windows and retyping. The plugin still

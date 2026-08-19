@@ -422,6 +422,16 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertIn("IntersectionObserver", mod.PAGE)
         self.assertIn("rootMargin:'240px 0px'", mod.PAGE)
 
+    def test_ui_previews_every_search_result_image(self):
+        mod = load_module()
+        self.assertIn('class="result-image"', mod.PAGE)
+        self.assertIn('tabindex="0" onmouseenter="showImagePreview(this)"', mod.PAGE)
+        self.assertIn('onmouseleave="hideImagePreview(this)"', mod.PAGE)
+        self.assertIn('onfocus="showImagePreview(this)"', mod.PAGE)
+        self.assertIn('onblur="hideImagePreview(this)"', mod.PAGE)
+        self.assertIn("source.dataset&&source.dataset.src", mod.PAGE)
+        self.assertIn("loadResultImage(source)", mod.PAGE)
+
     def test_ui_prefetches_makerworld_profiles_and_images(self):
         mod = load_module()
         self.assertIn("prefetch_profile_choices", mod.PAGE)

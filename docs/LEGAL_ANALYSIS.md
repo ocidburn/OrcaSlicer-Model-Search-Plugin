@@ -31,11 +31,15 @@ authoritative source.
 | GrabCAD | Member HTML catalog | User browser cookies | Member download rules preserved |
 | Thingiverse | Official API | Personal developer access token | Official files API |
 | MyMiniFactory | Documented API v2 | Personal API key | API-key metadata; OAuth/store downloads stay in browser |
+| Yeggi | Pre-filled official browser search | Browser interaction | Meta-search; original portal owns the file flow |
+| STLFinder | Public indexed model pages | Original portal credential, when required | Delegates only to a registered original portal |
 | Creality Cloud | Current public model-tag pages | None for search | Direct public file when exposed; otherwise browser |
+| Smithsonian 3D | Public Smithsonian file API | None | Public STL ZIP resource |
+| NASA 3D Resources | Official NASA GitHub mirror | None | Canonical public STL/3MF raw files |
+| NIH 3D | Public Discover application | None | Validated public file when exposed; otherwise browser |
 | YouMagine | Current public HTML search | None | Validated public file when exposed; otherwise browser |
-| Pinshape | Current public HTML search | None for search | Official browser download flow |
+| Pinshape | Current public HTML search | None | Validated public STL when exposed; otherwise browser |
 | Thangs | Pre-filled official browser search | Browser interaction | Browser only |
-| CGTrader | Pre-filled official browser search | Browser interaction | Browser only |
 
 Undocumented public web endpoints can change without notice. Their use here is
 limited to the same search metadata exposed to an ordinary visitor; the plugin

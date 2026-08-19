@@ -4,9 +4,9 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "3D Model Search Engine"
-# description = "Search, sort, and import 3D-printable models from community model portals."
+# description = "Search, sort, and import 3D-printable models from community and public institutional catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.7.2"
+# version = "0.8.0"
 # ///
 
 import html
@@ -35,7 +35,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.7.2 "
+    "OrcaSlicer-Model-Search-Plugin/0.8.0 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _STANDARD_BROWSER_UA = (
@@ -1079,11 +1079,13 @@ def _is_cloudflare_challenge(response):
     headers = response.headers or {}
     if str(headers.get("cf-mitigated") or "").strip().casefold() == "challenge":
         return True
+    sample = str(getattr(response, "text", "") or "")[:20000].casefold()
+    if "challenges.cloudflare.com/turnstile" in sample and "cf-turnstile" in sample:
+        return True
     if response.status_code not in (403, 429, 503):
         return False
     if "cloudflare" not in str(headers.get("server") or "").casefold():
         return False
-    sample = str(getattr(response, "text", "") or "")[:20000].casefold()
     return any(
         marker in sample
         for marker in (
@@ -2646,6 +2648,117 @@ def _browser_search_result(query, platform, url):
     }
 
 
+_INDEXED_SOURCE_HOSTS = (
+    ("thingiverse.com", "thingiverse"),
+    ("printables.com", "printables"),
+    ("prusaprinters.org", "printables"),
+    ("makerworld.com", "makerworld"),
+    ("cults3d.com", "cults3d"),
+    ("myminifactory.com", "myminifactory"),
+    ("crealitycloud.com", "crealitycloud"),
+    ("grabcad.com", "grabcad"),
+    ("youmagine.com", "youmagine"),
+    ("pinshape.com", "pinshape"),
+)
+
+
+def _indexed_source(url):
+    host = _url_host(url)
+    for suffix, key in _INDEXED_SOURCE_HOSTS:
+        if _host_matches(host, (suffix,)):
+            return key
+    return ""
+
+
+def _extract_indexed_source_url(raw, base_url):
+    preferred = []
+    fallback = []
+    for anchor in _parse_catalog_html(raw).anchors:
+        url = urllib.parse.urljoin(base_url, anchor.get("href") or "")
+        if urllib.parse.urlsplit(url).scheme.lower() != "https" or not _indexed_source(
+            url
+        ):
+            continue
+        text = str(anchor.get("text") or anchor.get("title") or "").casefold()
+        target = preferred if "view on" in text else fallback
+        if url not in target:
+            target.append(url)
+    return _first(preferred or fallback, "")
+
+
+def _indexed_model_files(model, auth, index_name):
+    page_url = model.get("url") or model.get("download_url") or ""
+    raw, fetched = _fetch_html(page_url)
+    source_url = _extract_indexed_source_url(raw, fetched)
+    source_key = _indexed_source(source_url)
+    source_spec = _platform(source_key)
+    if source_spec is None:
+        raise BrowserRequired(
+            f"{index_name} does not host model files. Open the indexed model and download it from its original portal.",
+            page_url,
+        )
+    if source_spec.requires_auth and (
+        auth is None or not auth.authenticated(source_spec.key)
+    ):
+        raise BrowserRequired(
+            f"The original {source_spec.display} model requires its account session. Connect that portal or open the original page.",
+            source_url,
+        )
+    source_model = dict(model)
+    source_model.update(
+        {
+            "_platform_key": source_spec.key,
+            "platform": source_spec.display,
+            "url": source_url,
+            "download_url": source_url,
+            "requires_auth": source_spec.requires_auth,
+        }
+    )
+    return source_spec.adapter.get_files(source_model, auth)
+
+
+class YeggiSearcher:
+    BASE = "https://www.yeggi.com"
+
+    @staticmethod
+    def search(query, context, options=None):
+        url = f"{YeggiSearcher.BASE}/q/{urllib.parse.quote(query, safe='')}/"
+        return [_browser_search_result(query, "Yeggi", url)]
+
+    @staticmethod
+    def get_files(model, auth=None):
+        raise BrowserRequired(
+            "Yeggi is a meta-search engine and requires an interactive Turnstile check before opening the original model portal.",
+            model.get("url", ""),
+        )
+
+
+class StlFinderSearcher:
+    BASE = "https://www.stlfinder.com"
+    PATH_RE = r"/model/[a-z0-9%._~+()-]+/\d+"
+
+    @staticmethod
+    def search(query, context, options=None):
+        page = _search_page_number(options)
+        url = (
+            f"{StlFinderSearcher.BASE}/3dmodels/"
+            f"{urllib.parse.quote(query.strip(), safe='')}/"
+        )
+        if page > 1:
+            url += f"?page={page}"
+        raw, final_url = _fetch_html(url)
+        items = _extract_catalog_models(
+            raw, final_url, StlFinderSearcher.PATH_RE, "STLFinder"
+        )
+        for item in items:
+            item["is_free"] = None
+        return SearchPage(items, has_more=len(items) >= 30)
+
+    @staticmethod
+    def get_files(model, auth=None):
+        return _indexed_model_files(model, auth, "STLFinder")
+
+
 class ThangsSearcher:
     BASE = "https://thangs.com"
     @staticmethod
@@ -2722,6 +2835,245 @@ class GrabcadSearcher:
         )
 
 
+class SmithsonianSearcher:
+    API = "https://3d-api.si.edu/api/v1.0/content/file/search"
+
+    @staticmethod
+    def search(query, _context, options=None):
+        import requests
+
+        page = _search_page_number(options)
+        response = requests.get(
+            SmithsonianSearcher.API,
+            params={
+                "q": query,
+                "model_type": "stl",
+                "start": (page - 1) * 30,
+                "rows": 30,
+            },
+            headers={"User-Agent": _BROWSER_UA},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        results = []
+        for item in payload.get("rows") or []:
+            content = item.get("content") or {}
+            direct = content.get("uri") or ""
+            identifier = str(content.get("model_url") or "").split(":", 1)[-1]
+            results.append(
+                {
+                    "name": item.get("title") or "Untitled",
+                    "author": "Smithsonian Institution",
+                    "platform": "Smithsonian 3D",
+                    "thumbnail_url": "",
+                    "license": "Smithsonian Open Access",
+                    "license_url": "https://www.si.edu/openaccess",
+                    "license_summary": "Released through the Smithsonian Open Access initiative.",
+                    "download_url": direct,
+                    "url": (
+                        f"https://3d.si.edu/object/3d/{identifier}"
+                        if identifier
+                        else direct
+                    ),
+                    "_direct_file": direct,
+                    "requires_auth": False,
+                    "direct_import": bool(direct),
+                    "is_free": True,
+                }
+            )
+        total = _number(payload.get("rowCount"), integer=True)
+        return SearchPage(
+            results,
+            total=total,
+            has_more=bool(total is not None and page * 30 < total),
+        )
+
+    @staticmethod
+    def get_files(model, auth=None):
+        url = model.get("_direct_file") or model.get("download_url") or ""
+        if not url:
+            return []
+        name = os.path.basename(urllib.parse.urlsplit(url).path) or "smithsonian.zip"
+        return [{"name": urllib.parse.unquote(name), "url": url}]
+
+
+class NasaSearcher:
+    TREE_API = (
+        "https://api.github.com/repos/nasa/NASA-3D-Resources/git/trees/master"
+        "?recursive=1"
+    )
+    REPO = "https://github.com/nasa/NASA-3D-Resources"
+    RAW = "https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/"
+
+    @staticmethod
+    def search(query, _context, options=None):
+        import requests
+
+        response = requests.get(
+            NasaSearcher.TREE_API,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": _BROWSER_UA,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        terms = [term.casefold() for term in re.findall(r"[\w-]+", query)]
+        results = []
+        for item in response.json().get("tree") or []:
+            path = str(item.get("path") or "")
+            lower = path.casefold()
+            if item.get("type") != "blob" or not lower.endswith((".stl", ".3mf")):
+                continue
+            if terms and not all(term in lower for term in terms):
+                continue
+            quoted = urllib.parse.quote(path, safe="/")
+            direct = NasaSearcher.RAW + quoted
+            results.append(
+                {
+                    "name": os.path.splitext(os.path.basename(path))[0],
+                    "author": "NASA",
+                    "platform": "NASA 3D Resources",
+                    "thumbnail_url": "",
+                    "license": "NASA Media Usage Guidelines",
+                    "license_url": "https://www.nasa.gov/nasa-brand-center/images-and-media/",
+                    "license_summary": "NASA resource; review NASA's media usage guidelines.",
+                    "download_url": direct,
+                    "url": f"{NasaSearcher.REPO}/blob/master/{quoted}",
+                    "_direct_file": direct,
+                    "requires_auth": False,
+                    "direct_import": True,
+                    "is_free": True,
+                }
+            )
+            if len(results) >= 30:
+                break
+        return results
+
+    @staticmethod
+    def get_files(model, auth=None):
+        url = model.get("_direct_file") or model.get("download_url") or ""
+        name = os.path.basename(urllib.parse.urlsplit(url).path) or "nasa_model.stl"
+        return [{"name": urllib.parse.unquote(name), "url": url}] if url else []
+
+
+class Nih3DSearcher:
+    BASE = "https://3d.nih.gov"
+    _server_action: ClassVar[str] = ""
+
+    @classmethod
+    def _discover_search_action(cls, session):
+        if cls._server_action:
+            return cls._server_action
+        page = session.get(cls.BASE + "/discover", timeout=30)
+        page.raise_for_status()
+        paths = re.findall(r'<script[^>]+src="([^"]+)"', page.text, re.IGNORECASE)
+        path = next((value for value in paths if "/discover/page-" in value), "")
+        if not path:
+            raise RuntimeError("NIH 3D discover application script was not found")
+        script = session.get(urllib.parse.urljoin(cls.BASE, path), timeout=30)
+        script.raise_for_status()
+        match = re.search(
+            r'createServerReference\)\("([0-9a-f]{40,64})".{0,250}"discoverSearch"',
+            script.text,
+        )
+        if not match:
+            raise RuntimeError("NIH 3D search action was not found")
+        cls._server_action = match.group(1)
+        return cls._server_action
+
+    @staticmethod
+    def _flight_payload(response):
+        marker = response.text.find('1:{"status"')
+        if marker < 0:
+            return None
+        payload, _end = json.JSONDecoder().raw_decode(response.text[marker + 2 :])
+        return payload
+
+    @staticmethod
+    def search(query, _context, options=None):
+        import requests
+
+        terms = " ".join(re.findall(r"[\w-]+", query, re.UNICODE))[:160]
+        if not terms:
+            return []
+        page = _search_page_number(options)
+        start = (page - 1) * 30
+        expression = (
+            'type:entry AND submissionstatus:"Published" AND '
+            f"{terms}?start={start}&size=30&sort=publisheddate desc"
+        )
+        session = requests.Session()
+        session.headers.update({"User-Agent": _BROWSER_UA})
+        payload = None
+        for _attempt in range(2):
+            action = Nih3DSearcher._discover_search_action(session)
+            response = session.post(
+                Nih3DSearcher.BASE + "/discover",
+                data=json.dumps([expression]),
+                headers={
+                    "Accept": "text/x-component",
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Next-Action": action,
+                },
+                timeout=30,
+            )
+            if response.status_code < 400:
+                payload = Nih3DSearcher._flight_payload(response)
+            if payload:
+                break
+            Nih3DSearcher._server_action = ""
+        if not payload:
+            raise RuntimeError("NIH 3D search response format changed")
+        results = []
+        hits = payload.get("hits") or {}
+        for hit in hits.get("hit") or []:
+            fields = hit.get("fields") or {}
+            identifier = str(_first(fields.get("paddedentryid") or fields.get("id")))
+            lic_name = str(_first(fields.get("license"), "Unknown"))
+            lic = _parse_license(lic_name.replace("CC-", "CC "))
+            page_url = f"{Nih3DSearcher.BASE}/entries/3DPX-{identifier}"
+            thumbnail = str(_first(fields.get("thumbnail")))
+            results.append(
+                {
+                    "name": str(_first(fields.get("title"), "Untitled")),
+                    "author": str(_first(fields.get("createdby"), "Unknown")),
+                    "platform": "NIH 3D",
+                    "thumbnail_url": urllib.parse.urljoin(
+                        Nih3DSearcher.BASE, thumbnail
+                    ),
+                    "license": lic["name"],
+                    "license_url": lic["url"],
+                    "license_summary": lic["summary"],
+                    "download_url": page_url,
+                    "url": page_url,
+                    "requires_auth": False,
+                    "direct_import": True,
+                    "downloads": _first(fields.get("downloadcount"), None),
+                    "views": _first(fields.get("viewcount"), None),
+                    "published_at": _first(fields.get("publisheddate"), None),
+                    "is_free": True,
+                }
+            )
+        total = _number(hits.get("found"), integer=True)
+        return SearchPage(
+            results,
+            total=total,
+            has_more=bool(total is not None and page * 30 < total),
+        )
+
+    @staticmethod
+    def get_files(model, auth=None):
+        return _public_page_files(
+            model,
+            no_direct_message=(
+                "NIH 3D uses an interactive file-selection flow for this entry. "
+                "Open it in the browser."
+            ),
+        )
+
+
 class YouMagineSearcher:
     BASE = "https://youmagine.com"
     SEARCH_URLS = (BASE + "/explore?query={query}",)
@@ -2755,35 +3107,23 @@ class PinshapeSearcher:
             query, PinshapeSearcher.SEARCH_URLS, PinshapeSearcher.PATH_RE, "Pinshape"
         )
         for item in items:
-            if item.get("name", "").casefold() in ("free", "premium"):
+            price_label = item.get("name", "").casefold()
+            if price_label in ("free", "premium"):
                 item["name"] = _slug_title(item.get("url", ""))
-            item["direct_import"] = False
-            item["is_free"] = None
+            item["direct_import"] = price_label == "free"
+            item["is_free"] = (
+                True if price_label == "free" else False if price_label == "premium" else None
+            )
         return items
 
     @staticmethod
     def get_files(model, auth=None):
-        raise BrowserRequired(
-            "Pinshape downloads use the official account/browser flow.",
-            model.get("url", ""),
-        )
-
-
-class CgTraderSearcher:
-    BASE = "https://www.cgtrader.com"
-
-    @staticmethod
-    def search(query, context, options=None):
-        url = CgTraderSearcher.BASE + "/3d-models?keywords=" + urllib.parse.quote(
-            query, safe=""
-        )
-        return [_browser_search_result(query, "CGTrader", url)]
-
-    @staticmethod
-    def get_files(model, auth=None):
-        raise BrowserRequired(
-            "CGTrader search and downloads require its interactive browser flow.",
-            model.get("url", ""),
+        return _public_page_files(
+            model,
+            no_direct_message=(
+                "Pinshape did not expose a public STL file for this model. "
+                "Open its official download page."
+            ),
         )
 
 
@@ -2848,6 +3188,7 @@ _PLATFORM_SPECS = (
         referer="https://cults3d.com/",
         cookie_domain=".cults3d.com",
     ),
+    PlatformSpec("yeggi", "Yeggi", YeggiSearcher),
     PlatformSpec(
         "myminifactory",
         "MyMiniFactory",
@@ -2859,6 +3200,12 @@ _PLATFORM_SPECS = (
         search_page_size=30,
     ),
     PlatformSpec("thangs", "Thangs", ThangsSearcher),
+    PlatformSpec(
+        "stlfinder",
+        "STLFinder",
+        StlFinderSearcher,
+        search_page_size=30,
+    ),
     PlatformSpec("crealitycloud", "Creality Cloud", CrealityCloudSearcher),
     PlatformSpec(
         "grabcad",
@@ -2870,9 +3217,16 @@ _PLATFORM_SPECS = (
         referer="https://grabcad.com/library",
         cookie_domain=".grabcad.com",
     ),
+    PlatformSpec(
+        "smithsonian",
+        "Smithsonian 3D",
+        SmithsonianSearcher,
+        search_page_size=30,
+    ),
+    PlatformSpec("nasa", "NASA 3D Resources", NasaSearcher),
+    PlatformSpec("nih3d", "NIH 3D", Nih3DSearcher, search_page_size=30),
     PlatformSpec("youmagine", "YouMagine", YouMagineSearcher),
     PlatformSpec("pinshape", "Pinshape", PinshapeSearcher),
-    PlatformSpec("cgtrader", "CGTrader", CgTraderSearcher),
 )
 _PLATFORMS.update((spec.key, spec) for spec in _PLATFORM_SPECS)
 _PLATFORMS_BY_DISPLAY.update((spec.display, spec) for spec in _PLATFORM_SPECS)
@@ -3264,17 +3618,21 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <div class="platforms" id="search-portals">
 <label class="portal-option"><input id="portal-thingiverse" class="portal-search" type="checkbox" data-platform="thingiverse"> Thingiverse</label>
 <label class="portal-option"><input id="portal-cults3d" class="portal-search" type="checkbox" checked data-platform="cults3d"> Cults3D</label>
+<label class="portal-option"><input id="portal-yeggi" class="portal-search" type="checkbox" data-platform="yeggi"> Yeggi (browser)</label>
 <label class="portal-option"><input id="portal-myminifactory" class="portal-search" type="checkbox" data-platform="myminifactory"> MyMiniFactory</label>
 <label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" data-platform="thangs"> Thangs (browser)</label>
+<label class="portal-option"><input id="portal-stlfinder" class="portal-search" type="checkbox" data-platform="stlfinder"> STLFinder</label>
 <label class="portal-option"><input id="portal-makeronline" class="portal-search" type="checkbox" checked data-platform="makeronline"> Makeronline</label>
 <label class="portal-option"><input id="portal-crealitycloud" class="portal-search" type="checkbox" checked data-platform="crealitycloud"> Creality Cloud</label>
 <label class="portal-option"><input id="portal-nexprint" class="portal-search" type="checkbox" checked data-platform="nexprint"> Nexprint</label>
 <label class="portal-option"><input id="portal-grabcad" class="portal-search" type="checkbox" data-platform="grabcad"> GrabCAD</label>
 <label class="portal-option"><input id="portal-printables" class="portal-search" type="checkbox" checked data-platform="printables"> Printables</label>
 <label class="portal-option"><input id="portal-makerworld" class="portal-search" type="checkbox" checked data-platform="makerworld"> MakerWorld</label>
+<label class="portal-option"><input id="portal-smithsonian" class="portal-search" type="checkbox" checked data-platform="smithsonian"> Smithsonian 3D</label>
+<label class="portal-option"><input id="portal-nasa" class="portal-search" type="checkbox" checked data-platform="nasa"> NASA 3D Resources</label>
+<label class="portal-option"><input id="portal-nih3d" class="portal-search" type="checkbox" checked data-platform="nih3d"> NIH 3D</label>
 <label class="portal-option"><input id="portal-youmagine" class="portal-search" type="checkbox" checked data-platform="youmagine"> YouMagine</label>
 <label class="portal-option"><input id="portal-pinshape" class="portal-search" type="checkbox" checked data-platform="pinshape"> Pinshape</label>
-<label class="portal-option"><input id="portal-cgtrader" class="portal-search" type="checkbox" data-platform="cgtrader"> CGTrader (browser)</label>
 </div>
 <div id="source-results" class="source-results" aria-live="polite"></div>
 <div id="results"></div>
@@ -3316,7 +3674,7 @@ function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").
 function safeUrl(s){try{var u=new URL(String(s||''));return(u.protocol==='http:'||u.protocol==='https:')?u.href:''}catch(e){return''}}
 function showAuthHelp(button){var tooltip=$('auth-tooltip'),text=AUTH_HELP[button.dataset.platform]||'';if(!text)return;activeAuthHelp=button;tooltip.textContent=text;tooltip.classList.add('active');tooltip.style.left='0px';tooltip.style.top='0px';var r=button.getBoundingClientRect(),gap=8,margin=8,left=Math.max(margin,Math.min(window.innerWidth-tooltip.offsetWidth-margin,r.left+r.width/2-tooltip.offsetWidth/2)),top=r.bottom+gap;if(top+tooltip.offsetHeight>window.innerHeight-margin)top=Math.max(margin,r.top-tooltip.offsetHeight-gap);tooltip.style.left=Math.round(left)+'px';tooltip.style.top=Math.round(top)+'px'}
 function hideAuthHelp(button){if(activeAuthHelp!==button||button.matches(':hover')||document.activeElement===button)return;$('auth-tooltip').classList.remove('active');activeAuthHelp=null}
-function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',MyMiniFactory:'myminifactory',Thangs:'thangs','Creality Cloud':'crealitycloud',GrabCAD:'grabcad',YouMagine:'youmagine',Pinshape:'pinshape',CGTrader:'cgtrader'}[display]||String(display||'').toLowerCase()}
+function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',Yeggi:'yeggi',MyMiniFactory:'myminifactory',Thangs:'thangs',STLFinder:'stlfinder','Creality Cloud':'crealitycloud',GrabCAD:'grabcad','Smithsonian 3D':'smithsonian','NASA 3D Resources':'nasa','NIH 3D':'nih3d',YouMagine:'youmagine',Pinshape:'pinshape'}[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
 function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
 var PORTAL_PREF_KEY='orca-model-search-portals-v2';

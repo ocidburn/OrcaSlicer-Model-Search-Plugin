@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.7.2**
+**Current plugin version: v0.8.0**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -56,16 +56,20 @@ The selected search portals are remembered by the embedded UI and restored the n
 | **Printables** | Yes | Yes, for public files | None |
 | **Thingiverse** | Yes, official API | Yes | Personal Thingiverse API token |
 | **MyMiniFactory** | Yes, official API | OAuth archives only; otherwise browser | Personal MyMiniFactory API key |
+| **Yeggi** | Browser meta-search | Original portal | Interactive Turnstile check |
 | **Thangs** | Browser search link | Browser | Interactive browser check |
+| **STLFinder** | Yes, when Cloudflare permits | Delegated to the original registered portal | Original portal credentials when required |
 | **Creality Cloud** | Yes | Yes, when a public STL/3MF/CAD URL is exposed | None |
 | **MakerWorld / Bambu Lab** | Yes | Yes | Bambu/MakerWorld account session |
 | **Nexprint / Elegoo** | Yes | Yes | `auth_token` session cookie |
 | **Makeronline / Anycubic** | Yes | Yes | Anycubic access token / Anycubic Slicer Next session |
 | **Cults3D** | Yes | Yes, for files available to the signed-in account | Cults3D browser session cookies |
 | **GrabCAD** | Yes | Yes, for files available to the signed-in account | GrabCAD browser session cookies |
+| **Smithsonian 3D** | Yes, official API | Yes, public STL ZIP | None |
+| **NASA 3D Resources** | Yes, official GitHub mirror | Yes, public STL/3MF | None |
+| **NIH 3D** | Yes | Public file when exposed; otherwise browser | None |
 | **YouMagine** | Yes | Public file when exposed; otherwise browser | None |
-| **Pinshape** | Yes | Browser | None for search |
-| **CGTrader** | Browser search link | Browser | Interactive browser flow |
+| **Pinshape** | Yes | Yes, for public STL files; otherwise browser | None |
 
 A successful search result does not guarantee that the portal allows a direct programmatic download. Paid models, member-only models, CAPTCHA-protected downloads, checkout flows, or pages that do not expose a direct file URL are intentionally sent to **Open in browser** instead of being reported as a successful import.
 
@@ -98,6 +102,13 @@ See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the wider platform survey: whic
 
 - Thangs currently rejects non-browser search requests with an interactive protection page and has no documented public search API.
 - The plugin returns an explicitly labelled browser-search card with the query pre-filled. It never reports that card as an importable model.
+
+### Yeggi and STLFinder
+
+- Both are meta-search engines and do not host the model files themselves.
+- Yeggi currently requires an interactive Turnstile check, so its query opens in the browser.
+- STLFinder model results resolve the original supported portal. Import is then delegated to that portal's existing adapter and credential rules instead of scraping or mirroring a file through STLFinder.
+- If Cloudflare requires interactive verification, the source status provides **Open in browser** after the standard-UA compatibility retry.
 
 ### Creality Cloud
 
@@ -174,11 +185,16 @@ GrabCAD Community Library search/download requires a member session.
 
 Search and file resolution then use that saved GrabCAD browser session. Expired sessions are detected and rejected instead of returning a fake successful import.
 
-### YouMagine, Pinshape, and CGTrader
+### Smithsonian 3D, NASA 3D Resources, and NIH 3D
+
+- Smithsonian uses its public file-search API and imports water-tight STL ZIP resources.
+- NASA searches the official public `nasa/NASA-3D-Resources` GitHub mirror and imports matching STL/3MF files from canonical raw URLs.
+- NIH 3D uses its current public Discover application. Direct files exposed by an entry are validated and imported; interactive file-selection flows remain in the browser.
+
+### YouMagine and Pinshape
 
 - YouMagine and Pinshape use their current public HTML search pages.
-- YouMagine attempts validated public file resolution; Pinshape keeps downloads in its official browser flow.
-- CGTrader's current anti-bot flow returns an explicitly labelled browser-search card rather than fake or incomplete model results.
+- Both use validated public file resolution. Pinshape's public `/stl/` resources can be imported directly even though its account download buttons remain on the official site.
 
 ## Sorting and filters
 
@@ -190,7 +206,7 @@ Raw counters from different portals are not directly comparable. **Popularity (n
 
 The merged, sorted result set is paginated in the search window. The default is 24 cards per page, with 12, 24, and 48-card options, numbered page navigation, previous/next controls, and a visible result range. A new search returns to page one.
 
-This display pagination is separate from portal pagination. **Load next pages** fetches the next 30-result page from every selected API source that reports more results, merges models without duplicates, and reapplies the active filters and global sort. Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, and MyMiniFactory support this flow. HTML catalogs and browser fallbacks are explicitly labelled **first page only** because they do not expose a stable paginated API.
+This display pagination is separate from portal pagination. **Load next pages** fetches the next 30-result page from every selected source that reports more results, merges models without duplicates, and reapplies the active filters and global sort. Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, MyMiniFactory, STLFinder, Smithsonian 3D, and NIH 3D support this flow. Other HTML catalogs and browser fallbacks are explicitly labelled **first page only** because they do not expose a stable paginated interface.
 
 ## Search-source selection
 
@@ -198,17 +214,21 @@ The **Search portals** section contains one checkbox for every registered adapte
 
 - Thingiverse
 - Cults3D
+- Yeggi
 - MyMiniFactory
 - Thangs
+- STLFinder
 - Makeronline
 - Creality Cloud
 - Nexprint
 - GrabCAD
 - Printables
 - MakerWorld
+- Smithsonian 3D
+- NASA 3D Resources
+- NIH 3D
 - YouMagine
 - Pinshape
-- CGTrader
 
 Use **Select all** or **Select none** for quick changes. The selected list is stored in the embedded UI's local storage.
 
@@ -383,7 +403,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.7.2 validation gates are:
+The v0.8.0 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check
@@ -398,7 +418,7 @@ The v0.7.2 validation gates are:
 ## Current limitations
 
 - Portal websites and private web APIs can change without notice; an adapter may need updating when a site changes its frontend/API.
-- Thangs and CGTrader currently provide browser-search links because their interactive protection blocks a safe anonymous plugin search request.
+- Yeggi and Thangs currently provide browser-search links because their interactive protection blocks a safe anonymous plugin search request.
 - Thingiverse and MyMiniFactory require user-supplied developer credentials for their documented APIs.
 - MakerWorld download endpoints are not a public stable third-party API contract.
 - Browser-session integrations depend on the user's own valid portal session.

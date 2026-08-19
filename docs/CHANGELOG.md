@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.8.0
+
+- Restored the non-excluded public NIH 3D, Smithsonian 3D, and NASA 3D
+  Resources adapters listed in the platform landscape, including direct public
+  ZIP/STL/3MF import where each source exposes it.
+- Added Yeggi and STLFinder coverage. Meta-search results never masquerade as
+  hosted files: STLFinder delegates import to the registered original portal,
+  while Yeggi's interactive Turnstile flow stays in the browser.
+- Added validated direct import for public Pinshape `/stl/` resources.
+- Removed excluded CGTrader from the adapter registry, search UI, tests, and
+  current documentation. Wikimedia Commons remains excluded.
+- Extended challenge detection to Cloudflare Turnstile pages returned with
+  HTTP 200 and retained the single standard-UA retry plus browser fallback.
+
 ## 0.7.2
 
 - Added one HTML-only retry with standard browser navigation headers when a

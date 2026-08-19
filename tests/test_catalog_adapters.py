@@ -148,6 +148,14 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertEqual(session.get.call_count, 2)
         self.assertTrue(all(response.closed for response in responses))
 
+    def test_cloudflare_turnstile_page_is_detected_even_with_http_200(self):
+        response = FakeResponse(
+            '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js">'
+            '</script><div class="cf-turnstile"></div>',
+            status_code=200,
+        )
+        self.assertTrue(mod._is_cloudflare_challenge(response))
+
     def test_myminifactory_search_uses_official_api(self):
         payload = {
             "items": [
@@ -262,12 +270,6 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertEqual(rows[0]["result_type"], "search_link")
         self.assertFalse(rows[0]["direct_import"])
         self.assertIn("/search/dragon", rows[0]["url"])
-
-    def test_cgtrader_search_uses_explicit_browser_fallback(self):
-        rows = mod.CgTraderSearcher.search("benchy", None)
-        self.assertEqual(rows[0]["platform"], "CGTrader")
-        self.assertEqual(rows[0]["result_type"], "search_link")
-        self.assertFalse(rows[0]["direct_import"])
 
     def test_creality_search_parses_model(self):
         html = '<a href="/model-detail/output">Output</a>'
@@ -476,37 +478,58 @@ class RegistryAndUiTests(unittest.TestCase):
         requested = {
             "thingiverse",
             "cults3d",
+            "yeggi",
             "myminifactory",
             "thangs",
+            "stlfinder",
             "makeronline",
             "crealitycloud",
             "nexprint",
             "grabcad",
+            "smithsonian",
+            "nasa",
+            "nih3d",
             "youmagine",
             "pinshape",
-            "cgtrader",
         }
         self.assertTrue(requested.issubset(mod._PLATFORMS))
         display = {
             "Thingiverse",
             "Cults3D",
+            "Yeggi",
             "MyMiniFactory",
             "Thangs",
+            "STLFinder",
             "Makeronline",
             "Creality Cloud",
             "Nexprint",
             "GrabCAD",
-            "YouMagine",
-            "Pinshape",
-            "CGTrader",
-        }
-        self.assertTrue(display.issubset(mod._PLATFORMS_BY_DISPLAY))
-        removed_keys = {"smithsonian", "wikimedia", "nasa", "nih3d"}
-        removed_names = {
             "Smithsonian 3D",
-            "Wikimedia Commons",
             "NASA 3D Resources",
             "NIH 3D",
+            "YouMagine",
+            "Pinshape",
+        }
+        self.assertTrue(display.issubset(mod._PLATFORMS_BY_DISPLAY))
+        removed_keys = {
+            "sketchfab",
+            "cgtrader",
+            "free3d",
+            "3dfindit",
+            "3dexport",
+            "wikimedia",
+            "zortrax",
+            "qidimaker",
+        }
+        removed_names = {
+            "Sketchfab",
+            "CGTrader",
+            "Free3D",
+            "3DfindIT",
+            "3DExport",
+            "Wikimedia Commons",
+            "Zortrax Library",
+            "QIDI Maker",
         }
         self.assertTrue(removed_keys.isdisjoint(mod._PLATFORMS))
         self.assertTrue(removed_names.isdisjoint(mod._PLATFORMS_BY_DISPLAY))
@@ -525,11 +548,15 @@ class RegistryAndUiTests(unittest.TestCase):
 
     def test_only_authenticated_sites_have_auth_controls(self):
         for platform in (
+            "yeggi",
             "thangs",
+            "stlfinder",
             "crealitycloud",
+            "smithsonian",
+            "nasa",
+            "nih3d",
             "youmagine",
             "pinshape",
-            "cgtrader",
         ):
             self.assertNotIn(f'id="auth-{platform}"', mod.PAGE)
         for platform in (
@@ -624,6 +651,9 @@ class RegistryAndUiTests(unittest.TestCase):
                 "makerworld",
                 "thingiverse",
                 "myminifactory",
+                "stlfinder",
+                "smithsonian",
+                "nih3d",
             },
         )
 
@@ -713,10 +743,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_072(self):
+    def test_version_is_080(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.7.2"', head)
+        self.assertIn('# version = "0.8.0"', head)
 
 
 if __name__ == "__main__":

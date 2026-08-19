@@ -21,12 +21,12 @@ The popularity score is a 1-10 logarithmic scale derived from those visits:
 | 9 | Printables | https://www.printables.com | 17.2M | #2,485 | ~1.5M models | Free only | Yes |
 | 9 | Cults3D | https://cults3d.com | 14.1M | #2,588 | ~3.2M models | Free and paid | Yes |
 | 8 | Thingiverse | https://www.thingiverse.com | 11.7M | #3,449 | ~2.5M models | Free only | Yes |
-| 7 | Yeggi | https://www.yeggi.com | 5.9M | #9,828 | 4.86M indexed | Meta-search | **No** |
+| 7 | Yeggi | https://www.yeggi.com | 5.9M | #9,828 | 4.86M indexed | Meta-search | Yes, browser |
 | 6 | GrabCAD | https://grabcad.com/library | 3.4M | #11,968 | 5M CAD files | Free, membership | Yes |
 | 6 | MyMiniFactory | https://www.myminifactory.com | 2.7M | #16,677 | Hundreds of thousands | Free, paid, Tribes | Yes |
 | 6 | Creality Cloud | https://www.crealitycloud.com | 2.4M | #20,018 | 400K+ models | Free and paid | Yes |
 | 5 | Thangs | https://thangs.com | 1.1M | #45,671 | 14M indexed | Free and paid | Yes |
-| 5 | STLFinder | https://www.stlfinder.com | 961K | #42,999 | Not published | Meta-search | **No** |
+| 5 | STLFinder | https://www.stlfinder.com | 961K | #42,999 | Not published | Meta-search | Yes |
 | 4 | Makeronline | https://www.makeronline.com | 679K | #65,684 | Not published | Free | Yes |
 | 3 | Nexprint | https://www.nexprint.com | 383K | #100,313 | Not published | Free | Yes |
 | 3 | Pinshape | https://pinshape.com | 187K | #216,438 | 70K+ designers | Free and paid | Yes |
@@ -39,9 +39,10 @@ Notes on individual entries:
   and one-click slicer integration.
 - **Printables** has the most consistent license metadata of the large portals,
   which is why its results carry reliable license strings in the plugin.
-- **Yeggi** and **STLFinder** are search engines rather than hosts. They index
-  the portals above and are the two most significant catalogs the plugin does
-  not yet cover.
+- **Yeggi** and **STLFinder** are search engines rather than hosts. The plugin
+  never treats them as file hosts: Yeggi remains an official browser flow due
+  to Turnstile, while STLFinder delegates an indexed model to its registered
+  original portal and that portal's authentication/download rules.
 - **GrabCAD** is a CAD library rather than a print portal. It is kept because
   it is the strongest free source for functional and mechanical parts.
 - **Thangs** adds geometric similarity search but has been losing traffic since
@@ -91,20 +92,14 @@ These are large or well known, but are poor fits for a print-oriented search.
 | Zortrax Library | n/a | Small vendor-specific library |
 | QIDI Maker | n/a | Launched recently, negligible traffic |
 
-Two of these, **CGTrader** and **Wikimedia Commons**, are still registered in
-`src/search_engine.py` for historical reasons. CGTrader is a browser-only
-search card and Wikimedia contributes openly licensed STL files, so neither
-misrepresents itself as a print catalog, but neither earns its place on merit.
+None of these excluded platforms is registered in `src/search_engine.py`.
 
-## Coverage gaps
+## Coverage status
 
-Ordered by the traffic the plugin would gain:
-
-1. **Yeggi** (5.9M) - meta-search over free STL files. Highest-value addition;
-   maps cleanly onto the existing adapter shape.
-2. **STLFinder** (961K) - second meta-search, same integration pattern.
-
-Everything else worth having is already registered.
+Every non-excluded catalog in this survey is registered. A registered entry
+may still be browser-only when the service requires an interactive challenge,
+and a meta-search entry delegates the actual file operation to the original
+portal instead of pretending to host a download itself.
 
 ---
 

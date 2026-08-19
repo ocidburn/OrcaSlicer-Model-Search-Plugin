@@ -24,7 +24,13 @@ SEARCHES = (
     ("makeronline", "benchy"),
     ("nexprint", "benchy"),
     ("cults3d", "benchy"),
+    ("yeggi", "benchy"),
+    ("stlfinder", "benchy"),
+    ("thangs", "benchy"),
     ("crealitycloud", "benchy"),
+    ("smithsonian", "apollo"),
+    ("nasa", "apollo"),
+    ("nih3d", "heart"),
     ("youmagine", "cube"),
     ("pinshape", "benchy"),
 )
@@ -36,6 +42,13 @@ def main() -> int:
         spec = PLUGIN._platform(key)
         try:
             rows = spec.adapter.search(query, None, {"sort": "relevance"})
+        except PLUGIN.BrowserRequired as exc:
+            if exc.url:
+                print(f"OPEN {key}: interactive browser fallback ({exc.url})")
+                continue
+            failures.append(f"{key}: {exc}")
+            print(f"FAIL {key}: {exc}")
+            continue
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
             failures.append(f"{key}: {exc}")
             print(f"FAIL {key}: {exc}")

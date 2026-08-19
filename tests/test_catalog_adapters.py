@@ -299,12 +299,65 @@ class CatalogSearchTests(unittest.TestCase):
             row["license_url"], "https://creativecommons.org/licenses/by/4.0/"
         )
 
-    def test_thangs_search_uses_explicit_browser_fallback(self):
-        rows = mod.ThangsSearcher.search("dragon", None)
+    def test_thangs_search_uses_json_api_with_pagination_and_metrics(self):
+        payload = {
+            "items": [
+                {
+                    "modelId": "17751",
+                    "name": "Cup",
+                    "ownerUsername": "Maker",
+                    "modelPageUrl": "https://thangs.com/m/17751",
+                    "downloadUrl": "https://thangs.com/api/v2/models/17751/download-url",
+                    "thumbnailUrl": "https://storage.googleapis.com/thumb/cup.png",
+                    "downloadCount": 9649,
+                    "likesCount": 2013,
+                    "publishedOn": "2021-05-28T23:19:43.078Z",
+                    "marketplaceInfo": {"priceInUSD": 3},
+                }
+            ],
+            "totalPages": 75,
+            "totalResults": 3733,
+        }
+        with mock.patch("requests.get", return_value=FakeResponse(payload)) as get:
+            rows = mod.ThangsSearcher.search(
+                "cup", None, {"page": 2, "sort": "downloads"}
+            )
+
         self.assertEqual(rows[0]["platform"], "Thangs")
-        self.assertEqual(rows[0]["result_type"], "search_link")
+        self.assertEqual(rows[0]["downloads"], 9649)
+        self.assertEqual(rows[0]["likes"], 2013)
+        self.assertEqual(rows[0]["price"], 3)
+        self.assertEqual(
+            rows[0]["thumbnail_url"],
+            "https://storage.googleapis.com/thumb/cup.png",
+        )
+        self.assertEqual(rows.total, 3733)
+        self.assertTrue(rows.has_more)
         self.assertFalse(rows[0]["direct_import"])
-        self.assertIn("/search/dragon", rows[0]["url"])
+        self.assertEqual(get.call_args.kwargs["params"]["page"], 1)
+        self.assertEqual(get.call_args.kwargs["params"]["pageSize"], 50)
+        self.assertEqual(get.call_args.kwargs["params"]["sort"], "downloads")
+
+    def test_thangs_cloudflare_challenge_retries_then_opens_browser(self):
+        first = FakeResponse(
+            "Just a moment cf-chl-",
+            status_code=403,
+            headers={"server": "cloudflare", "cf-mitigated": "challenge"},
+            url=mod.ThangsSearcher.SEARCH_URL,
+        )
+        second = FakeResponse(
+            "Just a moment challenge-platform",
+            status_code=403,
+            headers={"server": "cloudflare", "cf-mitigated": "challenge"},
+            url=mod.ThangsSearcher.SEARCH_URL,
+        )
+        with (
+            mock.patch("requests.get", side_effect=(first, second)) as get,
+            self.assertRaises(mod.CloudflareChallenge) as raised,
+        ):
+            mod.ThangsSearcher.search("dragon", None)
+        self.assertEqual(get.call_count, 2)
+        self.assertIn("/search/dragon", raised.exception.url)
 
     def test_creality_search_parses_model(self):
         html = '<a href="/model-detail/output">Output</a>'
@@ -686,6 +739,7 @@ class RegistryAndUiTests(unittest.TestCase):
                 "makerworld",
                 "thingiverse",
                 "myminifactory",
+                "thangs",
                 "stlfinder",
                 "smithsonian",
                 "nih3d",
@@ -778,10 +832,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_081(self):
+    def test_version_is_082(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.8.1"', head)
+        self.assertIn('# version = "0.8.2"', head)
 
 
 if __name__ == "__main__":

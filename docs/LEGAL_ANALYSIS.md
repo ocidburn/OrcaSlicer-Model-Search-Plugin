@@ -39,7 +39,7 @@ authoritative source.
 | NIH 3D | Public Discover application | None | Validated public file when exposed; otherwise browser |
 | YouMagine | Current public HTML search | None | Validated public file when exposed; otherwise browser |
 | Pinshape | Current public HTML search | None | Validated public STL when exposed; otherwise browser |
-| Thangs | Pre-filled official browser search | Browser interaction | Browser only |
+| Thangs | Public web JSON search metadata | None for search | Browser only |
 
 Undocumented public web endpoints can change without notice. Their use here is
 limited to the same search metadata exposed to an ordinary visitor; the plugin

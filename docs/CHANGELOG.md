@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.8.2
+
+- Replaced the Thangs browser-search placeholder with its current JSON text-search
+  endpoint, including 50-result pagination, thumbnails, download/like metrics,
+  publication dates, prices, and total counts.
+- Added a standard-browser retry and explicit official-browser fallback when
+  Cloudflare challenges the Thangs JSON endpoint. Downloads remain browser-only.
+
 ## 0.8.1
 
 - Fixed missing MakerOnline result images by preserving the working official

@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community and public institutional catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.8.1"
+# version = "0.8.2"
 # ///
 
 import html
@@ -35,7 +35,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.8.1 "
+    "OrcaSlicer-Model-Search-Plugin/0.8.2 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _STANDARD_BROWSER_UA = (
@@ -2768,17 +2768,124 @@ class StlFinderSearcher:
         return _indexed_model_files(model, auth, "STLFinder")
 
 
+THANGS_BASE = "https://thangs.com"
+
+
+def _thangs_thumbnail(item):
+    thumbnail = _decode_embedded_url(item.get("thumbnailUrl"))
+    if _is_http_url(thumbnail):
+        return thumbnail
+    return next(
+        (
+            _decode_embedded_url(value)
+            for value in item.get("thumbnails") or ()
+            if _is_http_url(_decode_embedded_url(value))
+        ),
+        "",
+    )
+
+
+def _thangs_result(item):
+    model_id = item.get("modelId")
+    url = _decode_embedded_url(item.get("modelPageUrl"))
+    if not _is_http_url(url) or not _host_matches(_url_host(url), ("thangs.com",)):
+        url = f"{THANGS_BASE}/m/{model_id}" if model_id else ""
+    marketplace = item.get("marketplaceInfo") or {}
+    price = _number(marketplace.get("priceInUSD"))
+    return {
+        "name": _clean_web_text(item.get("name")) or "Untitled",
+        "author": _clean_web_text(item.get("ownerUsername")) or "Unknown",
+        "platform": "Thangs",
+        "thumbnail_url": _thangs_thumbnail(item),
+        "license": "Unknown",
+        "license_url": "",
+        "license_summary": "Open the Thangs model page to review the exact license before downloading.",
+        "download_url": url,
+        "url": url,
+        "_model_id": model_id,
+        "requires_auth": False,
+        "direct_import": False,
+        "downloads": item.get("downloadCount"),
+        "likes": item.get("likesCount"),
+        "published_at": item.get("publishedOn"),
+        "price": price,
+        "is_free": price is None or price <= 0,
+    }
+
+
 class ThangsSearcher:
-    BASE = "https://thangs.com"
+    BASE = THANGS_BASE
+    SEARCH_URL = BASE + "/api/search/v5/search-by-text"
+
+    @staticmethod
+    def _browser_url(query):
+        return f"{ThangsSearcher.BASE}/search/{urllib.parse.quote(query, safe='')}?scope=thangs"
+
+    @staticmethod
+    def _request(params, query):
+        import requests
+
+        def request(user_agent):
+            return requests.get(
+                ThangsSearcher.SEARCH_URL,
+                params=params,
+                headers={
+                    "User-Agent": user_agent,
+                    "Accept": "application/json,text/plain,*/*",
+                    "Referer": ThangsSearcher.BASE + "/",
+                },
+                timeout=30,
+            )
+
+        response = request(_BROWSER_UA)
+        if _is_cloudflare_challenge(response):
+            response.close()
+            response = request(_STANDARD_BROWSER_UA)
+            if _is_cloudflare_challenge(response):
+                response.close()
+                raise CloudflareChallenge(
+                    "Thangs search JSON still requires interactive Cloudflare verification after the standard browser retry.",
+                    ThangsSearcher._browser_url(query),
+                )
+        response.raise_for_status()
+        return response.json()
+
     @staticmethod
     def search(query, context, options=None):
-        url = f"{ThangsSearcher.BASE}/search/{urllib.parse.quote(query, safe='')}?scope=thangs"
-        return [_browser_search_result(query, "Thangs", url)]
+        page = _search_page_number(options)
+        sort = str((options or {}).get("sort") or "relevance")
+        api_sort = {
+            "downloads": "downloads",
+            "likes": "likes",
+            "newest": "newest",
+            "popularity": "downloads",
+        }.get(sort, "relevance")
+        payload = ThangsSearcher._request(
+            {
+                "searchTerm": query,
+                "page": page - 1,
+                "pageSize": 50,
+                "pageScope": "root",
+                "sort": api_sort,
+            },
+            query,
+        )
+        results = [
+            _thangs_result(item)
+            for item in payload.get("items") or []
+            if isinstance(item, dict)
+        ]
+        total_pages = int(_number(payload.get("totalPages"), integer=True) or 0)
+        return SearchPage(
+            results,
+            total=payload.get("totalResults"),
+            has_more=page < total_pages,
+        )
 
     @staticmethod
     def get_files(model, auth=None):
         raise BrowserRequired(
-            "Thangs protects search and downloads with an interactive browser check.",
+            "Thangs downloads remain in the official browser flow.",
             model.get("url", ""),
         )
 
@@ -3208,7 +3315,7 @@ _PLATFORM_SPECS = (
         referer="https://www.myminifactory.com/",
         search_page_size=30,
     ),
-    PlatformSpec("thangs", "Thangs", ThangsSearcher),
+    PlatformSpec("thangs", "Thangs", ThangsSearcher, search_page_size=50),
     PlatformSpec(
         "stlfinder",
         "STLFinder",

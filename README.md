@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.8.1**
+**Current plugin version: v0.8.2**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -57,7 +57,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 | **Thingiverse** | Yes, official API | Yes | Personal Thingiverse API token |
 | **MyMiniFactory** | Yes, official API | OAuth archives only; otherwise browser | Personal MyMiniFactory API key |
 | **Yeggi** | Browser meta-search | Original portal | Interactive Turnstile check |
-| **Thangs** | Browser search link | Browser | Interactive browser check |
+| **Thangs** | Yes, JSON search | Browser | Cloudflare may require an interactive browser check |
 | **STLFinder** | Yes, when Cloudflare permits | Delegated to the original registered portal | Original portal credentials when required |
 | **Creality Cloud** | Yes | Yes, when a public STL/3MF/CAD URL is exposed | None |
 | **MakerWorld / Bambu Lab** | Yes | Yes | Bambu/MakerWorld account session |
@@ -100,8 +100,10 @@ See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the wider platform survey: whic
 
 ### Thangs
 
-- Thangs currently rejects non-browser search requests with an interactive protection page and has no documented public search API.
-- The plugin returns an explicitly labelled browser-search card with the query pre-filled. It never reports that card as an importable model.
+- Search uses Thangs' current JSON text-search endpoint and exposes names, authors, thumbnails, downloads, likes, publication dates, prices, and result totals.
+- The API is paginated in 50-result pages. Global downloads, likes, newest, and normalized-popularity choices are mapped to the nearest Thangs ordering.
+- The endpoint is an undocumented web API and may still return an interactive Cloudflare challenge. The plugin retries once with a standard browser identity, then offers the official search page.
+- Downloads remain in the official Thangs browser flow and are never presented as direct imports.
 
 ### Yeggi and STLFinder
 
@@ -206,7 +208,7 @@ Raw counters from different portals are not directly comparable. **Popularity (n
 
 The merged, sorted result set is paginated in the search window. The default is 24 cards per page, with 12, 24, and 48-card options, numbered page navigation, previous/next controls, and a visible result range. A new search returns to page one.
 
-This display pagination is separate from portal pagination. **Load next pages** fetches the next 30-result page from every selected source that reports more results, merges models without duplicates, and reapplies the active filters and global sort. Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, MyMiniFactory, STLFinder, Smithsonian 3D, and NIH 3D support this flow. Other HTML catalogs and browser fallbacks are explicitly labelled **first page only** because they do not expose a stable paginated interface.
+This display pagination is separate from portal pagination. **Load next pages** fetches the next source page from every selected portal that reports more results, merges models without duplicates, and reapplies the active filters and global sort. Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, MyMiniFactory, Thangs, STLFinder, Smithsonian 3D, and NIH 3D support this flow. Other HTML catalogs and browser fallbacks are explicitly labelled **first page only** because they do not expose a stable paginated interface.
 
 ## Search-source selection
 
@@ -403,7 +405,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.8.1 validation gates are:
+The v0.8.2 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check
@@ -418,7 +420,7 @@ The v0.8.1 validation gates are:
 ## Current limitations
 
 - Portal websites and private web APIs can change without notice; an adapter may need updating when a site changes its frontend/API.
-- Yeggi and Thangs currently provide browser-search links because their interactive protection blocks a safe anonymous plugin search request.
+- Yeggi provides a browser-search link. Thangs uses its JSON search endpoint but falls back to the browser when Cloudflare requires interaction.
 - Thingiverse and MyMiniFactory require user-supplied developer credentials for their documented APIs.
 - MakerWorld download endpoints are not a public stable third-party API contract.
 - Browser-session integrations depend on the user's own valid portal session.

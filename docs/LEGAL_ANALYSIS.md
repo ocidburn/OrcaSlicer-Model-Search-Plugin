@@ -39,7 +39,7 @@ authoritative source.
 | NIH 3D | Public Discover application | None | Validated public file when exposed; otherwise browser |
 | YouMagine | Current public HTML search | None | Validated public file when exposed; otherwise browser |
 | Pinshape | Current public HTML search | None | Validated public STL when exposed; otherwise browser |
-| Thangs | Public web JSON search metadata | None for search | Browser only |
+| Thangs | Public web JSON search metadata | None for search; user Bearer token for import | Official `downloadUrl` resolver returns a signed ZIP URL; models without it stay in browser |
 
 Undocumented public web endpoints can change without notice. Their use here is
 limited to the same search metadata exposed to an ordinary visitor; the plugin
@@ -59,6 +59,10 @@ Credentials are scoped by the central `PlatformSpec` registry:
 - query parameters are removed after the first redirect;
 - copied cookies are placed in a domain-scoped cookie jar;
 - signed CDN/storage downloads do not receive the platform bearer token.
+
+For Thangs, the plugin sends the user's Bearer token only to the allow-listed
+`thangs.com` resolver. The returned signed storage URL is downloaded as a
+separate request without that token.
 
 The plugin does not collect search history, account identifiers, downloaded
 filenames, or usage analytics. A selected platform still receives the query and

@@ -333,7 +333,12 @@ class CatalogSearchTests(unittest.TestCase):
         )
         self.assertEqual(rows.total, 3733)
         self.assertTrue(rows.has_more)
-        self.assertFalse(rows[0]["direct_import"])
+        self.assertEqual(
+            rows[0]["download_url"],
+            "https://thangs.com/api/v2/models/17751/download-url",
+        )
+        self.assertTrue(rows[0]["requires_auth"])
+        self.assertTrue(rows[0]["direct_import"])
         self.assertEqual(get.call_args.kwargs["params"]["page"], 1)
         self.assertEqual(get.call_args.kwargs["params"]["pageSize"], 50)
         self.assertEqual(get.call_args.kwargs["params"]["sort"], "downloads")
@@ -548,14 +553,50 @@ class DownloadResolverTests(unittest.TestCase):
             with self.assertRaises(mod.BrowserRequired):
                 mod.MyMiniFactorySearcher.get_files(model, auth)
 
-    def test_thangs_member_model_goes_to_browser(self):
+    def test_thangs_model_without_download_resolver_goes_to_browser(self):
         model = {"url": "https://thangs.com/designer/A/3d-model/Paid-1"}
-        html = "<h1>Paid</h1><div>Become a member to download</div>"
-        with (
-            mock.patch.object(mod, "_fetch_html", return_value=(html, model["url"])),
-            self.assertRaises(mod.BrowserRequired),
-        ):
+        with self.assertRaises(mod.BrowserRequired):
             mod.ThangsSearcher.get_files(model)
+
+    def test_thangs_download_resolver_returns_signed_archive_with_extension(self):
+        model = {
+            "url": "https://thangs.com/m/17751",
+            "download_url": "https://thangs.com/api/v2/models/17751/download-url",
+        }
+        signed_url = (
+            "https://storage.googleapis.com/thangs/models/Kyle_Cup.zip"
+            "?response-content-disposition=attachment%3B%20filename%3D%22Kyle_Cup.zip%22"
+        )
+        payload = {
+            "fileName": "Kyle Cup V5 - New Design",
+            "signedUrl": signed_url,
+            "modelSource": 0,
+            "downloadId": 26996842,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("thangs", "Bearer thangs-token")
+            with mock.patch.object(
+                auth, "request", return_value=FakeResponse(payload)
+            ) as request:
+                files = mod.ThangsSearcher.get_files(model, auth)
+        self.assertEqual(files[0]["name"], "Kyle Cup V5 - New Design.zip")
+        self.assertEqual(files[0]["url"], signed_url)
+        self.assertEqual(request.call_args.args[:3], ("thangs", "GET", model["download_url"]))
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+
+    def test_thangs_bearer_token_is_scoped_to_thangs_hosts(self):
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("thangs", "Authorization: Bearer secret-token")
+            resolver_headers = auth._request_headers(
+                "thangs", "https://thangs.com/api/v2/models/1/download-url"
+            )
+            storage_headers = auth._request_headers(
+                "thangs", "https://storage.googleapis.com/thangs/model.zip"
+            )
+        self.assertEqual(resolver_headers["Authorization"], "Bearer secret-token")
+        self.assertNotIn("Authorization", storage_headers)
 
     def test_thingiverse_lists_files_through_official_api(self):
         model = {"url": "https://www.thingiverse.com/thing:7379392"}
@@ -749,7 +790,6 @@ class RegistryAndUiTests(unittest.TestCase):
     def test_only_authenticated_sites_have_auth_controls(self):
         for platform in (
             "yeggi",
-            "thangs",
             "stlfinder",
             "smithsonian",
             "nasa",
@@ -764,6 +804,7 @@ class RegistryAndUiTests(unittest.TestCase):
             "thingiverse",
             "myminifactory",
             "crealitycloud",
+            "thangs",
         ):
             self.assertIn(f'id="auth-{platform}"', mod.PAGE)
 
@@ -952,10 +993,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_083(self):
+    def test_version_is_084(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.8.3"', head)
+        self.assertIn('# version = "0.8.4"', head)
 
 
 if __name__ == "__main__":

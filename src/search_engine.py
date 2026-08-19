@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community and public institutional catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.8.3"
+# version = "0.8.4"
 # ///
 
 import html
@@ -35,7 +35,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.8.3 "
+    "OrcaSlicer-Model-Search-Plugin/0.8.4 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _STANDARD_BROWSER_UA = (
@@ -642,6 +642,8 @@ class AuthManager:
     @staticmethod
     def normalize_token(platform, token):
         token = (token or "").strip()
+        if token.lower().startswith("authorization:"):
+            token = token.split(":", 1)[1].strip()
         if token.lower().startswith("bearer "):
             token = token[7:].strip()
         spec = _platform(platform)
@@ -2793,6 +2795,11 @@ def _thangs_result(item):
     url = _decode_embedded_url(item.get("modelPageUrl"))
     if not _is_http_url(url) or not _host_matches(_url_host(url), ("thangs.com",)):
         url = f"{THANGS_BASE}/m/{model_id}" if model_id else ""
+    download_url = _decode_embedded_url(item.get("downloadUrl"))
+    if not _is_http_url(download_url) or not _host_matches(
+        _url_host(download_url), ("thangs.com",)
+    ):
+        download_url = ""
     marketplace = item.get("marketplaceInfo") or {}
     price = _number(marketplace.get("priceInUSD"))
     return {
@@ -2803,11 +2810,11 @@ def _thangs_result(item):
         "license": "Unknown",
         "license_url": "",
         "license_summary": "Open the Thangs model page to review the exact license before downloading.",
-        "download_url": url,
+        "download_url": download_url,
         "url": url,
         "_model_id": model_id,
-        "requires_auth": False,
-        "direct_import": False,
+        "requires_auth": bool(download_url),
+        "direct_import": bool(download_url),
         "downloads": item.get("downloadCount"),
         "likes": item.get("likesCount"),
         "published_at": item.get("publishedOn"),
@@ -2887,10 +2894,73 @@ class ThangsSearcher:
 
     @staticmethod
     def get_files(model, auth=None):
-        raise BrowserRequired(
-            "Thangs downloads remain in the official browser flow.",
-            model.get("url", ""),
+        download_url = _decode_embedded_url(model.get("download_url"))
+        if not _is_http_url(download_url) or not _host_matches(
+            _url_host(download_url), ("thangs.com",)
+        ):
+            raise BrowserRequired(
+                "Thangs did not provide a direct download resolver for this model.",
+                model.get("url", ""),
+            )
+        if auth is None or not auth.authenticated("thangs"):
+            raise AuthRequired(
+                "Connect your Thangs access token before importing this model."
+            )
+        response = auth.request(
+            "thangs",
+            "GET",
+            download_url,
+            timeout=30,
+            allow_redirects=False,
+            headers={"Accept": "application/json"},
         )
+        try:
+            if response.status_code in (401, 403):
+                raise AuthRequired(
+                    "Thangs rejected the access token or this account cannot download the model."
+                )
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Thangs returned an invalid download response") from exc
+        finally:
+            response.close()
+        if not isinstance(payload, dict):
+            raise TypeError("Thangs returned an invalid download response")
+        signed_url = _decode_embedded_url(payload.get("signedUrl"))
+        if not _is_http_url(signed_url):
+            raise RuntimeError("Thangs did not return a signed download URL")
+        name = _thangs_download_name(payload.get("fileName"), signed_url)
+        return [{"name": name, "url": signed_url}]
+
+
+def _thangs_download_name(file_name, signed_url):
+    """Keep the API filename while recovering the archive extension from its URL."""
+    name = _clean_web_text(file_name)
+    parsed = urllib.parse.urlsplit(signed_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    disposition = _first(query.get("response-content-disposition"), "")
+    match = re.search(
+        r"filename\*?=(?:UTF-8''|\")?([^\";]+)", str(disposition), re.IGNORECASE
+    )
+    disposition_name = (
+        urllib.parse.unquote(match.group(1).strip().strip('"')) if match else ""
+    )
+    path_name = urllib.parse.unquote(os.path.basename(parsed.path))
+    extension = next(
+        (
+            os.path.splitext(candidate)[1].lower()
+            for candidate in (disposition_name, path_name)
+            if os.path.splitext(candidate)[1].lower() in _MODEL_FILE_EXTS
+        ),
+        ".zip",
+    )
+    if not name:
+        name = disposition_name or path_name or "thangs_model"
+    if os.path.splitext(name)[1].lower() not in _MODEL_FILE_EXTS:
+        name += extension
+    return _safe_filename(name, "thangs_model" + extension)
 
 
 class CrealityCloudSearcher:
@@ -3600,7 +3670,16 @@ _PLATFORM_SPECS = (
         referer="https://www.myminifactory.com/",
         search_page_size=30,
     ),
-    PlatformSpec("thangs", "Thangs", ThangsSearcher, search_page_size=50),
+    PlatformSpec(
+        "thangs",
+        "Thangs",
+        ThangsSearcher,
+        auth_hosts=("thangs.com",),
+        auth_mode="bearer",
+        login_url="https://thangs.com/?showSignin=true",
+        referer="https://thangs.com/",
+        search_page_size=50,
+    ),
     PlatformSpec(
         "stlfinder",
         "STLFinder",
@@ -4021,6 +4100,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
   <div class="account"><div class="account-head"><strong>Thingiverse API</strong><button type="button" class="auth-help" data-platform="thingiverse" aria-label="Thingiverse authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-thingiverse" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('thingiverse')">API token</button></div>
   <div class="account"><div class="account-head"><strong>MyMiniFactory API</strong><button type="button" class="auth-help" data-platform="myminifactory" aria-label="MyMiniFactory authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-myminifactory" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('myminifactory')">API key</button></div>
   <div class="account"><div class="account-head"><strong>Creality Cloud</strong><button type="button" class="auth-help" data-platform="crealitycloud" aria-label="Creality Cloud authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-crealitycloud" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('crealitycloud')">Account</button></div>
+  <div class="account"><div class="account-head"><strong>Thangs</strong><button type="button" class="auth-help" data-platform="thangs" aria-label="Thangs authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-thangs" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('thangs')">Access token</button></div>
 </div>
 <div id="auth-tooltip" class="auth-tooltip" role="tooltip"></div>
 <div class="search-row"><input id="query" placeholder="Search for 3D models..."><button id="search-btn" onclick="doSearch()">Search</button></div>
@@ -4031,7 +4111,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <label class="portal-option"><input id="portal-cults3d" class="portal-search" type="checkbox" checked data-platform="cults3d"> Cults3D</label>
 <label class="portal-option"><input id="portal-yeggi" class="portal-search" type="checkbox" data-platform="yeggi"> Yeggi (browser)</label>
 <label class="portal-option"><input id="portal-myminifactory" class="portal-search" type="checkbox" data-platform="myminifactory"> MyMiniFactory</label>
-<label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" data-platform="thangs"> Thangs (browser)</label>
+<label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" data-platform="thangs"> Thangs</label>
 <label class="portal-option"><input id="portal-stlfinder" class="portal-search" type="checkbox" data-platform="stlfinder"> STLFinder</label>
 <label class="portal-option"><input id="portal-makeronline" class="portal-search" type="checkbox" checked data-platform="makeronline"> Makeronline</label>
 <label class="portal-option"><input id="portal-crealitycloud" class="portal-search" type="checkbox" checked data-platform="crealitycloud"> Creality Cloud</label>
@@ -4080,14 +4160,14 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <script>
 var selectedModel=null, searching=false, canLoadMore=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[], pendingMakerWorldModel=null, activeAuthHelp=null, resultImageObserver=null, makerWorldChoicesCache={}, makerWorldPrefetching={}, makerWorldPreloadedImages={}, currentPage=1, pageSize=24;
 var $=function(id){return document.getElementById(id)};
-var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login in your browser. After MakerOnline returns, copy the mo_access_token cookie value (or its Cookie header), paste it below, and connect. You can alternatively import the Anycubic Slicer Next session. The plugin never reads the browser profile or password.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'A GrabCAD Community Library membership is required. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.',crealitycloud:'Open the official Creality Cloud login and sign in. In the signed-in browser session, copy the model_token cookie value (or a Cookie header containing model_token and model_user_id), paste it below, and connect. The plugin never reads your browser profile or password.'};
+var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login in your browser. After MakerOnline returns, copy the mo_access_token cookie value (or its Cookie header), paste it below, and connect. You can alternatively import the Anycubic Slicer Next session. The plugin never reads the browser profile or password.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'A GrabCAD Community Library membership is required. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.',crealitycloud:'Open the official Creality Cloud login and sign in. In the signed-in browser session, copy the model_token cookie value (or a Cookie header containing model_token and model_user_id), paste it below, and connect. The plugin never reads your browser profile or password.',thangs:'Open the official Thangs sign-in page and log in. In the signed-in browser developer tools, copy the token from an Authorization: Bearer request header, paste it below, and connect. The token is sent only to Thangs and never to the signed storage URL.'};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function safeUrl(s){try{var u=new URL(String(s||''));return(u.protocol==='http:'||u.protocol==='https:')?u.href:''}catch(e){return''}}
 function showAuthHelp(button){var tooltip=$('auth-tooltip'),text=AUTH_HELP[button.dataset.platform]||'';if(!text)return;activeAuthHelp=button;tooltip.textContent=text;tooltip.classList.add('active');tooltip.style.left='0px';tooltip.style.top='0px';var r=button.getBoundingClientRect(),gap=8,margin=8,left=Math.max(margin,Math.min(window.innerWidth-tooltip.offsetWidth-margin,r.left+r.width/2-tooltip.offsetWidth/2)),top=r.bottom+gap;if(top+tooltip.offsetHeight>window.innerHeight-margin)top=Math.max(margin,r.top-tooltip.offsetHeight-gap);tooltip.style.left=Math.round(left)+'px';tooltip.style.top=Math.round(top)+'px'}
 function hideAuthHelp(button){if(activeAuthHelp!==button||button.matches(':hover')||document.activeElement===button)return;$('auth-tooltip').classList.remove('active');activeAuthHelp=null}
 function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',Yeggi:'yeggi',MyMiniFactory:'myminifactory',Thangs:'thangs',STLFinder:'stlfinder','Creality Cloud':'crealitycloud',GrabCAD:'grabcad','Smithsonian 3D':'smithsonian','NASA 3D Resources':'nasa','NIH 3D':'nih3d',YouMagine:'youmagine',Pinshape:'pinshape'}[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
-function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory','crealitycloud'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
+function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory','crealitycloud','thangs'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
 var PORTAL_PREF_KEY='orca-model-search-portals-v2';
 function selectedPortals(){var ps=[];document.querySelectorAll('.portal-search:checked').forEach(function(x){ps.push(x.dataset.platform)});return ps}
 function updatePortalCount(){var all=document.querySelectorAll('.portal-search');var checked=document.querySelectorAll('.portal-search:checked');$('source-count').textContent=checked.length+' / '+all.length+' selected'}
@@ -4125,7 +4205,7 @@ function licenseClass(l){if(/CC|Creative Commons|CC0|Public Domain/i.test(l||'')
 function openExternal(url){orca.postMessage({action:'open_external',url:url})}
 function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedModel.download_url)}
 function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var platform=platformKey(selectedModel.platform);if(!selectedModel._download_format&&(platform==='makerworld'||platform==='crealitycloud')){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id,picker_platform:cached.picker_platform});$('status').textContent='Select a '+cached.picker_platform+' print profile and file format.';return}}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
-function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory'||p==='crealitycloud');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API',crealitycloud:'Creality Cloud account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='makeronline'?'MakerOnline mo_access_token value or Cookie header':p==='crealitycloud'?'Creality model_token value or Cookie header':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=AUTH_HELP[p]||'Use the account credentials supplied by the selected platform.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
+function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory'||p==='crealitycloud'||p==='thangs');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API',crealitycloud:'Creality Cloud account',thangs:'Thangs account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='makeronline'?'MakerOnline mo_access_token value or Cookie header':p==='crealitycloud'?'Creality model_token value or Cookie header':p==='thangs'?'Thangs Bearer access token':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=AUTH_HELP[p]||'Use the account credentials supplied by the selected platform.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
 function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active')||$('makerworld-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
 function closeAuth(){$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
 function closeFilePicker(){$('file-modal').classList.remove('active');hideImagePreview(null,true);pendingFiles=[];syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
@@ -4143,7 +4223,7 @@ function showImagePreview(source){var url=safeUrl(source.currentSrc||source.src)
 function hideImagePreview(source,force){if(!force&&source&&(source.matches(':hover')||document.activeElement===source))return;var preview=$('image-preview');preview.classList.remove('active');preview.style.visibility='hidden'}
 function showMakerWorldChoices(msg){cacheMakerWorldChoices(msg);pendingMakerWorldModel=msg.model||selectedModel;var platform=msg.picker_platform||pendingMakerWorldModel.platform||'platform',profiles=msg.profiles||[],formats=msg.formats||[],defaultId=String(msg.default_profile_id||'');$('profile-picker-title').textContent='Choose '+platform+' download';$('profile-picker-note').textContent='Select a print profile and file format. 3MF uses the official signed profile URL.';var phtml='';profiles.forEach(function(p,i){var id=String(p.profile_id||''),title=p.title||'Print profile';var image=safeUrl(p.cover),summary=p.summary?'<span class="mw-summary">'+esc(p.summary)+'</span>':'';phtml+='<label class="mw-profile"><input type="radio" name="mw-profile" value="'+esc(id)+'" '+((id===defaultId||(!defaultId&&i===0))?'checked':'')+' onchange="updateMakerWorldChoice()">'+(image?'<img class="mw-cover" src="'+esc(image)+'" alt="'+esc(title)+'" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="mw-cover"></span>')+'<span><span class="mw-title">'+esc(title)+'</span>'+summary+'<span class="mw-meta">'+esc(profileMeta(p))+'</span></span></label>'});$('mw-profiles').innerHTML=phtml;var fhtml='',first=true;formats.forEach(function(f){if(f.available===false)return;fhtml+='<label class="mw-format"><input type="radio" name="mw-format" value="'+esc(f.id)+'" '+(first?'checked':'')+' onchange="updateMakerWorldChoice()"><span><strong>'+esc(f.label)+'</strong><small>'+esc(f.description||'')+'</small></span></label>';first=false});$('mw-formats').innerHTML=fhtml;$('makerworld-modal').classList.add('active');syncBackdrop();updateMakerWorldChoice()}
 function confirmMakerWorldChoice(){var p=document.querySelector('#mw-profiles input:checked'),f=document.querySelector('#mw-formats input:checked');if(!p||!f||!pendingMakerWorldModel)return;var platform=pendingMakerWorldModel.platform||'platform';$('mw-import').disabled=true;$('status').textContent=f.value==='3mf'?'Resolving selected '+platform+' profile...':'Opening '+platform+'...';orca.postMessage({action:'resolve_profile_choice',model:pendingMakerWorldModel,profile_id:p.value,format:f.value})}
-function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='crealitycloud'&&!token){$('status').textContent='Creality Cloud: paste model_token after signing in.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}if((authPlatform==='thingiverse'||authPlatform==='myminifactory')&&!token){$('status').textContent='Paste the API token/key first.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
+function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='crealitycloud'&&!token){$('status').textContent='Creality Cloud: paste model_token after signing in.';return}if(authPlatform==='thangs'&&!token){$('status').textContent='Thangs: paste the Bearer access token after signing in.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}if((authPlatform==='thingiverse'||authPlatform==='myminifactory')&&!token){$('status').textContent='Paste the API token/key first.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform});if(authPlatform==='makeronline')$('status').textContent='Anycubic login opened. After MakerOnline returns, copy mo_access_token, paste it here, and connect.'}
 function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('status').textContent='Looking for Anycubic Slicer Next session...'}

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.8.4
+
+- Added direct Thangs import through the `downloadUrl` supplied by its JSON
+  search response. The authenticated resolver's `signedUrl` is downloaded as a
+  ZIP and safely expanded for OrcaSlicer.
+- Added a Thangs account card, official sign-in shortcut, Bearer-token
+  instructions, token normalization, and automatic authorization prompting.
+- Scoped the Thangs Bearer token to Thangs hosts only; signed Google Storage or
+  other CDN requests never receive it.
+- Preserved the API filename while recovering a missing `.zip` extension from
+  the signed URL or its response-content-disposition query parameter.
+
 ## 0.8.3
 
 - Replaced Creality Cloud HTML card scraping with its current JSON model-search

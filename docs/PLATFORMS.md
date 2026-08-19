@@ -46,7 +46,9 @@ Notes on individual entries:
 - **GrabCAD** is a CAD library rather than a print portal. It is kept because
   it is the strongest free source for functional and mechanical parts.
 - **Thangs** adds geometric similarity search but has been losing traffic since
-  the Shapeways acquisition.
+  the Shapeways acquisition. Its JSON text search also supplies an authenticated
+  `downloadUrl`; the plugin resolves that URL with the user's token and imports
+  the returned signed ZIP without forwarding the token to storage.
 - **YouMagine** is retained for continuity; its traffic is marginal and it now
   shares ownership with Thingiverse and MyMiniFactory.
 

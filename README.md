@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.8.3**
+**Current plugin version: v0.8.4**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -57,7 +57,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 | **Thingiverse** | Yes, official API | Yes | Personal Thingiverse API token |
 | **MyMiniFactory** | Yes, official API | OAuth archives only; otherwise browser | Personal MyMiniFactory API key |
 | **Yeggi** | Browser meta-search | Original portal | Interactive Turnstile check |
-| **Thangs** | Yes, JSON search | Browser | Cloudflare may require an interactive browser check |
+| **Thangs** | Yes, JSON search | Yes, signed ZIP when `downloadUrl` is available | Bearer access token; Cloudflare may require an interactive browser check for search |
 | **STLFinder** | Yes, when Cloudflare permits | Delegated to the original registered portal | Original portal credentials when required |
 | **Creality Cloud** | Yes, JSON API | Selected signed 3MF profile; STL/CAD in browser | `model_token` from the user's official session for 3MF |
 | **MakerWorld / Bambu Lab** | Yes | Yes | Bambu/MakerWorld account session |
@@ -83,6 +83,13 @@ See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the wider platform survey: whic
 - No login is required for public model files.
 - The plugin requests every file's canonical temporary URL through Printables' `getDownloadLink` mutation. It never guesses a storage URL from filename capitalization, spaces, or hyphens.
 - Available STL files can be selected and imported into the active OrcaSlicer project. The picker uses Printables' per-file `filePreviewPath` renders and shows a larger preview on mouse hover or keyboard focus.
+
+### Thangs
+
+- Search uses Thangs' JSON text-search response and preserves its official `downloadUrl` resolver.
+- Sign in on the official Thangs page, copy the access token from an authenticated `Authorization: Bearer` request, and connect it through the Thangs account card.
+- Import requests a short-lived `signedUrl` from Thangs, preserves the API filename, restores the ZIP extension when necessary, and then downloads the archive from the signed storage URL.
+- The Bearer token is allow-listed to Thangs hosts only and is never attached to Google Storage or another signed download host. Results without `downloadUrl` remain in the official browser flow.
 
 ### Thingiverse
 
@@ -325,6 +332,7 @@ The download/auth layer includes several defensive checks:
 - ZIP extraction blocks path traversal.
 - Expired/rejected sessions return an authentication error.
 - MakerWorld signed download URLs are downloaded without leaking the portal bearer token to the signed storage host.
+- Thangs signed download URLs are downloaded without leaking the Thangs bearer token to the signed storage host.
 
 ## Actions Speed Dial
 
@@ -407,7 +415,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.8.3 validation gates are:
+The v0.8.4 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

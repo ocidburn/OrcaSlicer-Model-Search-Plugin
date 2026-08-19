@@ -60,6 +60,13 @@ Credentials are scoped by the central `PlatformSpec` registry:
 - copied cookies are placed in a domain-scoped cookie jar;
 - signed CDN/storage downloads do not receive the platform bearer token.
 
+A Cloudflare clearance obtained by the user is stored in the same file, keyed
+by host, together with the browser User-Agent it is bound to. The plugin does
+not solve, answer, or circumvent a Cloudflare challenge: the check is completed
+by the user in their own browser and only its result is replayed, scoped to the
+host that issued it. A clearance that is no longer accepted is deleted rather
+than retried.
+
 For Thangs, the plugin sends the user's Bearer token only to the allow-listed
 `production-api.thangs.com` resolver. The returned signed storage URL is then
 downloaded separately without that token.

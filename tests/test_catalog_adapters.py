@@ -150,7 +150,11 @@ class CatalogSearchTests(unittest.TestCase):
             mod._fetch_html(url)
 
         self.assertEqual(raised.exception.url, url)
-        self.assertIn("standard browser User-Agent", str(raised.exception))
+        # The message must name the blocked host and point at the verification
+        # hand-off rather than telling the user to just try again later.
+        self.assertEqual(raised.exception.host, "cults3d.com")
+        self.assertIn("cults3d.com", str(raised.exception))
+        self.assertIn("cf_clearance", str(raised.exception))
         self.assertEqual(session.request.call_count, 2)
         self.assertTrue(all(response.closed for response in responses))
         session.close.assert_called_once_with()

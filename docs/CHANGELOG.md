@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.3
+
+- Fixed MakerWorld's complete-profile response normalization so profile covers, titles, authors, descriptions, ratings, and print settings are taken from the populated response fields instead of an empty nested placeholder.
+- Merged the complete profile list with rich design metadata and added profile descriptions to the picker UI.
+
 ## 0.5.2
 
 - Replaced Printables filename-based storage URL construction with its canonical `getDownloadLink` GraphQL mutation.

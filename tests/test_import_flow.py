@@ -252,6 +252,7 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertIn('id="mw-formats"', mod.PAGE)
         self.assertIn("resolve_makerworld_choice", mod.PAGE)
         self.assertIn("STL/CAD files", mod.PAGE)
+        self.assertIn("mw-summary", mod.PAGE)
 
     def test_detail_import_panel_closes_on_click_outside(self):
         mod = load_module()

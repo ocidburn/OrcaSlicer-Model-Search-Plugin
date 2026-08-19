@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community, museum, scientific, and space catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.5.2"
+# version = "0.5.3"
 # ///
 
 import html
@@ -34,7 +34,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.5.2 "
+    "OrcaSlicer-Model-Search-Plugin/0.5.3 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -1858,9 +1858,16 @@ class MakerWorldSearcher:
         if not isinstance(instance, dict):
             return None
         detail = instance.get("detail")
-        item = detail if isinstance(detail, dict) else {}
-        if not item:
-            item = instance
+        detail_id = (
+            _coalesce(
+                detail.get("profileId"),
+                detail.get("profile_id"),
+                detail.get("id"),
+            )
+            if isinstance(detail, dict)
+            else ""
+        )
+        item = detail if detail_id and isinstance(detail, dict) else instance
         profile_id = _coalesce(
             item.get("profileId"), item.get("profile_id"), item.get("id")
         )
@@ -1888,6 +1895,9 @@ class MakerWorldSearcher:
             if isinstance(creator, dict)
             else str(creator or ""),
             "cover": _coalesce(item.get("cover"), item.get("coverUrl")),
+            "summary": _strip_html(
+                _coalesce(item.get("summaryTranslated"), item.get("summary"))
+            ),
             "printer": _first(
                 (model_info.get("compatibility") or {}).get("devProductName")
             ),
@@ -1903,6 +1913,20 @@ class MakerWorldSearcher:
         }
 
     @staticmethod
+    def _merge_profile_instance(summary, detail):
+        if not isinstance(detail, dict):
+            return summary
+        merged = dict(summary)
+        merged.update(
+            {
+                key: value
+                for key, value in detail.items()
+                if value not in (None, "", [], {})
+            }
+        )
+        return merged
+
+    @staticmethod
     def _load_profiles(design_id, design, auth, session, complete=False):
         instances = design.get("instances") or []
         if complete or not instances:
@@ -1915,7 +1939,23 @@ class MakerWorldSearcher:
             )
             response.raise_for_status()
             payload = response.json()
-            instances = payload.get("hits") or payload.get("instances") or instances
+            complete_instances = payload.get("hits") or payload.get("instances") or []
+            if complete_instances:
+                rich_profiles = {
+                    str(profile["profile_id"]): instance
+                    for instance in instances
+                    if (profile := MakerWorldSearcher._profile_record(instance))
+                    is not None
+                }
+                instances = [
+                    MakerWorldSearcher._merge_profile_instance(
+                        instance,
+                        rich_profiles.get(str(profile["profile_id"])),
+                    )
+                    for instance in complete_instances
+                    if (profile := MakerWorldSearcher._profile_record(instance))
+                    is not None
+                ]
         profiles = [
             profile
             for instance in instances
@@ -3214,7 +3254,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 .accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account strong{display:block;font-size:.86em}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.search-options{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:-4px 0 10px;font-size:.82em}.search-options select{padding:5px 8px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.search-options label{display:flex;align-items:center;gap:5px}.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 6px}.source-head strong{font-size:.9em}.source-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.source-tools button{padding:4px 8px;font-size:.76em}.source-count{font-size:.76em;color:var(--orca-muted,#999)}.platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;margin-bottom:12px}.portal-option{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.84em;color:var(--orca-fg,#eee);cursor:pointer;user-select:none}.portal-option:hover{border-color:var(--orca-accent,#4a9eff)}.portal-option input{margin:0;accent-color:var(--orca-accent,#4a9eff)}
 #results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.metrics{font-size:.72em;color:var(--orca-muted,#999);min-height:1.2em;margin-top:3px}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
 .panel{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(650px,calc(100% - 32px));max-height:70vh;overflow:auto;z-index:20;padding:14px 34px 14px 14px;border:1px solid var(--orca-border,#444);border-radius:8px;background:var(--orca-bg,#1e1e1e);box-shadow:0 6px 28px rgba(0,0,0,.55);display:none}.panel.active{display:block}.close{position:absolute;right:8px;top:6px;background:none!important;font-size:1.35em;padding:2px 6px}.panel p{font-size:.86em;color:var(--orca-muted,#aaa);margin:6px 0}.panel a{color:var(--orca-accent,#4a9eff)}.responsibility{border-left:3px solid var(--orca-border,#444);padding:8px 10px;margin:10px 0;font-size:.78em;color:var(--orca-muted,#888)}
-.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.file-list{max-height:46vh;overflow:auto;border:1px solid var(--orca-border,#555);border-radius:6px;margin:10px 0}.file-choice{display:flex;align-items:flex-start;gap:9px;padding:9px 10px;border-bottom:1px solid var(--orca-border,#444);cursor:pointer}.file-choice:last-child{border-bottom:0}.file-choice input{margin-top:2px}.file-choice span{overflow-wrap:anywhere}.file-tools{display:flex;gap:7px;margin:8px 0}.file-count{font-size:.8em;color:var(--orca-muted,#999)}.makerworld-modal{width:min(700px,calc(100% - 32px))}.mw-profiles{max-height:42vh;overflow:auto;margin:10px 0}.mw-profile{display:grid;grid-template-columns:auto 72px 1fr;gap:10px;align-items:center;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;margin:7px 0;cursor:pointer}.mw-profile:has(input:checked){border-color:var(--orca-accent,#4a9eff);background:rgba(74,158,255,.08)}.mw-profile input{margin:0}.mw-cover{width:72px;height:58px;object-fit:cover;border-radius:5px;background:#333}.mw-title{font-weight:600;font-size:.88em}.mw-meta{font-size:.75em;color:var(--orca-muted,#aaa);margin-top:4px}.mw-formats{display:grid;gap:7px;margin:10px 0}.mw-format{display:flex;gap:9px;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;cursor:pointer}.mw-format:has(input:checked){border-color:var(--orca-accent,#4a9eff)}.mw-format small{display:block;color:var(--orca-muted,#aaa);margin-top:2px}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.file-list{max-height:46vh;overflow:auto;border:1px solid var(--orca-border,#555);border-radius:6px;margin:10px 0}.file-choice{display:flex;align-items:flex-start;gap:9px;padding:9px 10px;border-bottom:1px solid var(--orca-border,#444);cursor:pointer}.file-choice:last-child{border-bottom:0}.file-choice input{margin-top:2px}.file-choice span{overflow-wrap:anywhere}.file-tools{display:flex;gap:7px;margin:8px 0}.file-count{font-size:.8em;color:var(--orca-muted,#999)}.makerworld-modal{width:min(700px,calc(100% - 32px))}.mw-profiles{max-height:42vh;overflow:auto;margin:10px 0}.mw-profile{display:grid;grid-template-columns:auto 88px 1fr;gap:10px;align-items:center;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;margin:7px 0;cursor:pointer}.mw-profile:has(input:checked){border-color:var(--orca-accent,#4a9eff);background:rgba(74,158,255,.08)}.mw-profile input{margin:0}.mw-cover{width:88px;height:68px;object-fit:cover;border-radius:5px;background:#333}.mw-title{display:block;font-weight:600;font-size:.88em}.mw-summary{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:.78em;line-height:1.3;margin-top:3px}.mw-meta{display:block;font-size:.75em;color:var(--orca-muted,#aaa);margin-top:4px}.mw-formats{display:grid;gap:7px;margin:10px 0}.mw-format{display:flex;gap:9px;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;cursor:pointer}.mw-format:has(input:checked){border-color:var(--orca-accent,#4a9eff)}.mw-format small{display:block;color:var(--orca-muted,#aaa);margin-top:2px}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
 @media(max-width:680px){.accounts{grid-template-columns:1fr}}
 </style>
 <h1 style="margin:0;font-size:1.25em">&#128269; 3D Model Search</h1>
@@ -3321,7 +3361,7 @@ function setAllFiles(value){document.querySelectorAll('#file-list input[type=che
 function confirmFileImport(){var selected=[];document.querySelectorAll('#file-list input[type=checkbox]:checked').forEach(function(x){selected.push(parseInt(x.value,10))});if(!selected.length)return;$('file-import').disabled=true;$('status').textContent='Downloading selected files...';$('file-modal').classList.remove('active');syncBackdrop();orca.postMessage({action:'import_selected',indices:selected})}
 function profileMeta(p){var v=[];if(p.creator)v.push('by '+p.creator);if(p.printer)v.push(p.printer);if(p.layer_height)v.push(p.layer_height+' layer');if(p.walls)v.push(p.walls+' walls');if(p.infill)v.push(p.infill+' infill');if(p.prediction)v.push(Math.max(1,Math.round(Number(p.prediction)/3600*10)/10)+' h');if(p.plates)v.push(p.plates+' plate'+(Number(p.plates)===1?'':'s'));if(p.rating!=null)v.push('Rating '+p.rating+(p.rating_count?' ('+p.rating_count+')':''));return v.join(' / ')}
 function updateMakerWorldChoice(){var f=document.querySelector('#mw-formats input:checked');var p=document.querySelector('#mw-profiles input:checked');$('mw-import').disabled=!(f&&p);$('mw-import').textContent=f&&f.value==='raw_browser'?'Open STL/CAD files in MakerWorld':'Download selected 3MF'}
-function showMakerWorldChoices(msg){pendingMakerWorldModel=msg.model||selectedModel;var profiles=msg.profiles||[],formats=msg.formats||[],defaultId=String(msg.default_profile_id||'');var phtml='';profiles.forEach(function(p,i){var id=String(p.profile_id||'');var image=safeUrl(p.cover);phtml+='<label class="mw-profile"><input type="radio" name="mw-profile" value="'+esc(id)+'" '+((id===defaultId||(!defaultId&&i===0))?'checked':'')+' onchange="updateMakerWorldChoice()">'+(image?'<img class="mw-cover" src="'+esc(image)+'">':'<span class="mw-cover"></span>')+'<span><span class="mw-title">'+esc(p.title||'Print profile')+'</span><span class="mw-meta">'+esc(profileMeta(p))+'</span></span></label>'});$('mw-profiles').innerHTML=phtml;var fhtml='';formats.forEach(function(f,i){if(f.available===false)return;fhtml+='<label class="mw-format"><input type="radio" name="mw-format" value="'+esc(f.id)+'" '+(i===0?'checked':'')+' onchange="updateMakerWorldChoice()"><span><strong>'+esc(f.label)+'</strong><small>'+esc(f.description||'')+'</small></span></label>'});$('mw-formats').innerHTML=fhtml;$('makerworld-modal').classList.add('active');syncBackdrop();updateMakerWorldChoice()}
+function showMakerWorldChoices(msg){pendingMakerWorldModel=msg.model||selectedModel;var profiles=msg.profiles||[],formats=msg.formats||[],defaultId=String(msg.default_profile_id||'');var phtml='';profiles.forEach(function(p,i){var id=String(p.profile_id||'');var image=safeUrl(p.cover),summary=p.summary?'<span class="mw-summary">'+esc(p.summary)+'</span>':'';phtml+='<label class="mw-profile"><input type="radio" name="mw-profile" value="'+esc(id)+'" '+((id===defaultId||(!defaultId&&i===0))?'checked':'')+' onchange="updateMakerWorldChoice()">'+(image?'<img class="mw-cover" src="'+esc(image)+'" alt="">':'<span class="mw-cover"></span>')+'<span><span class="mw-title">'+esc(p.title||'Print profile')+'</span>'+summary+'<span class="mw-meta">'+esc(profileMeta(p))+'</span></span></label>'});$('mw-profiles').innerHTML=phtml;var fhtml='';formats.forEach(function(f,i){if(f.available===false)return;fhtml+='<label class="mw-format"><input type="radio" name="mw-format" value="'+esc(f.id)+'" '+(i===0?'checked':'')+' onchange="updateMakerWorldChoice()"><span><strong>'+esc(f.label)+'</strong><small>'+esc(f.description||'')+'</small></span></label>'});$('mw-formats').innerHTML=fhtml;$('makerworld-modal').classList.add('active');syncBackdrop();updateMakerWorldChoice()}
 function confirmMakerWorldChoice(){var p=document.querySelector('#mw-profiles input:checked'),f=document.querySelector('#mw-formats input:checked');if(!p||!f||!pendingMakerWorldModel)return;$('mw-import').disabled=true;$('status').textContent=f.value==='3mf'?'Resolving selected MakerWorld profile...':'Opening MakerWorld...';orca.postMessage({action:'resolve_makerworld_choice',model:pendingMakerWorldModel,profile_id:p.value,format:f.value})}
 function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}if((authPlatform==='thingiverse'||authPlatform==='myminifactory')&&!token){$('status').textContent='Paste the API token/key first.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}

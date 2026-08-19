@@ -245,6 +245,8 @@ class ResolverTests(unittest.TestCase):
                 {
                     "profileId": 123,
                     "title": "Fast profile",
+                    "summary": "<p>Fast profile description.</p>",
+                    "cover": "https://cdn.example/fast.webp",
                     "isDefault": True,
                     "hasZipStl": True,
                     "prediction": 7200,
@@ -270,7 +272,25 @@ class ResolverTests(unittest.TestCase):
             "makerworld",
             [
                 FakeResponse(data=design),
-                FakeResponse(data={"hits": design["instances"], "total": 2}),
+                FakeResponse(
+                    data={
+                        "hits": [
+                            {
+                                "profileId": 123,
+                                "title": "Fast wrapper",
+                                "cover": "https://cdn.example/wrapper.webp",
+                                "detail": {"profileId": 0, "title": ""},
+                            },
+                            {
+                                "profileId": 456,
+                                "title": "Quality profile",
+                                "cover": "https://cdn.example/quality.webp",
+                                "detail": {"profileId": 0, "title": ""},
+                            },
+                        ],
+                        "total": 2,
+                    }
+                ),
             ],
         )
         choices = mod.MakerWorldSearcher.get_download_choices(
@@ -289,6 +309,15 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(choices["profiles"][0]["rating"], 4.8)
         self.assertEqual(choices["profiles"][0]["printer"], "X1 Carbon")
         self.assertEqual(
+            choices["profiles"][0]["summary"], "Fast profile description."
+        )
+        self.assertEqual(
+            choices["profiles"][0]["cover"], "https://cdn.example/fast.webp"
+        )
+        self.assertEqual(
+            choices["profiles"][1]["cover"], "https://cdn.example/quality.webp"
+        )
+        self.assertEqual(
             [item["id"] for item in choices["formats"]], ["3mf", "raw_browser"]
         )
         self.assertTrue(choices["formats"][1]["available"])
@@ -298,11 +327,15 @@ class ResolverTests(unittest.TestCase):
         instance = {
             "profileId": 789,
             "title": "Wrapper title",
-            "detail": {"profileId": 0, "title": "Detailed title"},
+            "cover": "https://cdn.example/profile.webp",
+            "creator": {"name": "Profile author"},
+            "detail": {"profileId": 0, "title": ""},
         }
         profile = mod.MakerWorldSearcher._profile_record(instance)
         self.assertEqual(profile["profile_id"], "789")
-        self.assertEqual(profile["title"], "Detailed title")
+        self.assertEqual(profile["title"], "Wrapper title")
+        self.assertEqual(profile["cover"], "https://cdn.example/profile.webp")
+        self.assertEqual(profile["creator"], "Profile author")
 
     def test_makerworld_does_not_silently_select_first_profile(self):
         design = {"modelId": "MID", "title": "Thing", "instances": []}

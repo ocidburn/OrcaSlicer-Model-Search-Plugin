@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community and public institutional catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.8.5"
+# version = "0.8.6"
 # ///
 
 import html
@@ -35,7 +35,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.8.5 "
+    "OrcaSlicer-Model-Search-Plugin/0.8.6 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _STANDARD_BROWSER_UA = (
@@ -3007,6 +3007,29 @@ class StlFinderSearcher:
 
 
 THANGS_BASE = "https://thangs.com"
+THANGS_API_BASE = "https://production-api.thangs.com"
+
+
+def _thangs_api_url(url):
+    """Resolve a public Thangs web proxy URL against its official API host."""
+    decoded = _decode_embedded_url(url)
+    if not _is_http_url(decoded):
+        return ""
+    parsed = urllib.parse.urlsplit(decoded)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not re.fullmatch(
+        r"/(?:api/)?v2/models/\d+/download-url", parsed.path
+    ):
+        return ""
+    api_path = parsed.path[4:] if parsed.path.startswith("/api/") else parsed.path
+    if host == "production-api.thangs.com":
+        return urllib.parse.urlunsplit(("https", host, api_path, parsed.query, ""))
+    is_web_proxy = host in ("thangs.com", "www.thangs.com")
+    if not is_web_proxy or not parsed.path.startswith("/api/"):
+        return ""
+    return urllib.parse.urlunsplit(
+        ("https", "production-api.thangs.com", api_path, parsed.query, "")
+    )
 
 
 def _thangs_thumbnail(item):
@@ -3028,11 +3051,7 @@ def _thangs_result(item):
     url = _decode_embedded_url(item.get("modelPageUrl"))
     if not _is_http_url(url) or not _host_matches(_url_host(url), ("thangs.com",)):
         url = f"{THANGS_BASE}/m/{model_id}" if model_id else ""
-    download_url = _decode_embedded_url(item.get("downloadUrl"))
-    if not _is_http_url(download_url) or not _host_matches(
-        _url_host(download_url), ("thangs.com",)
-    ):
-        download_url = ""
+    download_url = _thangs_api_url(item.get("downloadUrl"))
     marketplace = item.get("marketplaceInfo") or {}
     price = _number(marketplace.get("priceInUSD"))
     return {
@@ -3058,7 +3077,7 @@ def _thangs_result(item):
 
 class ThangsSearcher:
     BASE = THANGS_BASE
-    SEARCH_URL = BASE + "/api/search/v5/search-by-text"
+    SEARCH_URL = THANGS_API_BASE + "/search/v5/search-by-text"
 
     @staticmethod
     def _browser_url(query):
@@ -3075,6 +3094,7 @@ class ThangsSearcher:
                 headers={
                     "User-Agent": user_agent,
                     "Accept": "application/json,text/plain,*/*",
+                    "Origin": ThangsSearcher.BASE,
                     "Referer": ThangsSearcher.BASE + "/",
                 },
                 timeout=30,
@@ -3087,7 +3107,7 @@ class ThangsSearcher:
             if _is_cloudflare_challenge(response):
                 response.close()
                 raise CloudflareChallenge(
-                    "Thangs search JSON still requires interactive Cloudflare verification after the standard browser retry.",
+                    "The official Thangs API still requires interactive Cloudflare verification after the standard browser retry.",
                     ThangsSearcher._browser_url(query),
                 )
         response.raise_for_status()
@@ -3127,7 +3147,7 @@ class ThangsSearcher:
 
     @staticmethod
     def get_files(model, auth=None):
-        download_url = _decode_embedded_url(model.get("download_url"))
+        download_url = _thangs_api_url(model.get("download_url"))
         if not _is_http_url(download_url) or not _host_matches(
             _url_host(download_url), ("thangs.com",)
         ):
@@ -3907,7 +3927,7 @@ _PLATFORM_SPECS = (
         "thangs",
         "Thangs",
         ThangsSearcher,
-        auth_hosts=("thangs.com",),
+        auth_hosts=("production-api.thangs.com",),
         auth_mode="bearer",
         login_url="https://thangs.com/?showSignin=true",
         referer="https://thangs.com/",

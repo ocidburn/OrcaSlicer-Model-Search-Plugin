@@ -335,13 +335,18 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertTrue(rows.has_more)
         self.assertEqual(
             rows[0]["download_url"],
-            "https://thangs.com/api/v2/models/17751/download-url",
+            "https://production-api.thangs.com/v2/models/17751/download-url",
         )
         self.assertTrue(rows[0]["requires_auth"])
         self.assertTrue(rows[0]["direct_import"])
         self.assertEqual(get.call_args.kwargs["params"]["page"], 1)
         self.assertEqual(get.call_args.kwargs["params"]["pageSize"], 50)
         self.assertEqual(get.call_args.kwargs["params"]["sort"], "downloads")
+        self.assertEqual(
+            mod.ThangsSearcher.SEARCH_URL,
+            "https://production-api.thangs.com/search/v5/search-by-text",
+        )
+        self.assertEqual(get.call_args.kwargs["headers"]["Origin"], "https://thangs.com")
 
     def test_thangs_cloudflare_challenge_retries_then_opens_browser(self):
         first = FakeResponse(
@@ -363,6 +368,24 @@ class CatalogSearchTests(unittest.TestCase):
             mod.ThangsSearcher.search("dragon", None)
         self.assertEqual(get.call_count, 2)
         self.assertIn("/search/dragon", raised.exception.url)
+
+    def test_thangs_download_resolver_normalization_is_strict(self):
+        self.assertEqual(
+            mod._thangs_api_url(
+                "https://www.thangs.com/api/v2/models/17751/download-url"
+            ),
+            "https://production-api.thangs.com/v2/models/17751/download-url",
+        )
+        self.assertEqual(
+            mod._thangs_api_url(
+                "http://thangs.com/api/v2/models/17751/download-url"
+            ),
+            "",
+        )
+        self.assertEqual(
+            mod._thangs_api_url("https://evil.thangs.com/api/v2/models/1/download-url"),
+            "",
+        )
 
     def test_creality_search_uses_api_and_keeps_high_resolution_cover(self):
         payload = {
@@ -582,7 +605,14 @@ class DownloadResolverTests(unittest.TestCase):
                 files = mod.ThangsSearcher.get_files(model, auth)
         self.assertEqual(files[0]["name"], "Kyle Cup V5 - New Design.zip")
         self.assertEqual(files[0]["url"], signed_url)
-        self.assertEqual(request.call_args.args[:3], ("thangs", "GET", model["download_url"]))
+        self.assertEqual(
+            request.call_args.args[:3],
+            (
+                "thangs",
+                "GET",
+                "https://production-api.thangs.com/v2/models/17751/download-url",
+            ),
+        )
         self.assertFalse(request.call_args.kwargs["allow_redirects"])
 
     def test_thangs_bearer_token_is_scoped_to_thangs_hosts(self):
@@ -590,13 +620,18 @@ class DownloadResolverTests(unittest.TestCase):
             auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
             auth.save_token("thangs", "Authorization: Bearer secret-token")
             resolver_headers = auth._request_headers(
-                "thangs", "https://thangs.com/api/v2/models/1/download-url"
+                "thangs",
+                "https://production-api.thangs.com/v2/models/1/download-url",
             )
             storage_headers = auth._request_headers(
                 "thangs", "https://storage.googleapis.com/thangs/model.zip"
             )
+            website_headers = auth._request_headers(
+                "thangs", "https://thangs.com/api/v2/models/1/download-url"
+            )
         self.assertEqual(resolver_headers["Authorization"], "Bearer secret-token")
         self.assertNotIn("Authorization", storage_headers)
+        self.assertNotIn("Authorization", website_headers)
 
     def test_thingiverse_lists_files_through_official_api(self):
         model = {"url": "https://www.thingiverse.com/thing:7379392"}
@@ -993,10 +1028,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_085(self):
+    def test_version_is_086(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.8.5"', head)
+        self.assertIn('# version = "0.8.6"', head)
 
 
 if __name__ == "__main__":

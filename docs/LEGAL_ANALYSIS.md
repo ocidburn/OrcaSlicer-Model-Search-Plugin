@@ -61,8 +61,8 @@ Credentials are scoped by the central `PlatformSpec` registry:
 - signed CDN/storage downloads do not receive the platform bearer token.
 
 For Thangs, the plugin sends the user's Bearer token only to the allow-listed
-`thangs.com` resolver. The returned signed storage URL is downloaded as a
-separate request without that token.
+`production-api.thangs.com` resolver. The returned signed storage URL is then
+downloaded separately without that token.
 
 The plugin does not collect search history, account identifiers, downloaded
 filenames, or usage analytics. A selected platform still receives the query and

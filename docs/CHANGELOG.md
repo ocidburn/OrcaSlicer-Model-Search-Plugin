@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.8.6
+
+- Replaced the Cloudflare-protected Thangs Next.js proxy with the official
+  `production-api.thangs.com` search endpoint used by the current frontend.
+- Normalized Thangs `downloadUrl` proxy links to the same API host before the
+  authenticated signed-download request, while keeping the Bearer token scoped
+  to Thangs-owned hosts.
+- Added regression coverage for the production search endpoint, required
+  origin header, resolver normalization, pagination, and token isolation.
+
 ## 0.8.5
 
 - Added background loading and image preloading for every Nexprint print profile

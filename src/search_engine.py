@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community model portals."
 # author = "Tommaso Bianchi"
-# version = "0.6.2"
+# version = "0.7.0"
 # ///
 
 import html
@@ -34,7 +34,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.6.2 "
+    "OrcaSlicer-Model-Search-Plugin/0.7.0 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -200,6 +200,7 @@ class PlatformSpec:
         "key",
         "login_url",
         "referer",
+        "search_page_size",
     )
 
     def __init__(
@@ -214,6 +215,7 @@ class PlatformSpec:
         referer="",
         cookie_domain="",
         cookie_name="",
+        search_page_size=0,
     ):
         self.key = key
         self.display = display
@@ -224,10 +226,38 @@ class PlatformSpec:
         self.referer = referer
         self.cookie_domain = cookie_domain
         self.cookie_name = cookie_name
+        self.search_page_size = max(0, int(search_page_size))
 
     @property
     def requires_auth(self):
         return bool(self.auth_mode)
+
+    @property
+    def paginated_search(self):
+        return self.search_page_size > 0
+
+
+class SearchPage(list):
+    """List-compatible search response with optional paging metadata."""
+
+    def __init__(self, items=(), *, total=None, has_more=None):
+        super().__init__(items)
+        self.total = _number(total, integer=True)
+        self.has_more = has_more
+
+
+def _search_page_number(options):
+    try:
+        page = int((options or {}).get("page", 1))
+    except (AttributeError, TypeError, ValueError):
+        page = 1
+    return min(max(page, 1), 100)
+
+
+def _search_page_result(items, page, page_size, total=None):
+    total = _number(total, integer=True)
+    has_more = page * page_size < total if total is not None else len(items) >= page_size
+    return SearchPage(items, total=total, has_more=has_more)
 
 
 _COMMON_RESULT_FIELDS = (
@@ -378,6 +408,40 @@ def _filter_and_sort_results(results, options=None):
         item.pop("_popularity_raw", None)
         item.pop("_published_sort", None)
     return normalized
+
+
+def _result_identity(item):
+    platform = str(item.get("_platform_key") or item.get("platform") or "").casefold()
+    identifier = _coalesce(
+        item.get("_thing_id"),
+        item.get("_model_id"),
+        item.get("_mold_id"),
+        item.get("url"),
+        item.get("download_url"),
+        default="",
+    )
+    if not identifier:
+        identifier = "|".join(
+            (
+                str(item.get("name") or "").casefold(),
+                str(item.get("author") or "").casefold(),
+            )
+        )
+    return f"{platform}|{identifier}"
+
+
+def _merge_unique_results(existing, incoming):
+    merged = list(existing)
+    seen = {_result_identity(item) for item in merged}
+    added = 0
+    for item in incoming:
+        identity = _result_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(item)
+        added += 1
+    return merged, added
 
 
 _PLATFORMS = {}
@@ -1426,11 +1490,12 @@ class MakeronlineSearcher:
     def search(query, _context, options=None):
         import requests
 
+        page = _search_page_number(options)
         response = requests.post(
             MakeronlineSearcher.SEARCH_URL,
             json={
                 "keyword": query,
-                "page": 1,
+                "page": page,
                 "page_size": 30,
                 "order": "",
                 "search": 1,
@@ -1479,7 +1544,7 @@ class MakeronlineSearcher:
                     "is_free": not bool(item.get("is_premium")),
                 }
             )
-        return results
+        return _search_page_result(results, page, 30)
 
     @staticmethod
     def get_files(model, auth):
@@ -1533,9 +1598,14 @@ class NexprintSearcher:
     def search(query, _context, options=None):
         import requests
 
+        page_number = _search_page_number(options)
         response = requests.get(
             NexprintSearcher.SEARCH_URL,
-            params={"keyword": query, "pageNo": "1", "pageSize": "30"},
+            params={
+                "keyword": query,
+                "pageNo": str(page_number),
+                "pageSize": "30",
+            },
             headers={"User-Agent": _BROWSER_UA},
             timeout=30,
         )
@@ -1574,7 +1644,9 @@ class NexprintSearcher:
                     "is_free": not bool(item.get("price")),
                 }
             )
-        return results
+        return _search_page_result(
+            results, page_number, 30, total=page.get("total")
+        )
 
     @staticmethod
     def get_files(model, auth):
@@ -1610,8 +1682,10 @@ class NexprintSearcher:
 class PrintablesSearcher:
     GRAPHQL_URL = "https://api.printables.com/graphql/"
     SEARCH_QUERY = (
-        "query Search($query: String!, $limit: Int, $ordering: SearchChoicesEnum) {"
-        " searchPrints2(query: $query, limit: $limit, ordering: $ordering) {"
+        "query Search($query: String!, $limit: Int, $offset: Int, "
+        "$ordering: SearchChoicesEnum) {"
+        " searchPrints2(query: $query, limit: $limit, offset: $offset, "
+        "ordering: $ordering) {"
         " items { id name slug downloadCount likesCount ratingAvg datePublished "
         " image { filePath } license { name } user { publicUsername } } } }"
     )
@@ -1647,6 +1721,7 @@ class PrintablesSearcher:
     def search(query, _context, options=None):
         import requests
 
+        page = _search_page_number(options)
         requested_sort = (
             str(options.get("sort") or "") if isinstance(options, dict) else ""
         )
@@ -1666,6 +1741,7 @@ class PrintablesSearcher:
                 "variables": {
                     "query": query,
                     "limit": 30,
+                    "offset": (page - 1) * 30,
                     "ordering": ordering,
                 },
             },
@@ -1710,7 +1786,7 @@ class PrintablesSearcher:
                     "is_free": True,
                 }
             )
-        return results
+        return _search_page_result(results, page, 30)
 
     @staticmethod
     def _download_record(model_id, stl):
@@ -1796,15 +1872,21 @@ class MakerWorldSearcher:
     def search(query, _context, options=None):
         import requests
 
+        page = _search_page_number(options)
         response = requests.get(
             MakerWorldSearcher.SEARCH_URL,
-            params={"keyword": query, "limit": "30"},
+            params={
+                "keyword": query,
+                "limit": "30",
+                "offset": str((page - 1) * 30),
+            },
             headers={"User-Agent": _BROWSER_UA},
             timeout=30,
         )
         response.raise_for_status()
+        payload = response.json()
         results = []
-        for hit in response.json().get("hits") or []:
+        for hit in payload.get("hits") or []:
             lic_name, lic_url = MakerWorldSearcher.LICENSES.get(
                 hit.get("license", "Unknown"), (hit.get("license", "Unknown"), "")
             )
@@ -1833,7 +1915,7 @@ class MakerWorldSearcher:
                     "is_free": not bool(hit.get("price")),
                 }
             )
-        return results
+        return _search_page_result(results, page, 30, total=payload.get("total"))
 
     @staticmethod
     def _profile_from_url(url):
@@ -2217,11 +2299,17 @@ class ThingiverseSearcher:
             raise AuthRequired(
                 "Thingiverse search now requires a personal Thingiverse API access token"
             )
+        page = _search_page_number(options)
         response = context.request(
             "thingiverse",
             "GET",
             f"{ThingiverseSearcher.API}/search/{urllib.parse.quote(query, safe='')}",
-            params={"type": "things", "sort": "relevant", "per_page": 30},
+            params={
+                "type": "things",
+                "sort": "relevant",
+                "page": page,
+                "per_page": 30,
+            },
             timeout=30,
         )
         if response.status_code in (401, 403):
@@ -2236,7 +2324,11 @@ class ThingiverseSearcher:
             # opens a card, avoiding one API request per search result.
             result["_details_available"] = True
             result["_details_loaded"] = False
-        return results
+        total = payload.get("total") if isinstance(payload, dict) else None
+        if total is None:
+            headers = getattr(response, "headers", {}) or {}
+            total = headers.get("X-Total-Count") or headers.get("x-total-count")
+        return _search_page_result(results, page, 30, total=total)
 
     @staticmethod
     def get_details(model, auth):
@@ -2427,6 +2519,7 @@ class MyMiniFactorySearcher:
             raise AuthRequired(
                 "MyMiniFactory search requires a personal API key from MyMiniFactory"
             )
+        page = _search_page_number(options)
         requested_sort = (
             str(options.get("sort") or "") if isinstance(options, dict) else ""
         )
@@ -2442,7 +2535,7 @@ class MyMiniFactorySearcher:
             params={
                 "key": context.token("myminifactory"),
                 "q": query,
-                "page": 1,
+                "page": page,
                 "per_page": 30,
                 "sort": sort,
                 "order": "desc",
@@ -2452,7 +2545,17 @@ class MyMiniFactorySearcher:
         if response.status_code in (401, 403):
             raise AuthRequired("MyMiniFactory rejected the saved API key")
         response.raise_for_status()
-        return [_myminifactory_result(item) for item in response.json().get("items") or []]
+        payload = response.json()
+        results = [_myminifactory_result(item) for item in payload.get("items") or []]
+        total = _coalesce(
+            payload.get("total_count"),
+            payload.get("total"),
+            (payload.get("meta") or {}).get("total")
+            if isinstance(payload.get("meta"), dict)
+            else None,
+            default=None,
+        )
+        return _search_page_result(results, page, 30, total=total)
 
     @staticmethod
     def get_files(model, auth):
@@ -2627,7 +2730,9 @@ class CgTraderSearcher:
 
 
 _PLATFORM_SPECS = (
-    PlatformSpec("printables", "Printables", PrintablesSearcher),
+    PlatformSpec(
+        "printables", "Printables", PrintablesSearcher, search_page_size=30
+    ),
     PlatformSpec(
         "nexprint",
         "Nexprint",
@@ -2638,6 +2743,7 @@ _PLATFORM_SPECS = (
         referer="https://www.nexprint.com/",
         cookie_domain=".nexprint.com",
         cookie_name="auth_token",
+        search_page_size=30,
     ),
     PlatformSpec(
         "makeronline",
@@ -2652,6 +2758,7 @@ _PLATFORM_SPECS = (
             "&scope=read&state=ac_maker_online&lang=en"
         ),
         referer="https://www.makeronline.com/",
+        search_page_size=30,
     ),
     PlatformSpec(
         "makerworld",
@@ -2661,6 +2768,7 @@ _PLATFORM_SPECS = (
         auth_mode="bearer",
         login_url="https://makerworld.com/en/sign-in",
         referer="https://makerworld.com/",
+        search_page_size=30,
     ),
     PlatformSpec(
         "thingiverse",
@@ -2670,6 +2778,7 @@ _PLATFORM_SPECS = (
         auth_mode="bearer",
         login_url="https://www.thingiverse.com/developers",
         referer="https://www.thingiverse.com/",
+        search_page_size=30,
     ),
     PlatformSpec(
         "cults3d",
@@ -2689,6 +2798,7 @@ _PLATFORM_SPECS = (
         auth_mode="api_key",
         login_url="https://www.myminifactory.com/pages/for-developers",
         referer="https://www.myminifactory.com/",
+        search_page_size=30,
     ),
     PlatformSpec("thangs", "Thangs", ThangsSearcher),
     PlatformSpec("crealitycloud", "Creality Cloud", CrealityCloudSearcher),
@@ -3074,6 +3184,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 .accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account-head{display:flex;align-items:center;justify-content:space-between;gap:6px}.account strong{display:block;font-size:.86em}.auth-help{width:20px;height:20px;min-width:20px;padding:0!important;border:1px solid var(--orca-border,#666)!important;border-radius:50%!important;background:transparent!important;color:var(--orca-muted,#aaa)!important;font-size:.75em;font-weight:700;line-height:18px}.auth-help:hover,.auth-help:focus{border-color:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent,#4a9eff)!important;outline:none}.auth-tooltip{position:fixed;z-index:80;display:none;width:min(330px,calc(100vw - 24px));padding:9px 11px;border:1px solid var(--orca-border,#666);border-radius:7px;background:var(--orca-bg,#202020);color:var(--orca-fg,#eee);box-shadow:0 5px 20px rgba(0,0,0,.5);font-size:.76em;line-height:1.4;text-align:left;pointer-events:none}.auth-tooltip.active{display:block}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.search-options{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:-4px 0 10px;font-size:.82em}.search-options select{padding:5px 8px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.search-options label{display:flex;align-items:center;gap:5px}.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 6px}.source-head strong{font-size:.9em}.source-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.source-tools button{padding:4px 8px;font-size:.76em}.source-count{font-size:.76em;color:var(--orca-muted,#999)}.platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;margin-bottom:12px}.portal-option{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.84em;color:var(--orca-fg,#eee);cursor:pointer;user-select:none}.portal-option:hover{border-color:var(--orca-accent,#4a9eff)}.portal-option input{margin:0;accent-color:var(--orca-accent,#4a9eff)}
 #results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.result-image{opacity:0;transition:opacity .18s ease}.result-image.loaded{opacity:1}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.metrics{font-size:.72em;color:var(--orca-muted,#999);min-height:1.2em;margin-top:3px}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
 .pagination{display:none;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin:14px 0 4px}.pagination.active{display:flex}.pagination-summary{font-size:.8em;color:var(--orca-muted,#999);margin-right:4px}.pagination label{display:flex;align-items:center;gap:5px;font-size:.8em;color:var(--orca-muted,#999)}.pagination select{padding:5px 7px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.page-numbers{display:flex;align-items:center;gap:4px}.page-button{min-width:34px;padding:6px 8px}.page-button.current{background:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent-fg,#fff)!important;border-color:var(--orca-accent,#4a9eff)!important}.page-ellipsis{padding:0 2px;color:var(--orca-muted,#999)}
+.source-results{display:none;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px;margin:0 0 12px}.source-results.active{display:grid}.source-result{padding:7px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.75em}.source-result strong,.source-result span,.source-result small{display:block}.source-result span{color:var(--orca-muted,#999);margin-top:2px}.source-result small{color:#e78b8b;margin-top:3px;overflow-wrap:anywhere}.load-more-row{display:none;justify-content:center;margin:10px 0 4px}.load-more-row.active{display:flex}.load-more-row button{min-width:220px}
 .panel{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(650px,calc(100% - 32px));max-height:70vh;overflow:auto;z-index:20;padding:14px 34px 14px 14px;border:1px solid var(--orca-border,#444);border-radius:8px;background:var(--orca-bg,#1e1e1e);box-shadow:0 6px 28px rgba(0,0,0,.55);display:none}.panel.active{display:block}.close{position:absolute;right:8px;top:6px;background:none!important;font-size:1.35em;padding:2px 6px}.panel p{font-size:.86em;color:var(--orca-muted,#aaa);margin:6px 0}.panel a{color:var(--orca-accent,#4a9eff)}.responsibility{border-left:3px solid var(--orca-border,#444);padding:8px 10px;margin:10px 0;font-size:.78em;color:var(--orca-muted,#888)}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.58);z-index:29;display:none}.modal-backdrop.active{display:block}.auth-modal{position:fixed;z-index:30;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,calc(100% - 32px));background:var(--orca-bg,#1e1e1e);border:1px solid var(--orca-border,#555);border-radius:9px;padding:16px;display:none}.auth-modal.active{display:block}.field{margin:8px 0}.field label{display:block;font-size:.78em;color:var(--orca-muted,#999);margin-bottom:3px}.field input{width:100%;padding:8px;border:1px solid var(--orca-border,#555);background:var(--orca-bg,#222);color:inherit;border-radius:5px}.auth-note{font-size:.79em;color:var(--orca-muted,#aaa);line-height:1.4}.button-row{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.file-modal{width:min(700px,calc(100% - 32px))}.file-list{max-height:46vh;overflow:auto;border:1px solid var(--orca-border,#555);border-radius:6px;margin:10px 0}.file-choice{display:grid;grid-template-columns:auto 96px minmax(0,1fr);align-items:center;gap:10px;padding:9px 10px;border-bottom:1px solid var(--orca-border,#444);cursor:pointer}.file-choice:last-child{border-bottom:0}.file-choice:has(input:checked){background:rgba(74,158,255,.06)}.file-choice input{margin:0}.file-preview,.file-preview-placeholder{width:96px;height:76px;border-radius:5px;background:#333}.file-preview{object-fit:cover;cursor:zoom-in}.file-preview:focus,.mw-cover:focus{outline:2px solid var(--orca-accent,#4a9eff);outline-offset:2px}.file-preview-placeholder{display:flex;align-items:center;justify-content:center;color:var(--orca-muted,#888);font-size:.7em}.file-details{min-width:0}.file-name{display:block;overflow-wrap:anywhere;font-weight:600;font-size:.86em}.file-meta{display:block;color:var(--orca-muted,#999);font-size:.75em;margin-top:4px}.file-tools{display:flex;gap:7px;margin:8px 0}.file-count{font-size:.8em;color:var(--orca-muted,#999)}.makerworld-modal{width:min(700px,calc(100% - 32px))}.mw-profiles{max-height:42vh;overflow:auto;margin:10px 0}.mw-profile{display:grid;grid-template-columns:auto 88px 1fr;gap:10px;align-items:center;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;margin:7px 0;cursor:pointer}.mw-profile:has(input:checked){border-color:var(--orca-accent,#4a9eff);background:rgba(74,158,255,.08)}.mw-profile input{margin:0}.mw-cover{width:88px;height:68px;object-fit:cover;border-radius:5px;background:#333;cursor:zoom-in}.image-preview{position:fixed;z-index:70;display:none;width:min(420px,55vw);max-height:65vh;object-fit:contain;border:1px solid var(--orca-border,#666);border-radius:8px;background:#222;box-shadow:0 8px 30px rgba(0,0,0,.7);pointer-events:none}.image-preview.active{display:block}.mw-title{display:block;font-weight:600;font-size:.88em}.mw-summary{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:.78em;line-height:1.3;margin-top:3px}.mw-meta{display:block;font-size:.75em;color:var(--orca-muted,#aaa);margin-top:4px}.mw-formats{display:grid;gap:7px;margin:10px 0}.mw-format{display:flex;gap:9px;padding:9px;border:1px solid var(--orca-border,#4b4b4b);border-radius:7px;cursor:pointer}.mw-format:has(input:checked){border-color:var(--orca-accent,#4a9eff)}.mw-format small{display:block;color:var(--orca-muted,#aaa);margin-top:2px}#status{margin-top:10px;color:var(--orca-muted,#999);font-size:.8em}
 @media(max-width:680px){.accounts{grid-template-columns:1fr}}
@@ -3107,8 +3218,10 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <label class="portal-option"><input id="portal-pinshape" class="portal-search" type="checkbox" checked data-platform="pinshape"> Pinshape</label>
 <label class="portal-option"><input id="portal-cgtrader" class="portal-search" type="checkbox" data-platform="cgtrader"> CGTrader (browser)</label>
 </div>
+<div id="source-results" class="source-results" aria-live="polite"></div>
 <div id="results"></div>
 <nav id="pagination" class="pagination" aria-label="Search result pages"><span id="pagination-summary" class="pagination-summary"></span><label>Per page <select id="page-size" onchange="changePageSize()"><option value="12">12</option><option value="24" selected>24</option><option value="48">48</option></select></label><button id="page-prev" class="secondary page-button" type="button" onclick="setResultPage(currentPage-1)" aria-label="Previous page">&larr;</button><span id="page-numbers" class="page-numbers"></span><button id="page-next" class="secondary page-button" type="button" onclick="setResultPage(currentPage+1)" aria-label="Next page">&rarr;</button></nav>
+<div id="load-more-row" class="load-more-row"><button id="load-more" type="button" onclick="loadMoreResults()">Load more from portals</button></div>
 <div id="detail" class="panel"><button class="close" onclick="closeDetail()">&times;</button><h2 id="det-name"></h2><p id="det-author"></p><p id="det-platform"></p><p id="det-metrics"></p><p id="det-url"></p><p id="det-license"></p><p id="det-summary"></p><p class="responsibility">Downloads use your own account session and the platform's own file URL. The plugin does not host or redistribute models. You remain responsible for the model license and the platform terms.</p><button id="det-import-btn" onclick="doImport()">Import into OrcaSlicer</button><button class="secondary" onclick="doDownload()">Open in browser</button></div>
 <div id="modal-bg" class="modal-backdrop" onclick="closeTopModal()"></div>
 <div id="auth-modal" class="auth-modal">
@@ -3138,7 +3251,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <img id="image-preview" class="image-preview" alt="Enlarged file or print profile preview">
 <div id="status">Ready.</div>
 <script>
-var selectedModel=null, searching=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[], pendingMakerWorldModel=null, activeAuthHelp=null, resultImageObserver=null, makerWorldChoicesCache={}, makerWorldPrefetching={}, makerWorldPreloadedImages={}, currentPage=1, pageSize=24;
+var selectedModel=null, searching=false, canLoadMore=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[], pendingMakerWorldModel=null, activeAuthHelp=null, resultImageObserver=null, makerWorldChoicesCache={}, makerWorldPrefetching={}, makerWorldPreloadedImages={}, currentPage=1, pageSize=24;
 var $=function(id){return document.getElementById(id)};
 var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login in your browser. After MakerOnline returns, copy the mo_access_token cookie value (or its Cookie header), paste it below, and connect. You can alternatively import the Anycubic Slicer Next session. The plugin never reads the browser profile or password.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'A GrabCAD Community Library membership is required. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.'};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
@@ -3155,7 +3268,7 @@ function savePortalSelection(){try{localStorage.setItem(PORTAL_PREF_KEY,JSON.str
 function restorePortalSelection(){try{var raw=localStorage.getItem(PORTAL_PREF_KEY);if(raw){var saved=JSON.parse(raw);if(Array.isArray(saved)){var set={};saved.forEach(function(p){set[p]=true});document.querySelectorAll('.portal-search').forEach(function(x){x.checked=!!set[x.dataset.platform]})}}}catch(e){}updatePortalCount()}
 function setAllPortals(value){document.querySelectorAll('.portal-search').forEach(function(x){x.checked=!!value});updatePortalCount();savePortalSelection()}
 $('search-portals').addEventListener('change',function(e){if(e.target&&e.target.classList.contains('portal-search')){updatePortalCount();savePortalSelection()}});
-function doSearch(){if(searching)return;var q=$('query').value.trim();if(!q)return;var ps=selectedPortals();if(!ps.length){$('status').textContent='Select at least one search portal.';return}searching=true;$('search-btn').disabled=true;$('search-btn').textContent='Searching...';$('status').textContent='Searching '+ps.length+' portal(s)...';closeDetail();orca.postMessage({action:'search',query:q,platforms:ps,options:{sort:$('sort').value,free_only:$('free-only').checked,direct_only:$('direct-only').checked}})}
+function doSearch(){if(searching)return;var q=$('query').value.trim();if(!q)return;var ps=selectedPortals();if(!ps.length){$('status').textContent='Select at least one search portal.';return}searching=true;canLoadMore=false;$('search-btn').disabled=true;$('search-btn').textContent='Searching...';$('source-results').classList.remove('active');$('source-results').innerHTML='';$('load-more-row').classList.remove('active');$('status').textContent='Searching '+ps.length+' portal(s)...';closeDetail();orca.postMessage({action:'search',query:q,platforms:ps,options:{sort:$('sort').value,free_only:$('free-only').checked,direct_only:$('direct-only').checked}})}
 $('query').addEventListener('keydown',function(e){if(e.key==='Enter')doSearch()});
 function compactNumber(v){v=Number(v);if(!isFinite(v))return'';if(v>=1000000)return(v/1000000).toFixed(v>=10000000?0:1)+'M';if(v>=1000)return(v/1000).toFixed(v>=10000?0:1)+'K';return String(Math.round(v))}
 function metricText(m){var p=[];if(m.downloads!=null)p.push('Downloads '+compactNumber(m.downloads));if(m.likes!=null)p.push('Likes '+compactNumber(m.likes));if(m.rating!=null)p.push('Rating '+Number(m.rating).toFixed(1));if(m.views!=null)p.push('Views '+compactNumber(m.views));if(m.makes!=null)p.push('Prints '+compactNumber(m.makes));return p.join(' / ')}
@@ -3167,6 +3280,8 @@ function renderResultPage(){var total=window._results.length,pages=Math.max(1,Ma
 function renderResults(models,resetPage){window._results=models||[];if(resetPage!==false)currentPage=1;renderResultPage()}
 function setResultPage(page){var pages=Math.max(1,Math.ceil(window._results.length/pageSize)),next=Math.max(1,Math.min(Number(page)||1,pages));if(next===currentPage)return;currentPage=next;closeDetail();renderResultPage();$('results').scrollIntoView({behavior:'smooth',block:'start'})}
 function changePageSize(){var value=parseInt($('page-size').value,10);pageSize=value===12||value===48?value:24;currentPage=1;closeDetail();renderResultPage()}
+function renderSourceResults(sources,more){var html='',moreCount=0;(sources||[]).forEach(function(s){var loaded=Number(s.loaded)||0,visible=Number(s.visible)||0,parts=[];if(s.total!=null)parts.push(loaded+' of '+Number(s.total)+' loaded');else parts.push(loaded+' loaded');if(visible!==loaded)parts.push(visible+' shown by filters');if(s.has_more){parts.push('more available');moreCount++}else if(!s.error){parts.push(s.paginated?'complete':'first page only')}html+='<div class="source-result'+(s.error?' error':'')+'"><strong>'+esc(s.display||s.key)+'</strong><span>'+esc(parts.join(' · '))+'</span>'+(s.error?'<small>'+esc(s.error)+'</small>':'')+'</div>'});$('source-results').innerHTML=html;$('source-results').classList.toggle('active',!!html);canLoadMore=!!more&&moreCount>0;$('load-more-row').classList.toggle('active',canLoadMore);$('load-more').disabled=false;$('load-more').textContent=moreCount===1?'Load next page from 1 portal':'Load next pages from '+moreCount+' portals'}
+function loadMoreResults(){if(searching||!canLoadMore)return;searching=true;$('search-btn').disabled=true;$('load-more').disabled=true;$('load-more').textContent='Loading...';$('status').textContent='Loading next portal pages...';orca.postMessage({action:'search_more'})}
 function modelIdentity(m){return String((m&&m._platform_key)||platformKey(m&&m.platform)||'')+'|'+String((m&&m._thing_id)||(m&&m._model_id)||(m&&m.url)||'')}
 function preloadMakerWorldImages(key,profiles){var images=[];(profiles||[]).forEach(function(p){var url=safeUrl(p.cover);if(!url)return;var img=new Image();img.decoding='async';img.src=url;images.push(img)});makerWorldPreloadedImages[key]=images}
 function cacheMakerWorldChoices(msg){var model=msg.model||selectedModel;if(!model)return;var key=modelIdentity(model);makerWorldChoicesCache[key]={profiles:msg.profiles||[],formats:msg.formats||[],default_profile_id:msg.default_profile_id||''};makerWorldPrefetching[key]=false;if(!makerWorldPreloadedImages[key])preloadMakerWorldImages(key,msg.profiles||[])}
@@ -3207,7 +3322,7 @@ function importAnycubic(){orca.postMessage({action:'auth_import_anycubic'});$('s
 orca.onMessage(function(msg){
   msg=msg||{};
   if(msg.action==='results'){
-    searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[]);
+    searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';renderResults(msg.results||[],msg.append?false:true);renderSourceResults(msg.sources||[],msg.can_load_more);
   }else if(msg.action==='model_details'){
     applyModelDetails(msg.model||{});
   }else if(msg.action==='auth_status'||msg.action==='auth_changed'){
@@ -3243,6 +3358,7 @@ orca.onMessage(function(msg){
     var q=$('query');if(q){q.focus();q.select()}
   }else if(msg.action==='error'){
     searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;
+    if($('load-more')){$('load-more').disabled=false;$('load-more').textContent='Load more from portals'}
     if($('det-import-btn')){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer'}
     if($('file-import'))$('file-import').disabled=false;
     if($('mw-import'))$('mw-import').disabled=false;
@@ -3267,6 +3383,15 @@ if orca is not None:
             self._pending_import_lock = threading.RLock()
             self._pending_import_model = None
             self._pending_import_files = []
+            self._search_lock = threading.RLock()
+            self._search_generation = 0
+            self._search_loading_more = False
+            self._search_query = ""
+            self._search_platforms = []
+            self._search_options = {}
+            self._search_results = []
+            self._search_pages = {}
+            self._search_stats = {}
 
         def get_name(self):
             return "Search 3D Models"
@@ -3307,6 +3432,7 @@ if orca is not None:
             msg = msg or {}
             handler = {
                 "search": self._handle_search,
+                "search_more": self._handle_search_more,
                 "model_details": self._handle_model_details,
                 "prefetch_makerworld_profiles": self._handle_makerworld_prefetch,
                 "resolve_import": self._handle_resolve_import,
@@ -3323,7 +3449,19 @@ if orca is not None:
                 handler(msg)
 
         def _handle_search(self, msg):
-            self._start(self._do_search, msg)
+            with self._search_lock:
+                self._search_generation += 1
+                generation = self._search_generation
+                self._search_loading_more = False
+            self._start(self._do_search, msg, generation)
+
+        def _handle_search_more(self, _msg):
+            with self._search_lock:
+                if self._search_loading_more or not self._search_query:
+                    return
+                self._search_loading_more = True
+                generation = self._search_generation
+            self._start(self._do_search_more, generation)
 
         def _handle_model_details(self, msg):
             model = msg.get("model") or {}
@@ -3441,36 +3579,154 @@ if orca is not None:
                 f"Imported Anycubic session from {data.get('source', 'Anycubic Slicer Next')}.",
             )
 
-        def _do_search(self, msg):
-            query = msg.get("query", "")
+        def _load_search_page(self, spec, query, options, page):
+            page_options = dict(options)
+            page_options["page"] = page
+            items = spec.adapter.search(query, self.auth, page_options)
+            total = getattr(items, "total", None)
+            has_more = getattr(items, "has_more", None)
+            rows = list(items)
+            for item in rows:
+                item["_platform_key"] = spec.key
+                item["authenticated"] = not item.get(
+                    "requires_auth"
+                ) or self.auth.authenticated(spec.key)
+                item["importable"] = callable(
+                    getattr(spec.adapter, "get_files", None)
+                )
+            if not spec.paginated_search:
+                has_more = False
+            elif has_more is None:
+                has_more = len(rows) >= spec.search_page_size
+            return rows, total, bool(has_more)
+
+        def _search_payload(self, *, append):
+            with self._search_lock:
+                results = list(self._search_results)
+                options = dict(self._search_options)
+                platforms = list(self._search_platforms)
+                stats = {key: dict(value) for key, value in self._search_stats.items()}
+            visible_results = _filter_and_sort_results(results, options)
+            visible_counts = {}
+            for item in visible_results:
+                key = str(item.get("_platform_key") or "")
+                visible_counts[key] = visible_counts.get(key, 0) + 1
+            sources = []
+            for key in platforms:
+                source = stats.get(key)
+                if source is None:
+                    continue
+                source["visible"] = visible_counts.get(key, 0)
+                sources.append(source)
+            return {
+                "action": "results",
+                "append": append,
+                "results": visible_results,
+                "sources": sources,
+                "can_load_more": any(source.get("has_more") for source in sources),
+            }
+
+        def _do_search(self, msg, generation):
+            query = str(msg.get("query") or "").strip()
             options = msg.get("options") if isinstance(msg.get("options"), dict) else {}
+            platforms = [
+                key
+                for key in dict.fromkeys(msg.get("platforms", []))
+                if _platform(key) is not None
+            ]
             results = []
-            errors = []
-            for platform in dict.fromkeys(msg.get("platforms", [])):
-                spec = _platform(platform)
+            stats = {}
+            pages = {}
+            for key in platforms:
+                spec = _platform(key)
                 if spec is None:
                     continue
                 try:
-                    items = spec.adapter.search(query, self.auth, options)
-                    for item in items:
-                        item["_platform_key"] = spec.key
-                        item["authenticated"] = not item.get(
-                            "requires_auth"
-                        ) or self.auth.authenticated(spec.key)
-                        item["importable"] = callable(
-                            getattr(spec.adapter, "get_files", None)
-                        )
-                    results.extend(items)
+                    items, total, has_more = self._load_search_page(
+                        spec, query, options, 1
+                    )
+                    results, _added = _merge_unique_results(results, items)
+                    pages[key] = 1
+                    stats[key] = {
+                        "key": key,
+                        "display": spec.display,
+                        "loaded": sum(
+                            item.get("_platform_key") == key for item in results
+                        ),
+                        "page": 1,
+                        "total": total,
+                        "has_more": has_more,
+                        "paginated": spec.paginated_search,
+                        "error": "",
+                    }
                 except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-                    errors.append(f"{platform}: {exc}")
-            self._post(
-                {
-                    "action": "results",
-                    "results": _filter_and_sort_results(results, options),
-                }
-            )
-            if errors:
-                self._post({"action": "status", "message": " | ".join(errors)})
+                    pages[key] = 0
+                    stats[key] = {
+                        "key": key,
+                        "display": spec.display,
+                        "loaded": 0,
+                        "page": 0,
+                        "total": None,
+                        "has_more": False,
+                        "paginated": spec.paginated_search,
+                        "error": str(exc),
+                    }
+            with self._search_lock:
+                if generation != self._search_generation:
+                    return
+                self._search_query = query
+                self._search_platforms = platforms
+                self._search_options = dict(options)
+                self._search_results = results
+                self._search_pages = pages
+                self._search_stats = stats
+                self._search_loading_more = False
+            self._post(self._search_payload(append=False))
+
+        def _do_search_more(self, generation):
+            with self._search_lock:
+                query = self._search_query
+                options = dict(self._search_options)
+                platforms = list(self._search_platforms)
+                results = list(self._search_results)
+                pages = dict(self._search_pages)
+                stats = {key: dict(value) for key, value in self._search_stats.items()}
+            for key in platforms:
+                source = stats.get(key) or {}
+                if not source.get("has_more"):
+                    continue
+                spec = _platform(key)
+                if spec is None:
+                    continue
+                next_page = pages.get(key, 0) + 1
+                try:
+                    items, total, has_more = self._load_search_page(
+                        spec, query, options, next_page
+                    )
+                    results, added = _merge_unique_results(results, items)
+                    pages[key] = next_page
+                    source.update(
+                        {
+                            "loaded": sum(
+                                item.get("_platform_key") == key for item in results
+                            ),
+                            "page": next_page,
+                            "total": total if total is not None else source.get("total"),
+                            "has_more": has_more and added > 0,
+                            "error": "",
+                        }
+                    )
+                except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+                    source["error"] = str(exc)
+                stats[key] = source
+            with self._search_lock:
+                if generation != self._search_generation:
+                    return
+                self._search_results = results
+                self._search_pages = pages
+                self._search_stats = stats
+                self._search_loading_more = False
+            self._post(self._search_payload(append=True))
 
         def _do_model_details(self, model):
             result = dict(model)
@@ -3488,6 +3744,12 @@ if orca is not None:
                     result["_details_loaded"] = True
                     result["_details_error"] = str(exc)
             result["_details_loading"] = False
+            identity = _result_identity(result)
+            with self._search_lock:
+                for index, item in enumerate(self._search_results):
+                    if _result_identity(item) == identity:
+                        self._search_results[index] = dict(result)
+                        break
             self._post({"action": "model_details", "model": result})
 
         def _resolve_import(self, model):

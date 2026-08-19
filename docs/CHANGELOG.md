@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.7.0
+
+- Added real server-side pagination for Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, and MyMiniFactory, using each service's page or offset parameter.
+- Added a **Load next pages** action that fetches every eligible selected source, de-duplicates new models, reapplies global filters/sorting, and preserves the current display page.
+- Added per-source result diagnostics with loaded and visible counts, exact totals when exposed, pagination/exhaustion state, first-page-only labels, and portal-specific errors.
+- Kept lazy-loaded model details in the server-side result cache so loading more pages cannot revert updated license or metric metadata.
+
 ## 0.6.2
 
 - Fixed MyMiniFactory search cards by reading official nested image variants such as `images[].thumbnail.url` and preferring the primary image.

@@ -10,9 +10,10 @@ mod = load_plugin("search_engine_catalog")
 
 
 class FakeResponse:
-    def __init__(self, payload, status_code=200):
+    def __init__(self, payload, status_code=200, headers=None):
         self.payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -36,8 +37,10 @@ class CatalogSearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
             auth.save_token("thingiverse", "token")
-            with mock.patch.object(auth, "request", return_value=FakeResponse(payload)):
-                rows = mod.ThingiverseSearcher.search("cube", auth)
+            with mock.patch.object(
+                auth, "request", return_value=FakeResponse(payload)
+            ) as request:
+                rows = mod.ThingiverseSearcher.search("cube", auth, {"page": 2})
         self.assertEqual(rows[0]["platform"], "Thingiverse")
         self.assertEqual(rows[0]["name"], "Calibration cube")
         self.assertTrue(rows[0]["requires_auth"])
@@ -45,6 +48,7 @@ class CatalogSearchTests(unittest.TestCase):
         self.assertIn("thing:7379392", rows[0]["url"])
         self.assertTrue(rows[0]["_details_available"])
         self.assertFalse(rows[0]["_details_loaded"])
+        self.assertEqual(request.call_args.kwargs["params"]["page"], 2)
 
     def test_thingiverse_details_supply_canonical_license_and_metrics(self):
         payload = {
@@ -121,8 +125,10 @@ class CatalogSearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
             auth.save_token("myminifactory", "api-key")
-            with mock.patch.object(auth, "request", return_value=FakeResponse(payload)):
-                rows = mod.MyMiniFactorySearcher.search("yak", auth)
+            with mock.patch.object(
+                auth, "request", return_value=FakeResponse(payload)
+            ) as request:
+                rows = mod.MyMiniFactorySearcher.search("yak", auth, {"page": 3})
         self.assertEqual(rows[0]["name"], "Yak Mount")
         self.assertEqual(rows[0]["platform"], "MyMiniFactory")
         self.assertEqual(rows[0]["views"], 50)
@@ -135,6 +141,40 @@ class CatalogSearchTests(unittest.TestCase):
             "https://www.myminifactory.com/object-licensing",
         )
         self.assertIn("Non-commercial personal use", rows[0]["license_summary"])
+        self.assertEqual(request.call_args.kwargs["params"]["page"], 3)
+
+    def test_api_searchers_send_real_page_parameters(self):
+        response = FakeResponse({"code": 0, "data": {"data": []}})
+        with mock.patch("requests.post", return_value=response) as post:
+            rows = mod.MakeronlineSearcher.search("cube", None, {"page": 4})
+        self.assertEqual(post.call_args.kwargs["json"]["page"], 4)
+        self.assertIsInstance(rows, mod.SearchPage)
+
+        response = FakeResponse({"code": 0, "data": {"pageResult": {"list": [], "total": 61}}})
+        with mock.patch("requests.get", return_value=response) as get:
+            rows = mod.NexprintSearcher.search("cube", None, {"page": 2})
+        self.assertEqual(get.call_args.kwargs["params"]["pageNo"], "2")
+        self.assertEqual(rows.total, 61)
+        self.assertTrue(rows.has_more)
+
+    def test_printables_and_makerworld_use_offsets(self):
+        printables_payload = {"data": {"searchPrints2": {"items": []}}}
+        with mock.patch(
+            "requests.post", return_value=FakeResponse(printables_payload)
+        ) as post:
+            mod.PrintablesSearcher.search("cube", None, {"page": 3})
+        variables = post.call_args.kwargs["json"]["variables"]
+        self.assertEqual(variables["offset"], 60)
+        self.assertIn("offset: $offset", mod.PrintablesSearcher.SEARCH_QUERY)
+
+        makerworld_payload = {"hits": [], "total": 75}
+        with mock.patch(
+            "requests.get", return_value=FakeResponse(makerworld_payload)
+        ) as get:
+            rows = mod.MakerWorldSearcher.search("cube", None, {"page": 2})
+        self.assertEqual(get.call_args.kwargs["params"]["offset"], "30")
+        self.assertEqual(rows.total, 75)
+        self.assertTrue(rows.has_more)
 
     def test_myminifactory_store_flag_supplies_license_fallback(self):
         row = mod._myminifactory_result(
@@ -510,6 +550,54 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn("index=start+i", mod.PAGE)
         self.assertIn("renderResults(window._results,false)", mod.PAGE)
 
+    def test_search_results_support_server_side_pagination(self):
+        self.assertIn('id="source-results"', mod.PAGE)
+        self.assertIn('id="load-more"', mod.PAGE)
+        self.assertIn("function loadMoreResults()", mod.PAGE)
+        self.assertIn("orca.postMessage({action:'search_more'})", mod.PAGE)
+        self.assertIn("function renderSourceResults(sources,more)", mod.PAGE)
+        self.assertEqual(
+            {
+                key
+                for key, spec in mod._PLATFORMS.items()
+                if spec.paginated_search
+            },
+            {
+                "printables",
+                "nexprint",
+                "makeronline",
+                "makerworld",
+                "thingiverse",
+                "myminifactory",
+            },
+        )
+
+    def test_search_page_helpers_clamp_and_deduplicate(self):
+        self.assertEqual(mod._search_page_number({"page": 0}), 1)
+        self.assertEqual(mod._search_page_number({"page": 1000}), 100)
+        existing = [
+            {
+                "_platform_key": "printables",
+                "_model_id": 1,
+                "name": "First",
+            }
+        ]
+        incoming = [
+            {
+                "_platform_key": "printables",
+                "_model_id": 1,
+                "name": "Duplicate",
+            },
+            {
+                "_platform_key": "printables",
+                "_model_id": 2,
+                "name": "Second",
+            },
+        ]
+        merged, added = mod._merge_unique_results(existing, incoming)
+        self.assertEqual(added, 1)
+        self.assertEqual([row["name"] for row in merged], ["First", "Second"])
+
     def test_common_sort_puts_missing_metrics_last(self):
         rows = mod._filter_and_sort_results(
             [
@@ -559,10 +647,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_062(self):
+    def test_version_is_070(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.6.2"', head)
+        self.assertIn('# version = "0.7.0"', head)
 
 
 if __name__ == "__main__":

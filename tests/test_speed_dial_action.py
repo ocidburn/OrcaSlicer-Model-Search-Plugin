@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest import mock
 
 from tests._module_loader import load_plugin
 
@@ -97,6 +98,47 @@ class SpeedDialActionTests(unittest.TestCase):
         action.execute()
         self.assertEqual(len(ui.created), 2)
         self.assertIsNot(action.win, first_window)
+
+    def test_search_more_merges_pages_and_reports_source_progress(self):
+        module, _ = load_with_fake_orca()
+        action = module.SearchEngineScript()
+        action.win = FakeWindow()
+
+        def search(_query, _auth, options):
+            page = options["page"]
+            row = {
+                "name": f"Model {page}",
+                "platform": "Printables",
+                "url": f"https://www.printables.com/model/{page}",
+            }
+            return module.SearchPage(
+                [row], total=2, has_more=page == 1
+            )
+
+        with mock.patch.object(
+            module.PrintablesSearcher, "search", side_effect=search
+        ):
+            action._search_generation = 1
+            action._do_search(
+                {
+                    "query": "cube",
+                    "platforms": ["printables"],
+                    "options": {},
+                },
+                1,
+            )
+            first = action.win.posts[-1]
+            self.assertFalse(first["append"])
+            self.assertTrue(first["can_load_more"])
+            self.assertEqual(first["sources"][0]["loaded"], 1)
+
+            action._do_search_more(1)
+            second = action.win.posts[-1]
+            self.assertTrue(second["append"])
+            self.assertFalse(second["can_load_more"])
+            self.assertEqual(len(second["results"]), 2)
+            self.assertEqual(second["sources"][0]["loaded"], 2)
+            self.assertEqual(second["sources"][0]["visible"], 2)
 
 
 if __name__ == "__main__":

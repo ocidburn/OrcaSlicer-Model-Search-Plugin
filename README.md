@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.6.2**
+**Current plugin version: v0.7.0**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -23,7 +23,9 @@ The selected search portals are remembered by the embedded UI and restored the n
 
 ## Main features
 
-- Search across 17 model catalogs and browser fallbacks from one OrcaSlicer window.
+- Search across 13 model catalogs and browser fallbacks from one OrcaSlicer window.
+- Load additional API result pages without discarding or duplicating models already shown.
+- Per-source progress shows loaded/visible counts, known catalog totals, more-page availability, first-page-only sources, and individual portal errors.
 - Sort merged results by relevance, normalized popularity, downloads, likes, rating, date, print count, name, or platform.
 - Filter to models explicitly marked free or to sources with a direct-import path.
 - A dedicated checkbox for every registered search adapter.
@@ -180,6 +182,8 @@ Raw counters from different portals are not directly comparable. **Popularity (n
 **Free only** includes only results whose source explicitly marks them free. **Direct import only** removes browser-only search cards and sources without a direct file path.
 
 The merged, sorted result set is paginated in the search window. The default is 24 cards per page, with 12, 24, and 48-card options, numbered page navigation, previous/next controls, and a visible result range. A new search returns to page one.
+
+This display pagination is separate from portal pagination. **Load next pages** fetches the next 30-result page from every selected API source that reports more results, merges models without duplicates, and reapplies the active filters and global sort. Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, and MyMiniFactory support this flow. HTML catalogs and browser fallbacks are explicitly labelled **first page only** because they do not expose a stable paginated API.
 
 ## Search-source selection
 
@@ -372,7 +376,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.6.2 validation gates are:
+The v0.7.0 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check
@@ -382,6 +386,7 @@ The v0.6.2 validation gates are:
 - Bandit: no unreviewed findings
 - Radon complexity report and Windows IPC smoke test
 - opt-in live search smoke across public programmatic catalogs
+- live first/second-page verification for public paginated APIs, including duplicate detection
 
 ## Current limitations
 

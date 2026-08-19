@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.8.7**
+**Current plugin version: v0.8.8**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -216,7 +216,7 @@ Raw counters from different portals are not directly comparable. **Popularity (n
 
 **Free only** includes only results whose source explicitly marks them free. **Direct import only** removes browser-only search cards and sources without a direct file path.
 
-The merged, sorted result set is paginated in the search window. The default is 24 cards per page, with 12, 24, and 48-card options, numbered page navigation, previous/next controls, and a visible result range. A new search returns to page one.
+The merged, sorted result set is paginated in the search window. The default is 100 cards per page, with 100, 150, 200, 250, and 300-card options, numbered page navigation, previous/next controls, and a visible result range. A new search returns to page one.
 
 This display pagination is separate from portal pagination. **Load next pages** fetches the next source page from every selected portal that reports more results, merges models without duplicates, and reapplies the active filters and global sort. Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, MyMiniFactory, Thangs, STLFinder, Smithsonian 3D, and NIH 3D support this flow. Other HTML catalogs and browser fallbacks are explicitly labelled **first page only** because they do not expose a stable paginated interface.
 
@@ -420,7 +420,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.8.7 validation gates are:
+The v0.8.8 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

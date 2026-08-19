@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.8.8
+
+- Increased the default client-side result page size to 100 cards and replaced
+  the previous choices with 100, 150, 200, 250, and 300 cards per page.
+
 ## 0.8.7
 
 - Applied and independently verified the v0.8.5 refactoring review against the

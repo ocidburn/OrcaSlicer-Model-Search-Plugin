@@ -950,6 +950,11 @@ class RegistryAndUiTests(unittest.TestCase):
     def test_search_results_have_client_side_pagination(self):
         self.assertIn('id="pagination"', mod.PAGE)
         self.assertIn('id="page-size"', mod.PAGE)
+        self.assertIn('<option value="100" selected>100</option>', mod.PAGE)
+        for size in (150, 200, 250, 300):
+            self.assertIn(f'<option value="{size}">{size}</option>', mod.PAGE)
+        self.assertIn("currentPage=1, pageSize=100", mod.PAGE)
+        self.assertIn("[100,150,200,250,300].indexOf(value)", mod.PAGE)
         self.assertIn('id="page-prev"', mod.PAGE)
         self.assertIn('id="page-next"', mod.PAGE)
         self.assertIn("function paginationItems(page,total)", mod.PAGE)
@@ -1088,10 +1093,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_087(self):
+    def test_version_is_088(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.8.7"', head)
+        self.assertIn('# version = "0.8.8"', head)
 
 
 if __name__ == "__main__":

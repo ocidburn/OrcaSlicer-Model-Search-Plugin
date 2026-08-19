@@ -201,6 +201,21 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertIsNone(action._pending_import_model)
         self.assertEqual(action._pending_import_files, [])
 
+    def test_empty_file_selection_keeps_pending_import(self):
+        _mod, action = self.make_action()
+        model = {"platform": "Printables", "name": "Demo"}
+        files = [{"name": "a.stl", "url": "https://cdn.example/a.stl"}]
+        action._pending_import_model = model
+        action._pending_import_files = files
+
+        with mock.patch.object(action, "_download_and_import") as download:
+            action._import_selected([])
+
+        download.assert_not_called()
+        self.assertIs(action._pending_import_model, model)
+        self.assertEqual(action._pending_import_files, files)
+        self.assertEqual(action.win.posts[-1]["message"], "Select at least one file to import.")
+
     def test_ui_contains_multifile_checkbox_picker(self):
         mod = load_module()
         self.assertIn('id="file-modal"', mod.PAGE)

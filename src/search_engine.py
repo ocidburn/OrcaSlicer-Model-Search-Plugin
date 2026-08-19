@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community and public institutional catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.8.6"
+# version = "0.8.7"
 # ///
 
 import html
@@ -35,7 +35,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.8.6 "
+    "OrcaSlicer-Model-Search-Plugin/0.8.7 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _STANDARD_BROWSER_UA = (
@@ -60,6 +60,7 @@ _MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 _MAX_REDIRECTS = 5
 _DETAIL_PREFETCH_WORKERS = 4
+_SEARCH_WORKERS = 8
 
 LICENSE_DESCRIPTIONS = {
     "CC BY": "Share and adapt for any purpose. Must credit the author.",
@@ -224,8 +225,10 @@ class PlatformSpec:
         "display",
         "key",
         "login_url",
+        "profile_picker",
         "referer",
         "search_page_size",
+        "session_recheck",
     )
 
     def __init__(
@@ -241,6 +244,8 @@ class PlatformSpec:
         cookie_domain="",
         cookie_name="",
         search_page_size=0,
+        profile_picker=False,
+        session_recheck=False,
     ):
         self.key = key
         self.display = display
@@ -252,6 +257,8 @@ class PlatformSpec:
         self.cookie_domain = cookie_domain
         self.cookie_name = cookie_name
         self.search_page_size = max(0, int(search_page_size))
+        self.profile_picker = bool(profile_picker)
+        self.session_recheck = bool(session_recheck)
 
     @property
     def requires_auth(self):
@@ -356,6 +363,17 @@ def _normalize_result(item, source_rank=0):
     return normalized
 
 
+def _popularity_ranks(by_platform):
+    """Map each raw score to its first ascending position per platform."""
+    ranks = {}
+    for platform, values in by_platform.items():
+        positions = {}
+        for position, value in enumerate(sorted(values)):
+            positions.setdefault(value, position)
+        ranks[platform] = (positions, len(values))
+    return ranks
+
+
 def _add_popularity_scores(results):
     """Create a platform-relative score; raw counters are not cross-site units."""
     by_platform = {}
@@ -375,14 +393,15 @@ def _add_popularity_scores(results):
             raw += max(0.0, rating) * 0.75
         item["_popularity_raw"] = raw
         by_platform.setdefault(item.get("platform", ""), []).append(raw)
+    ranks = _popularity_ranks(by_platform)
     for item in results:
-        values = sorted(by_platform.get(item.get("platform", ""), ()))
+        positions, count = ranks.get(item.get("platform", ""), ({}, 0))
         raw = item.get("_popularity_raw", 0.0)
-        if not values or raw <= 0:
+        if not count or raw <= 0:
             item["popularity"] = None
             continue
         item["popularity"] = (
-            100.0 if len(values) == 1 else 100.0 * values.index(raw) / (len(values) - 1)
+            100.0 if count == 1 else 100.0 * positions[raw] / (count - 1)
         )
 
 
@@ -435,6 +454,33 @@ def _filter_and_sort_results(results, options=None):
     return normalized
 
 
+def _source_stats(
+    spec, *, page=0, total=None, has_more=False, error="", browser_url=""
+):
+    """Create one search-source status row; loaded is filled after merging."""
+    return {
+        "key": spec.key,
+        "display": spec.display,
+        "loaded": 0,
+        "page": page,
+        "total": total,
+        "has_more": has_more,
+        "paginated": spec.paginated_search,
+        "error": error,
+        "browser_url": browser_url,
+    }
+
+
+def _apply_loaded_counts(results, stats):
+    """Count merged rows once instead of rescanning them for every portal."""
+    counts = {}
+    for item in results:
+        key = item.get("_platform_key")
+        counts[key] = counts.get(key, 0) + 1
+    for key, source in stats.items():
+        source["loaded"] = counts.get(key, 0)
+
+
 def _result_identity(item):
     platform = str(item.get("_platform_key") or item.get("platform") or "").casefold()
     identifier = _coalesce(
@@ -484,6 +530,11 @@ def _platform_for_display(display):
 def _platform_for_model(model):
     spec = _platform(str(model.get("_platform_key") or ""))
     return spec or _platform_for_display(model.get("platform", ""))
+
+
+def _session_recheck(key):
+    spec = _platform(key)
+    return spec is not None and spec.session_recheck
 
 
 def _display_name(key):
@@ -657,14 +708,12 @@ class AuthManager:
         if mode == "cookie_header" and token.lower().startswith("cookie:"):
             token = token.split(":", 1)[1].strip()
         if mode == "anycubic":
-            m = re.search(r"(?i)(?:^|[;\s])mo_access_token=([^;\s]+)", token)
-            if m:
-                token = m.group(1).strip()
-            else:
-                m = re.match(
-                    r"(?i)^(?:XX-Token|Authorization)\s*:\s*(?:Bearer\s+)?(.+)$",
-                    token,
-                )
+            m = re.search(
+                r"(?i)(?:^|[;\s])mo_access_token=([^;\s]+)", token
+            ) or re.match(
+                r"(?i)^(?:XX-Token|Authorization)\s*:\s*(?:Bearer\s+)?(.+)$",
+                token,
+            )
             if m:
                 token = m.group(1).strip()
         if mode == "creality" and token.lower().startswith("cookie:"):
@@ -978,7 +1027,7 @@ class AuthManager:
 # Public web-catalog helpers
 # ---------------------------------------------------------------------------
 
-_MODEL_FILE_EXTS = (
+_LOADABLE_MODEL_EXTS = (
     ".3mf",
     ".stl",
     ".obj",
@@ -991,8 +1040,8 @@ _MODEL_FILE_EXTS = (
     ".scad",
     ".fcstd",
     ".f3d",
-    ".zip",
 )
+_MODEL_FILE_EXTS = _LOADABLE_MODEL_EXTS + (".zip",)
 _IMAGE_EXTS = (
     ".jpg",
     ".jpeg",
@@ -1103,50 +1152,51 @@ def _is_cloudflare_challenge(response):
 
 
 def _fetch_html(url, auth=None, platform="", timeout=30):
-    import requests
-
-    session = (
-        auth.session(platform) if auth is not None and platform else requests.Session()
-    )
+    """Fetch HTML with the same redirect and SSRF policy for every caller."""
+    if auth is not None and platform:
+        manager = auth
+        key = platform
+    else:
+        manager = AuthManager()
+        key = ""
+    session = manager.session(key)
 
     def request(headers):
-        if auth is not None and platform:
-            return auth.request(
-                platform,
-                "GET",
-                url,
-                session=session,
-                timeout=timeout,
-                allow_redirects=True,
-                headers=headers,
-            )
-        return session.get(
+        return manager.request(
+            key,
+            "GET",
             url,
+            session=session,
             timeout=timeout,
             allow_redirects=True,
             headers=headers,
         )
 
-    response = request({"User-Agent": _BROWSER_UA, "Accept": _HTML_ACCEPT})
-    if _is_cloudflare_challenge(response):
-        response.close()
-        response = request(dict(_STANDARD_BROWSER_HTML_HEADERS))
+    response = None
+    try:
+        response = request({"User-Agent": _BROWSER_UA, "Accept": _HTML_ACCEPT})
         if _is_cloudflare_challenge(response):
-            challenged_url = response.url or url
             response.close()
-            raise CloudflareChallenge(
-                "Cloudflare still requires browser verification after retrying "
-                "with a standard browser User-Agent. Open the page in your "
-                "browser and try the search again later.",
-                challenged_url,
+            response = request(dict(_STANDARD_BROWSER_HTML_HEADERS))
+            if _is_cloudflare_challenge(response):
+                challenged_url = response.url or url
+                raise CloudflareChallenge(
+                    "Cloudflare still requires browser verification after retrying "
+                    "with a standard browser User-Agent. Open the page in your "
+                    "browser and try the search again later.",
+                    challenged_url,
+                )
+        if response.status_code in (401, 403) and _session_recheck(platform):
+            display = _display_name(platform)
+            raise AuthRequired(
+                f"{display} rejected the browser session. Sign in again and paste a fresh Cookie header."
             )
-    if response.status_code in (401, 403) and platform in ("grabcad", "cults3d"):
-        display = _display_name(platform)
-        raise AuthRequired(
-            f"{display} rejected the browser session. Sign in again and paste a fresh Cookie header."
-        )
-    response.raise_for_status()
-    return response.text, response.url
+        response.raise_for_status()
+        return response.text, response.url
+    finally:
+        if response is not None:
+            response.close()
+        session.close()
 
 
 def _looks_like_login_page(raw, platform=""):
@@ -1326,7 +1376,7 @@ def _request_probe(session, url, auth, platform, use_range):
 
 
 def _probe_result(response, platform):
-    if response.status_code in (401, 403) and platform in ("grabcad", "cults3d"):
+    if response.status_code in (401, 403) and _session_recheck(platform):
         raise AuthRequired(
             f"{_display_name(platform)} session was rejected while resolving files."
         )
@@ -1371,18 +1421,23 @@ def _probe_download(url, auth=None, platform=""):
     request_auth = auth or AuthManager()
     session = request_auth.session(platform)
     try:
-        response = _request_probe(session, url, request_auth, platform, use_range=True)
-        if response.status_code in (405, 416):
-            response.close()
+        try:
             response = _request_probe(
-                session, url, request_auth, platform, use_range=False
+                session, url, request_auth, platform, use_range=True
             )
-    except (requests.RequestException, ValueError):
-        return None
-    try:
-        return _probe_result(response, platform)
+            if response.status_code in (405, 416):
+                response.close()
+                response = _request_probe(
+                    session, url, request_auth, platform, use_range=False
+                )
+        except (requests.RequestException, ValueError):
+            return None
+        try:
+            return _probe_result(response, platform)
+        finally:
+            response.close()
     finally:
-        response.close()
+        session.close()
 
 
 def _collect_page_candidates(urls, auth, platform_key):
@@ -1399,7 +1454,7 @@ def _collect_page_candidates(urls, auth, platform_key):
             raise
         except (requests.RequestException, OSError, ValueError):
             continue
-        if platform_key in ("cults3d", "grabcad") and _looks_like_login_page(
+        if _session_recheck(platform_key) and _looks_like_login_page(
             raw, platform_key
         ):
             display = _display_name(platform_key)
@@ -1631,22 +1686,30 @@ class MakeronlineSearcher:
             "Makeronline model id is missing",
         )
         session = auth.session("makeronline")
-        response = auth.request(
-            "makeronline",
-            "GET",
-            f"{MAKERONLINE_BASE}/api/mold/detail",
-            session=session,
-            params={"id": mold_id},
-            timeout=30,
-        )
-        if response.status_code in (401, 403):
-            raise AuthRequired("Makeronline session was rejected; log in again")
-        detail = _api_data(response, "Makeronline detail API failed")
-        return _file_records(
-            detail.get("files"),
-            ("url", "file_url", "download_url"),
-            ("file_name", "name"),
-        )
+        try:
+            response = auth.request(
+                "makeronline",
+                "GET",
+                f"{MAKERONLINE_BASE}/api/mold/detail",
+                session=session,
+                params={"id": mold_id},
+                timeout=30,
+            )
+            try:
+                if response.status_code in (401, 403):
+                    raise AuthRequired(
+                        "Makeronline session was rejected; log in again"
+                    )
+                detail = _api_data(response, "Makeronline detail API failed")
+            finally:
+                response.close()
+            return _file_records(
+                detail.get("files"),
+                ("url", "file_url", "download_url"),
+                ("file_name", "name"),
+            )
+        finally:
+            session.close()
 
 
 NEXPRINT_LICENSES = {
@@ -1735,20 +1798,27 @@ class NexprintSearcher:
         if not auth.authenticated("nexprint"):
             raise AuthRequired("Nexprint requires a logged-in auth_token session")
         session = auth.session("nexprint")
-        detail = NexprintSearcher._load_detail(model, auth, session)
-        profile_id = str(model.get("_profile_id") or "").strip()
-        if not profile_id:
-            return NexprintSearcher._legacy_model_files(detail)
-        if not profile_id.isdigit():
-            raise ValueError("Select a Nexprint print profile before downloading")
-        if model.get("_download_format") != "3mf":
-            raise ValueError("Nexprint direct profile import supports 3MF only")
-        selected = NexprintSearcher._selected_profile(detail, profile_id)
-        file_info = NexprintSearcher._profile_file(selected)
-        signed = NexprintSearcher._signed_profile(
-            profile_id, file_info, auth, session
-        )
-        return [NexprintSearcher._profile_download(selected, file_info, signed, model)]
+        try:
+            detail = NexprintSearcher._load_detail(model, auth, session)
+            profile_id = str(model.get("_profile_id") or "").strip()
+            if not profile_id:
+                return NexprintSearcher._legacy_model_files(detail)
+            if not profile_id.isdigit():
+                raise ValueError("Select a Nexprint print profile before downloading")
+            if model.get("_download_format") != "3mf":
+                raise ValueError("Nexprint direct profile import supports 3MF only")
+            selected = NexprintSearcher._selected_profile(detail, profile_id)
+            file_info = NexprintSearcher._profile_file(selected)
+            signed = NexprintSearcher._signed_profile(
+                profile_id, file_info, auth, session
+            )
+            return [
+                NexprintSearcher._profile_download(
+                    selected, file_info, signed, model
+                )
+            ]
+        finally:
+            session.close()
 
     @staticmethod
     def _legacy_model_files(detail):
@@ -1795,9 +1865,12 @@ class NexprintSearcher:
             },
             timeout=30,
         )
-        payload = NexprintSearcher._response_data(
-            response, "Nexprint could not create a signed profile URL", auth=True
-        )
+        try:
+            payload = NexprintSearcher._response_data(
+                response, "Nexprint could not create a signed profile URL", auth=True
+            )
+        finally:
+            response.close()
         files = payload.get("fileInfoList") if isinstance(payload, dict) else None
         if not isinstance(files, list) or not files or not isinstance(files[0], dict):
             raise RuntimeError("Nexprint did not return signed profile metadata")
@@ -1870,6 +1943,7 @@ class NexprintSearcher:
         import requests
 
         model_id = NexprintSearcher._model_id(model)
+        owned_session = None
         if auth is None:
             response = requests.get(
                 NexprintSearcher.DETAIL_URL,
@@ -1878,6 +1952,9 @@ class NexprintSearcher:
                 timeout=30,
             )
         else:
+            if session is None:
+                owned_session = auth.session("nexprint")
+                session = owned_session
             response = auth.request(
                 "nexprint",
                 "GET",
@@ -1886,9 +1963,14 @@ class NexprintSearcher:
                 params={"id": model_id},
                 timeout=30,
             )
-        return NexprintSearcher._response_data(
-            response, "Nexprint detail API failed"
-        )
+        try:
+            return NexprintSearcher._response_data(
+                response, "Nexprint detail API failed"
+            )
+        finally:
+            response.close()
+            if owned_session is not None:
+                owned_session.close()
 
     @staticmethod
     def _profile_cover(item):
@@ -2379,47 +2461,50 @@ class MakerWorldSearcher:
             model, "_model_id", r"/models/(\d+)", "MakerWorld design id is missing"
         )
         session = auth.session("makerworld")
-        design = MakerWorldSearcher._load_design(design_id, auth, session)
-        profiles = MakerWorldSearcher._load_profiles(
-            design_id, design, auth, session, complete=True
-        )
-        requested = MakerWorldSearcher._profile_from_url(model.get("url", ""))
-        default = next(
-            (
-                item["profile_id"]
-                for item in profiles
-                if item["profile_id"] == requested
-            ),
-            "",
-        )
-        if not default:
-            default = next(
-                (item["profile_id"] for item in profiles if item["is_default"]),
-                profiles[0]["profile_id"],
+        try:
+            design = MakerWorldSearcher._load_design(design_id, auth, session)
+            profiles = MakerWorldSearcher._load_profiles(
+                design_id, design, auth, session, complete=True
             )
-        return {
-            "profiles": profiles,
-            "default_profile_id": default,
-            "formats": [
-                {
-                    "id": "3mf",
-                    "label": "3MF print profile",
-                    "description": "Download and import the selected print profile directly.",
-                    "direct": True,
-                    "available": True,
-                },
-                {
-                    "id": "raw_browser",
-                    "label": "STL/CAD files",
-                    "description": (
-                        "Open MakerWorld to choose raw model files; its raw-file API "
-                        "requires a browser session."
-                    ),
-                    "direct": False,
-                    "available": any(item["has_raw"] for item in profiles),
-                },
-            ],
-        }
+            requested = MakerWorldSearcher._profile_from_url(model.get("url", ""))
+            default = next(
+                (
+                    item["profile_id"]
+                    for item in profiles
+                    if item["profile_id"] == requested
+                ),
+                "",
+            )
+            if not default:
+                default = next(
+                    (item["profile_id"] for item in profiles if item["is_default"]),
+                    profiles[0]["profile_id"],
+                )
+            return {
+                "profiles": profiles,
+                "default_profile_id": default,
+                "formats": [
+                    {
+                        "id": "3mf",
+                        "label": "3MF print profile",
+                        "description": "Download and import the selected print profile directly.",
+                        "direct": True,
+                        "available": True,
+                    },
+                    {
+                        "id": "raw_browser",
+                        "label": "STL/CAD files",
+                        "description": (
+                            "Open MakerWorld to choose raw model files; its raw-file API "
+                            "requires a browser session."
+                        ),
+                        "direct": False,
+                        "available": any(item["has_raw"] for item in profiles),
+                    },
+                ],
+            }
+        finally:
+            session.close()
 
     @staticmethod
     def _download_profile(profile_id, internal_model_id, auth, session):
@@ -2482,38 +2567,46 @@ class MakerWorldSearcher:
             "MakerWorld design id is missing",
         )
         session = auth.session("makerworld")
-        design = MakerWorldSearcher._load_design(design_id, auth, session)
-        internal_model_id = design.get("modelId") or design.get("model_id")
-        if model.get("_download_format", "3mf") != "3mf":
-            raise ValueError("MakerWorld direct import supports the 3MF format only")
-        profile_id = str(
-            model.get("_profile_id")
-            or MakerWorldSearcher._profile_from_url(model.get("url", ""))
-        )
-        if not profile_id:
-            raise ValueError("Select a MakerWorld print profile before downloading")
-        selected = MakerWorldSearcher._selected_profile(
-            profile_id, design_id, design, auth, session
-        )
-        body = MakerWorldSearcher._download_profile(
-            profile_id, internal_model_id, auth, session
-        )
-        url = (
-            body.get("url") or body.get("downloadUrl") or body.get("download_url") or ""
-        )
-        if not url:
-            raise RuntimeError("MakerWorld download API returned no signed URL")
-        name = (
-            body.get("name")
-            or body.get("filename")
-            or selected["title"]
-            or design.get("title")
-            or f"makerworld_{design_id}.3mf"
-        )
-        name = _safe_filename(name, f"makerworld_{design_id}.3mf")
-        if not name.casefold().endswith(".3mf"):
-            name += ".3mf"
-        return [{"name": name, "url": url, "signed": True}]
+        try:
+            design = MakerWorldSearcher._load_design(design_id, auth, session)
+            internal_model_id = design.get("modelId") or design.get("model_id")
+            if model.get("_download_format", "3mf") != "3mf":
+                raise ValueError("MakerWorld direct import supports the 3MF format only")
+            profile_id = str(
+                model.get("_profile_id")
+                or MakerWorldSearcher._profile_from_url(model.get("url", ""))
+            )
+            if not profile_id:
+                raise ValueError(
+                    "Select a MakerWorld print profile before downloading"
+                )
+            selected = MakerWorldSearcher._selected_profile(
+                profile_id, design_id, design, auth, session
+            )
+            body = MakerWorldSearcher._download_profile(
+                profile_id, internal_model_id, auth, session
+            )
+            url = (
+                body.get("url")
+                or body.get("downloadUrl")
+                or body.get("download_url")
+                or ""
+            )
+            if not url:
+                raise RuntimeError("MakerWorld download API returned no signed URL")
+            name = (
+                body.get("name")
+                or body.get("filename")
+                or selected["title"]
+                or design.get("title")
+                or f"makerworld_{design_id}.3mf"
+            )
+            name = _safe_filename(name, f"makerworld_{design_id}.3mf")
+            if not name.casefold().endswith(".3mf"):
+                name += ".3mf"
+            return [{"name": name, "url": url, "signed": True}]
+        finally:
+            session.close()
 
 
 def _license_from_api(value):
@@ -3730,6 +3823,16 @@ class Nih3DSearcher:
         )
         session = requests.Session()
         session.headers.update({"User-Agent": _BROWSER_UA})
+        try:
+            payload = Nih3DSearcher._discover(session, expression)
+        finally:
+            session.close()
+        if not payload:
+            raise RuntimeError("NIH 3D search response format changed")
+        return Nih3DSearcher._rows(payload, page)
+
+    @staticmethod
+    def _discover(session, expression):
         payload = None
         for _attempt in range(2):
             action = Nih3DSearcher._discover_search_action(session)
@@ -3748,8 +3851,10 @@ class Nih3DSearcher:
             if payload:
                 break
             Nih3DSearcher._server_action = ""
-        if not payload:
-            raise RuntimeError("NIH 3D search response format changed")
+        return payload
+
+    @staticmethod
+    def _rows(payload, page):
         results = []
         hits = payload.get("hits") or {}
         for hit in hits.get("hit") or []:
@@ -3866,6 +3971,7 @@ _PLATFORM_SPECS = (
         cookie_domain=".nexprint.com",
         cookie_name="auth_token",
         search_page_size=30,
+        profile_picker=True,
     ),
     PlatformSpec(
         "makeronline",
@@ -3891,6 +3997,7 @@ _PLATFORM_SPECS = (
         login_url="https://makerworld.com/en/sign-in",
         referer="https://makerworld.com/",
         search_page_size=30,
+        profile_picker=True,
     ),
     PlatformSpec(
         "thingiverse",
@@ -3911,6 +4018,7 @@ _PLATFORM_SPECS = (
         login_url="https://cults3d.com/en/users/sign_in",
         referer="https://cults3d.com/",
         cookie_domain=".cults3d.com",
+        session_recheck=True,
     ),
     PlatformSpec("yeggi", "Yeggi", YeggiSearcher),
     PlatformSpec(
@@ -3948,6 +4056,7 @@ _PLATFORM_SPECS = (
         login_url=CrealityCloudSearcher.LOGIN_URL,
         referer="https://www.crealitycloud.com/",
         search_page_size=30,
+        profile_picker=True,
     ),
     PlatformSpec(
         "grabcad",
@@ -3958,6 +4067,7 @@ _PLATFORM_SPECS = (
         login_url="https://login.grabcad.com/login",
         referer="https://grabcad.com/library",
         cookie_domain=".grabcad.com",
+        session_recheck=True,
     ),
     PlatformSpec(
         "smithsonian",
@@ -4195,22 +4305,6 @@ def _load_in_orca(paths):
     return True, ""
 
 
-_LOADABLE_MODEL_EXTS = (
-    ".3mf",
-    ".stl",
-    ".obj",
-    ".step",
-    ".stp",
-    ".iges",
-    ".igs",
-    ".amf",
-    ".ply",
-    ".scad",
-    ".fcstd",
-    ".f3d",
-)
-
-
 def _expand_archives(paths, dest_dir):
     """Safely expand ZIP downloads and return files Orca can actually open."""
     loadable = []
@@ -4418,7 +4512,7 @@ function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").
 function safeUrl(s){try{var u=new URL(String(s||''));return(u.protocol==='http:'||u.protocol==='https:')?u.href:''}catch(e){return''}}
 function showAuthHelp(button){var tooltip=$('auth-tooltip'),text=AUTH_HELP[button.dataset.platform]||'';if(!text)return;activeAuthHelp=button;tooltip.textContent=text;tooltip.classList.add('active');tooltip.style.left='0px';tooltip.style.top='0px';var r=button.getBoundingClientRect(),gap=8,margin=8,left=Math.max(margin,Math.min(window.innerWidth-tooltip.offsetWidth-margin,r.left+r.width/2-tooltip.offsetWidth/2)),top=r.bottom+gap;if(top+tooltip.offsetHeight>window.innerHeight-margin)top=Math.max(margin,r.top-tooltip.offsetHeight-gap);tooltip.style.left=Math.round(left)+'px';tooltip.style.top=Math.round(top)+'px'}
 function hideAuthHelp(button){if(activeAuthHelp!==button||button.matches(':hover')||document.activeElement===button)return;$('auth-tooltip').classList.remove('active');activeAuthHelp=null}
-function platformKey(display){return {MakerWorld:'makerworld',Nexprint:'nexprint',Makeronline:'makeronline',Printables:'printables',Thingiverse:'thingiverse',Cults3D:'cults3d',Yeggi:'yeggi',MyMiniFactory:'myminifactory',Thangs:'thangs',STLFinder:'stlfinder','Creality Cloud':'crealitycloud',GrabCAD:'grabcad','Smithsonian 3D':'smithsonian','NASA 3D Resources':'nasa','NIH 3D':'nih3d',YouMagine:'youmagine',Pinshape:'pinshape'}[display]||String(display||'').toLowerCase()}
+function platformKey(display){return __PLATFORM_KEYS__[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
 function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory','crealitycloud','thangs'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
 var PORTAL_PREF_KEY='orca-model-search-portals-v2';
@@ -4530,6 +4624,15 @@ orca.postMessage({action:'auth_status'});
 restorePortalSelection();
 setTimeout(function(){var q=$('query');if(q)q.focus()},0);
 </script></body></html>"""
+
+PAGE = PAGE.replace(
+    "__PLATFORM_KEYS__",
+    json.dumps(
+        {spec.display: spec.key for spec in _PLATFORM_SPECS},
+        sort_keys=True,
+        separators=(",", ":"),
+    ),
+)
 
 
 if orca is not None:
@@ -4749,19 +4852,63 @@ if orca is not None:
             total = getattr(items, "total", None)
             has_more = getattr(items, "has_more", None)
             rows = list(items)
+            requires_auth = any(item.get("requires_auth") for item in rows)
+            authenticated = (
+                self.auth.authenticated(spec.key) if requires_auth else False
+            )
+            importable = callable(getattr(spec.adapter, "get_files", None))
             for item in rows:
                 item["_platform_key"] = spec.key
-                item["authenticated"] = not item.get(
-                    "requires_auth"
-                ) or self.auth.authenticated(spec.key)
-                item["importable"] = callable(
-                    getattr(spec.adapter, "get_files", None)
-                )
+                item["authenticated"] = not item.get("requires_auth") or authenticated
+                item["importable"] = importable
             if not spec.paginated_search:
                 has_more = False
             elif has_more is None:
                 has_more = len(rows) >= spec.search_page_size
             return rows, total, bool(has_more)
+
+        def _fetch_search_page(self, spec, query, options, page):
+            """Load one independent portal page inside a search worker."""
+            try:
+                items, total, has_more = self._load_search_page(
+                    spec, query, options, page
+                )
+            except BrowserRequired as exc:
+                return (
+                    None,
+                    _source_stats(spec, error=str(exc), browser_url=exc.url),
+                    True,
+                )
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+                return None, _source_stats(spec, error=str(exc)), False
+            return (
+                (items, total, has_more),
+                _source_stats(spec, page=page, total=total, has_more=has_more),
+                False,
+            )
+
+        def _run_search_pages(self, query, options, jobs):
+            """Run portal requests concurrently and return outcomes by key."""
+            if not jobs:
+                return {}
+            if len(jobs) == 1:
+                spec, page = jobs[0]
+                return {
+                    spec.key: self._fetch_search_page(spec, query, options, page)
+                }
+            outcomes = {}
+            with ThreadPoolExecutor(
+                max_workers=min(_SEARCH_WORKERS, len(jobs))
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._fetch_search_page, spec, query, options, page
+                    ): spec.key
+                    for spec, page in jobs
+                }
+                for future in as_completed(futures):
+                    outcomes[futures[future]] = future.result()
+            return outcomes
 
         def _search_payload(self, *, append):
             with self._search_lock:
@@ -4882,58 +5029,25 @@ if orca is not None:
                 for key in dict.fromkeys(msg.get("platforms", []))
                 if _platform(key) is not None
             ]
+            jobs = [
+                (spec, 1)
+                for key in platforms
+                if (spec := _platform(key)) is not None
+            ]
+            outcomes = self._run_search_pages(query, options, jobs)
             results = []
             stats = {}
             pages = {}
-            for key in platforms:
-                spec = _platform(key)
-                if spec is None:
-                    continue
-                try:
-                    items, total, has_more = self._load_search_page(
-                        spec, query, options, 1
-                    )
+            for spec, page in jobs:
+                payload, source, _stop = outcomes[spec.key]
+                if payload is None:
+                    pages[spec.key] = 0
+                else:
+                    items, _total, _has_more = payload
                     results, _added = _merge_unique_results(results, items)
-                    pages[key] = 1
-                    stats[key] = {
-                        "key": key,
-                        "display": spec.display,
-                        "loaded": sum(
-                            item.get("_platform_key") == key for item in results
-                        ),
-                        "page": 1,
-                        "total": total,
-                        "has_more": has_more,
-                        "paginated": spec.paginated_search,
-                        "error": "",
-                        "browser_url": "",
-                    }
-                except BrowserRequired as exc:
-                    pages[key] = 0
-                    stats[key] = {
-                        "key": key,
-                        "display": spec.display,
-                        "loaded": 0,
-                        "page": 0,
-                        "total": None,
-                        "has_more": False,
-                        "paginated": spec.paginated_search,
-                        "error": str(exc),
-                        "browser_url": exc.url,
-                    }
-                except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-                    pages[key] = 0
-                    stats[key] = {
-                        "key": key,
-                        "display": spec.display,
-                        "loaded": 0,
-                        "page": 0,
-                        "total": None,
-                        "has_more": False,
-                        "paginated": spec.paginated_search,
-                        "error": str(exc),
-                        "browser_url": "",
-                    }
+                    pages[spec.key] = page
+                stats[spec.key] = source
+            _apply_loaded_counts(results, stats)
             detail_candidates = self._prepare_thingiverse_prefetch(
                 results, generation
             )
@@ -4964,40 +5078,36 @@ if orca is not None:
                 results = list(self._search_results)
                 pages = dict(self._search_pages)
                 stats = {key: dict(value) for key, value in self._search_stats.items()}
+            jobs = []
             for key in platforms:
                 source = stats.get(key) or {}
-                if not source.get("has_more"):
-                    continue
                 spec = _platform(key)
-                if spec is None:
+                if spec is None or not source.get("has_more"):
                     continue
-                next_page = pages.get(key, 0) + 1
-                try:
-                    items, total, has_more = self._load_search_page(
-                        spec, query, options, next_page
-                    )
-                    results, added = _merge_unique_results(results, items)
-                    pages[key] = next_page
-                    source.update(
-                        {
-                            "loaded": sum(
-                                item.get("_platform_key") == key for item in results
-                            ),
-                            "page": next_page,
-                            "total": total if total is not None else source.get("total"),
-                            "has_more": has_more and added > 0,
-                            "error": "",
-                            "browser_url": "",
-                        }
-                    )
-                except BrowserRequired as exc:
-                    source["has_more"] = False
-                    source["error"] = str(exc)
-                    source["browser_url"] = exc.url
-                except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-                    source["error"] = str(exc)
-                    source["browser_url"] = ""
-                stats[key] = source
+                jobs.append((spec, pages.get(key, 0) + 1))
+            outcomes = self._run_search_pages(query, options, jobs)
+            for spec, next_page in jobs:
+                source = stats[spec.key]
+                payload, fresh, stop = outcomes[spec.key]
+                if payload is None:
+                    if stop:
+                        source["has_more"] = False
+                    source["error"] = fresh["error"]
+                    source["browser_url"] = fresh["browser_url"]
+                    continue
+                items, total, has_more = payload
+                results, added = _merge_unique_results(results, items)
+                pages[spec.key] = next_page
+                source.update(
+                    {
+                        "page": next_page,
+                        "total": total if total is not None else source.get("total"),
+                        "has_more": has_more and added > 0,
+                        "error": "",
+                        "browser_url": "",
+                    }
+                )
+            _apply_loaded_counts(results, stats)
             detail_candidates = self._prepare_thingiverse_prefetch(
                 results, generation
             )
@@ -5043,9 +5153,7 @@ if orca is not None:
                     }
                 )
                 return
-            if spec.key in ("makerworld", "crealitycloud", "nexprint") and not model.get(
-                "_download_format"
-            ):
+            if spec.profile_picker and not model.get("_download_format"):
                 self._show_profile_choices(model)
                 return
             files = self._list_model_files(spec, model)
@@ -5064,11 +5172,7 @@ if orca is not None:
 
         def _profile_choices(self, model):
             spec = _platform_for_model(model)
-            if spec is None or spec.key not in (
-                "makerworld",
-                "crealitycloud",
-                "nexprint",
-            ):
+            if spec is None or not spec.profile_picker:
                 raise ValueError("This platform does not provide print profiles")
             loader = getattr(spec.adapter, "get_download_choices", None)
             if not callable(loader):
@@ -5313,8 +5417,12 @@ if orca is not None:
             with self._pending_import_lock:
                 model = self._pending_import_model
                 files = list(self._pending_import_files)
-                self._pending_import_model = None
-                self._pending_import_files = []
+                selected = [
+                    files[i] for i in selected_indices if i < len(files)
+                ]
+                if model and selected:
+                    self._pending_import_model = None
+                    self._pending_import_files = []
             if not model or not files:
                 self._post(
                     {
@@ -5323,7 +5431,6 @@ if orca is not None:
                     }
                 )
                 return
-            selected = [files[i] for i in selected_indices if i < len(files)]
             if not selected:
                 self._post(
                     {

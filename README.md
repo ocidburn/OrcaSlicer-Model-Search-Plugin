@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.8.6**
+**Current plugin version: v0.8.7**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -381,7 +381,11 @@ Fully restart OrcaSlicer after replacing `search_engine.py`. Python/plugin error
 
 ## Development and validation
 
-The plugin keeps one deployment file, `src/search_engine.py`, but platform behavior is no longer spread across parallel dictionaries. Each portal has one `PlatformSpec` entry containing its display name, adapter, authentication hosts, cookie mode/scope, login URL and referer policy. Search, import, authentication status and UI routing all consume that registry.
+The plugin keeps one deployment file, `src/search_engine.py`, but platform behavior is no longer spread across parallel dictionaries. Each portal has one `PlatformSpec` entry containing its display name, adapter, authentication hosts, cookie mode/scope, login URL, referer policy, session-recheck policy and profile-picker behavior. Search, import, authentication status and UI routing all consume that registry, including the generated display-name-to-key map used by the embedded UI.
+
+Independent portal searches run concurrently with a maximum of eight workers. Results are still merged in the portal-selection order, so relevance ordering is deterministic rather than dependent on network completion order.
+
+Anonymous and authenticated HTML catalog requests share the same redirect limit and per-hop public-address validation. Temporary HTTP sessions and responses are closed after catalog probes and profile/file resolution.
 
 Repository layout:
 
@@ -416,7 +420,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.8.6 validation gates are:
+The v0.8.7 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

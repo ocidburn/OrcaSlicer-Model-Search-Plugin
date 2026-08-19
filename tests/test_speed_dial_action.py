@@ -1,4 +1,6 @@
 import sys
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -139,6 +141,82 @@ class SpeedDialActionTests(unittest.TestCase):
             self.assertEqual(len(second["results"]), 2)
             self.assertEqual(second["sources"][0]["loaded"], 2)
             self.assertEqual(second["sources"][0]["visible"], 2)
+
+    def test_selected_portals_search_concurrently_but_merge_in_order(self):
+        module, _ = load_with_fake_orca()
+        action = module.SearchEngineScript()
+        action.win = FakeWindow()
+        action._search_generation = 1
+        lock = threading.Lock()
+        started = set()
+        both_started = threading.Event()
+
+        def search_for(key, display, delay):
+            def search(_query, _auth, _options):
+                with lock:
+                    started.add(key)
+                    if len(started) == 2:
+                        both_started.set()
+                if not both_started.wait(1):
+                    raise AssertionError("portal searches ran sequentially")
+                time.sleep(delay)
+                return module.SearchPage(
+                    [{"name": display, "platform": display, "url": f"https://{key}.example/model"}],
+                    has_more=False,
+                )
+
+            return search
+
+        with (
+            mock.patch.object(
+                module.PrintablesSearcher,
+                "search",
+                side_effect=search_for("printables", "Printables", 0.05),
+            ),
+            mock.patch.object(
+                module.MakeronlineSearcher,
+                "search",
+                side_effect=search_for("makeronline", "Makeronline", 0),
+            ),
+        ):
+            action._do_search(
+                {
+                    "query": "cup",
+                    "platforms": ["printables", "makeronline"],
+                    "options": {},
+                },
+                1,
+            )
+
+        self.assertEqual(
+            [row["_platform_key"] for row in action._search_results],
+            ["printables", "makeronline"],
+        )
+
+    def test_auth_status_is_resolved_once_per_portal_page(self):
+        module, _ = load_with_fake_orca()
+        action = module.SearchEngineScript()
+        rows = [
+            {
+                "name": f"Model {index}",
+                "platform": "Makeronline",
+                "requires_auth": True,
+            }
+            for index in range(30)
+        ]
+        with (
+            mock.patch.object(
+                module.MakeronlineSearcher, "search", return_value=rows
+            ),
+            mock.patch.object(
+                action.auth, "authenticated", return_value=True
+            ) as authenticated,
+        ):
+            loaded, _total, _more = action._load_search_page(
+                module._PLATFORMS["makeronline"], "cup", {}, 1
+            )
+        self.assertEqual(len(loaded), 30)
+        authenticated.assert_called_once_with("makeronline")
 
     def test_search_reports_cloudflare_browser_fallback_url(self):
         module, _ = load_with_fake_orca()

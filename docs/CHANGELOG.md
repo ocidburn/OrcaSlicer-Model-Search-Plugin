@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## 0.8.7
+
+- Applied and independently verified the v0.8.5 refactoring review against the
+  current v0.8.6 code instead of applying the stale patch verbatim.
+- Added bounded concurrent portal search and concurrent next-page loading while
+  preserving selected-portal merge order and deterministic relevance ranking.
+- Routed anonymous HTML fetches through the same redirect cap and per-hop SSRF
+  guard as authenticated requests.
+- Closed temporary sessions and responses used by HTML fetches, download probes,
+  NIH search, MakerOnline, Nexprint, and MakerWorld resolution paths.
+- Reduced popularity ranking to one sort per platform, credential-store reads to
+  at most one per authenticated portal page, and loaded-result counting to one
+  merged-results pass.
+- Moved session-recheck and profile-picker behavior into `PlatformSpec` and
+  generated the embedded UI display-to-key map from that registry.
+- Preserved a pending multi-file import after an empty selection, simplified
+  Anycubic token normalization, and derived archive extensions from one canonical
+  loadable-extension tuple.
+- Added regression coverage for concurrency with deterministic merge order,
+  private redirect rejection, resource closure, registry-derived UI routing,
+  credential reads, popularity ranking, and empty file selection.
+
 ## 0.8.6
 
 - Replaced the Cloudflare-protected Thangs Next.js proxy with the official

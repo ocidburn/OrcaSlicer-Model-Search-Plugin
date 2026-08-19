@@ -40,18 +40,29 @@ class FakeAuth:
         self.platform = platform
         self.responses = list(responses)
         self.calls = []
+        self.sessions = []
 
     def authenticated(self, platform):
         return platform == self.platform
 
     def session(self, platform):
-        return object()
+        session = _FakeSession()
+        self.sessions.append(session)
+        return session
 
     def request(self, platform, method, url, session=None, **kwargs):
         self.calls.append((platform, method, url, kwargs))
         if not self.responses:
             raise AssertionError(f"unexpected request: {url}")
         return self.responses.pop(0)
+
+
+class _FakeSession:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
 
 class AuthStoreTests(unittest.TestCase):
@@ -255,6 +266,7 @@ class ResolverTests(unittest.TestCase):
         self.assertIn("/design/3183685", auth.calls[0][2])
         self.assertIn("/user/profile/3601086", auth.calls[1][2])
         self.assertEqual(auth.calls[1][3]["params"]["model_id"], "US2bb73b106683e5")
+        self.assertTrue(all(session.closed for session in auth.sessions))
 
     def test_makerworld_adds_3mf_extension_to_decimal_profile_name(self):
         profile_name = "0.2mm layer_ 2 walls_ 10_ infill"
@@ -369,6 +381,7 @@ class ResolverTests(unittest.TestCase):
         )
         self.assertTrue(choices["formats"][1]["available"])
         self.assertIn("/design/10/instances", auth.calls[1][2])
+        self.assertTrue(all(session.closed for session in auth.sessions))
 
     def test_makerworld_profile_list_uses_wrapper_id_when_detail_id_is_zero(self):
         instance = {
@@ -532,6 +545,7 @@ class ResolverTests(unittest.TestCase):
                 ]
             },
         )
+        self.assertTrue(all(session.closed for session in auth.sessions))
 
     def test_makeronline_lists_all_model_files(self):
         payload = {
@@ -553,6 +567,7 @@ class ResolverTests(unittest.TestCase):
         files = mod.MakeronlineSearcher.get_files({"_mold_id": 55}, auth)
         self.assertEqual(len(files), 2)
         self.assertEqual(files[0]["name"], "part.step")
+        self.assertTrue(all(session.closed for session in auth.sessions))
 
     def test_resolvers_require_authentication(self):
         class NoneAuth:

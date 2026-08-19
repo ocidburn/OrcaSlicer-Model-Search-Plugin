@@ -109,19 +109,24 @@ class CatalogSearchTests(unittest.TestCase):
         )
         success = FakeResponse("<title>Models</title>", url=url)
         session = mock.Mock()
-        session.get.side_effect = [challenged, success]
+        session.request.side_effect = [challenged, success]
 
-        with mock.patch("requests.Session", return_value=session):
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
             raw, final_url = mod._fetch_html(url)
 
         self.assertEqual(raw, "<title>Models</title>")
         self.assertEqual(final_url, url)
         self.assertTrue(challenged.closed)
-        self.assertEqual(session.get.call_count, 2)
-        first_headers = session.get.call_args_list[0].kwargs["headers"]
-        retry_headers = session.get.call_args_list[1].kwargs["headers"]
+        self.assertTrue(success.closed)
+        self.assertEqual(session.request.call_count, 2)
+        first_headers = session.request.call_args_list[0].kwargs["headers"]
+        retry_headers = session.request.call_args_list[1].kwargs["headers"]
         self.assertEqual(first_headers["User-Agent"], mod._BROWSER_UA)
         self.assertEqual(retry_headers["User-Agent"], mod._STANDARD_BROWSER_UA)
+        session.close.assert_called_once_with()
 
     def test_html_fetch_surfaces_persistent_cloudflare_challenge_for_browser(self):
         url = "https://cults3d.com/en/tags/benchy"
@@ -135,18 +140,33 @@ class CatalogSearchTests(unittest.TestCase):
             for _ in range(2)
         ]
         session = mock.Mock()
-        session.get.side_effect = responses
+        session.request.side_effect = responses
 
         with (
             mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
             self.assertRaises(mod.CloudflareChallenge) as raised,
         ):
             mod._fetch_html(url)
 
         self.assertEqual(raised.exception.url, url)
         self.assertIn("standard browser User-Agent", str(raised.exception))
-        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(session.request.call_count, 2)
         self.assertTrue(all(response.closed for response in responses))
+        session.close.assert_called_once_with()
+
+    def test_anonymous_html_fetch_rejects_private_redirect_targets(self):
+        session = mock.Mock()
+        session.request.side_effect = AssertionError(
+            "the SSRF guard must run before the request"
+        )
+        with (
+            mock.patch("requests.Session", return_value=session),
+            self.assertRaises(ValueError),
+        ):
+            mod._fetch_html("http://127.0.0.1:8080/admin")
+        session.request.assert_not_called()
+        session.close.assert_called_once_with()
 
     def test_cloudflare_turnstile_page_is_detected_even_with_http_200(self):
         response = FakeResponse(
@@ -821,6 +841,14 @@ class RegistryAndUiTests(unittest.TestCase):
             self.assertTrue(callable(spec.adapter.search))
             self.assertTrue(callable(spec.adapter.get_files))
             self.assertFalse(hasattr(spec.adapter, "enabled"))
+        self.assertEqual(
+            {spec.key for spec in mod._PLATFORM_SPECS if spec.profile_picker},
+            {"makerworld", "nexprint", "crealitycloud"},
+        )
+        self.assertEqual(
+            {spec.key for spec in mod._PLATFORM_SPECS if spec.session_recheck},
+            {"cults3d", "grabcad"},
+        )
 
     def test_only_authenticated_sites_have_auth_controls(self):
         for platform in (
@@ -882,6 +910,20 @@ class RegistryAndUiTests(unittest.TestCase):
             re.findall(r'class="portal-search"[^>]*data-platform="([^"]+)"', mod.PAGE)
         )
         self.assertEqual(portals, set(mod._PLATFORMS))
+
+    def test_ui_platform_key_map_is_generated_from_the_registry(self):
+        import json
+        import re
+
+        match = re.search(
+            r"function platformKey\(display\)\{return (\{.*?\})\[display\]",
+            mod.PAGE,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(
+            json.loads(match.group(1)),
+            {spec.display: spec.key for spec in mod._PLATFORM_SPECS},
+        )
 
     def test_portal_selection_controls_are_present(self):
         self.assertIn('id="search-portals"', mod.PAGE)
@@ -991,6 +1033,21 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in rows], ["high", "low", "missing"])
         self.assertTrue(all(field in rows[0] for field in mod._COMMON_RESULT_FIELDS))
 
+    def test_popularity_scores_sort_once_per_platform(self):
+        rows = [
+            {"platform": "A", "downloads": value}
+            for value in range(1, 31)
+        ] + [
+            {"platform": "B", "downloads": value}
+            for value in range(1, 31)
+        ]
+        real_sorted = sorted
+        with mock.patch("builtins.sorted", wraps=real_sorted) as sorted_call:
+            mod._add_popularity_scores(rows)
+        self.assertEqual(sorted_call.call_count, 2)
+        self.assertEqual(rows[0]["popularity"], 0)
+        self.assertEqual(rows[29]["popularity"], 100)
+
     def test_filters_do_not_guess_unknown_free_status(self):
         rows = mod._filter_and_sort_results(
             [
@@ -1024,14 +1081,17 @@ class RegistryAndUiTests(unittest.TestCase):
         )
 
     def test_unsupported_archive_types_are_not_advertised(self):
+        self.assertEqual(
+            mod._MODEL_FILE_EXTS, mod._LOADABLE_MODEL_EXTS + (".zip",)
+        )
         self.assertNotIn(".rar", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_086(self):
+    def test_version_is_087(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.8.6"', head)
+        self.assertIn('# version = "0.8.7"', head)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.6.1
+
+- Added client-side pagination for the merged result set with numbered pages, previous/next controls, visible result ranges, and 12/24/48-card page sizes.
+- Preserved full-result indexing and the active page when lazy model details are refreshed, while new searches reset to page one.
+
 ## 0.6.0
 
 - Removed NIH 3D, Smithsonian 3D, NASA 3D Resources, and Wikimedia Commons from the adapters, platform registry, search UI, live smoke checks, tests, and current documentation.

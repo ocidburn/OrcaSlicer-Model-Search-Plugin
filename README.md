@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.6.0**
+**Current plugin version: v0.6.1**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -177,6 +177,8 @@ Every result is normalized to the same nullable metric fields: downloads, likes,
 Raw counters from different portals are not directly comparable. **Popularity (normalized)** computes a platform-relative score from available counters and compares each result's percentile within its own platform. Exact **Downloads**, **Likes**, and **Rating** sorts remain available when raw values are what you want.
 
 **Free only** includes only results whose source explicitly marks them free. **Direct import only** removes browser-only search cards and sources without a direct file path.
+
+The merged, sorted result set is paginated in the search window. The default is 24 cards per page, with 12, 24, and 48-card options, numbered page navigation, previous/next controls, and a visible result range. A new search returns to page one.
 
 ## Search-source selection
 
@@ -369,7 +371,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.6.0 validation gates are:
+The v0.6.1 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

@@ -450,6 +450,16 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn('id="free-only"', mod.PAGE)
         self.assertIn('id="direct-only"', mod.PAGE)
 
+    def test_search_results_have_client_side_pagination(self):
+        self.assertIn('id="pagination"', mod.PAGE)
+        self.assertIn('id="page-size"', mod.PAGE)
+        self.assertIn('id="page-prev"', mod.PAGE)
+        self.assertIn('id="page-next"', mod.PAGE)
+        self.assertIn("function paginationItems(page,total)", mod.PAGE)
+        self.assertIn("window._results.slice(start,end)", mod.PAGE)
+        self.assertIn("index=start+i", mod.PAGE)
+        self.assertIn("renderResults(window._results,false)", mod.PAGE)
+
     def test_common_sort_puts_missing_metrics_last(self):
         rows = mod._filter_and_sort_results(
             [
@@ -499,10 +509,10 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertNotIn(".7z", mod._MODEL_FILE_EXTS)
         self.assertNotIn(".gcode", mod._MODEL_FILE_EXTS)
 
-    def test_version_is_060(self):
+    def test_version_is_061(self):
         with PLUGIN_PATH.open(encoding="utf-8") as fh:
             head = fh.read(500)
-        self.assertIn('# version = "0.6.0"', head)
+        self.assertIn('# version = "0.6.1"', head)
 
 
 if __name__ == "__main__":

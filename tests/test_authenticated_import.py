@@ -418,6 +418,121 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual([x["name"] for x in files], ["a.stl", "b.3mf"])
         self.assertIn("model-base-info/get", auth.calls[0][2])
 
+    def test_nexprint_lists_print_profiles_with_preview_and_metrics(self):
+        payload = {
+            "code": 0,
+            "data": {
+                "settingInfoList": [
+                    {
+                        "id": "1957793219610607616",
+                        "settingName": "0.2mm layer, 2 walls, 15% infill",
+                        "settingCoverImgUrl": "https://np.nexprint.com/profile.png",
+                        "filamentType": ["PLA"],
+                        "score": 5,
+                        "scoreCount": 13,
+                        "settingFile": {
+                            "fileId": "1474334",
+                            "fileName": "grease-tool.3mf",
+                            "fileSize": 720588,
+                        },
+                        "plateList": [{"coverImgUrl": "https://np.nexprint.com/plate.png"}],
+                        "settingParamList": [
+                            {
+                                "layerHeightMm": 0.2,
+                                "wallLoops": 2,
+                                "infillDensity": 15,
+                                "printTimeStr": "6min",
+                            }
+                        ],
+                        "statistics": {"printSettingDownloadCount": 3551},
+                    }
+                ]
+            },
+        }
+        auth = FakeAuth("nexprint", [FakeResponse(data=payload)])
+        choices = mod.NexprintSearcher.get_download_choices(
+            {
+                "_model_id": "G0149050",
+                "url": "https://www.nexprint.com/en/models/G0149050",
+            },
+            auth,
+        )
+        profile = choices["profiles"][0]
+        self.assertEqual(choices["picker_platform"], "Nexprint")
+        self.assertEqual(profile["profile_id"], "1957793219610607616")
+        self.assertEqual(profile["cover"], "https://np.nexprint.com/profile.png")
+        self.assertEqual(profile["layer_height"], "0.2mm")
+        self.assertEqual(profile["walls"], 2)
+        self.assertEqual(profile["infill"], "15%")
+        self.assertEqual(profile["prediction_text"], "6min")
+        self.assertEqual(profile["downloads"], 3551)
+        self.assertEqual(profile["rating"], 5)
+        self.assertEqual(profile["rating_count"], 13)
+        self.assertEqual(choices["formats"][0]["id"], "3mf")
+
+    def test_nexprint_selected_profile_uses_official_signed_download_api(self):
+        detail = {
+            "code": 0,
+            "data": {
+                "settingInfoList": [
+                    {
+                        "id": "1957793219610607616",
+                        "settingName": "Grease tool profile",
+                        "settingCoverImgUrl": "https://np.nexprint.com/profile.png",
+                        "settingFile": {
+                            "fileId": "1474334",
+                            "fileName": "elegoo_grease_tool.3mf",
+                            "fileSize": 720588,
+                        },
+                    }
+                ]
+            },
+        }
+        signed = {
+            "code": 0,
+            "data": {
+                "fileInfoList": [
+                    {
+                        "resultUrl": "https://nexprint.oss.example/signed/profile",
+                    }
+                ]
+            },
+        }
+        auth = FakeAuth(
+            "nexprint", [FakeResponse(data=detail), FakeResponse(data=signed)]
+        )
+        files = mod.NexprintSearcher.get_files(
+            {
+                "_model_id": "G0149050",
+                "_profile_id": "1957793219610607616",
+                "_download_format": "3mf",
+                "url": "https://www.nexprint.com/en/models/G0149050",
+            },
+            auth,
+        )
+        self.assertEqual(files[0]["name"], "elegoo_grease_tool.3mf")
+        self.assertEqual(
+            files[0]["url"], "https://nexprint.oss.example/signed/profile"
+        )
+        self.assertEqual(
+            files[0]["preview_url"], "https://np.nexprint.com/profile.png"
+        )
+        self.assertEqual(files[0]["size"], 720588)
+        self.assertEqual(auth.calls[1][1], "POST")
+        self.assertIn("presigned-download-url", auth.calls[1][2])
+        self.assertEqual(
+            auth.calls[1][3]["json"],
+            {
+                "fileInfoList": [
+                    {
+                        "fileId": "1474334",
+                        "type": "5",
+                        "bizId": "1957793219610607616",
+                    }
+                ]
+            },
+        )
+
     def test_makeronline_lists_all_model_files(self):
         payload = {
             "code": 0,

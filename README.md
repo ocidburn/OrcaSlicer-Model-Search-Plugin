@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.8.4**
+**Current plugin version: v0.8.5**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -105,13 +105,6 @@ See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the wider platform survey: whic
 - Search cards use the official primary image's nested thumbnail URL and show the API's `license` value. Store-only responses fall back to the documented MyMiniFactory Digital File Store License flag instead of displaying `Unknown`.
 - The documented API exposes archive downloads only to an OAuth-connected user; API-key-only and storefront downloads open the official model page.
 
-### Thangs
-
-- Search uses Thangs' current JSON text-search endpoint and exposes names, authors, thumbnails, downloads, likes, publication dates, prices, and result totals.
-- The API is paginated in 50-result pages. Global downloads, likes, newest, and normalized-popularity choices are mapped to the nearest Thangs ordering.
-- The endpoint is an undocumented web API and may still return an interactive Cloudflare challenge. The plugin retries once with a standard browser identity, then offers the official search page.
-- Downloads remain in the official Thangs browser flow and are never presented as direct imports.
-
 ### Yeggi and STLFinder
 
 - Both are meta-search engines and do not host the model files themselves.
@@ -154,6 +147,14 @@ Search is public. Import requires an authenticated Nexprint session.
 4. Paste it into the plugin and connect.
 
 The plugin does not ask for or store the Nexprint password.
+
+Selecting a Nexprint card loads its public print-profile list in the background
+and preloads every profile cover. Import displays the available 3MF profiles
+with their preview, material, layer height, wall and infill settings, print
+time, plate count, rating, download count, and file size. Hovering over or
+focusing a profile image opens the enlarged preview. After the user selects a
+profile, the plugin requests its official account-authorized signed URL using
+Nexprint's profile file ID; no download URL is guessed or constructed.
 
 ### Makeronline / Anycubic
 
@@ -415,7 +416,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.8.4 validation gates are:
+The v0.8.5 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

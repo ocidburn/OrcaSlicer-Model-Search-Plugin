@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.8.5
+
+- Added background loading and image preloading for every Nexprint print profile
+  exposed by a selected model.
+- Added explicit Nexprint profile selection with thumbnail and enlarged hover or
+  keyboard-focus preview, plus material, slicing, rating, download, and file
+  metadata.
+- Replaced implicit Nexprint model-file selection with the official
+  `presigned-download-url` flow for the selected 3MF profile (`MODEL_CONFIG_FILE`
+  type 5).
+- Preserved the profile filename, `.3mf` extension, preview URL, and size through
+  download and import.
+- Removed a stale duplicate README section that still described Thangs as
+  browser-only after direct signed downloads had been implemented.
+
 ## 0.8.4
 
 - Added direct Thangs import through the `downloadUrl` supplied by its JSON

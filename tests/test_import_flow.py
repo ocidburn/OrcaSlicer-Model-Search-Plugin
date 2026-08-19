@@ -276,6 +276,91 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertEqual(message["model"], model)
         self.assertEqual(message["profiles"][0]["profile_id"], "123")
 
+    def test_nexprint_import_opens_profile_picker(self):
+        mod, action = self.make_action()
+        model = {
+            "platform": "Nexprint",
+            "_platform_key": "nexprint",
+            "_model_id": "G0149050",
+            "url": "https://www.nexprint.com/en/models/G0149050",
+            "requires_auth": True,
+        }
+        choices = {
+            "picker_platform": "Nexprint",
+            "profiles": [
+                {
+                    "profile_id": "1957793219610607616",
+                    "title": "0.2mm profile",
+                    "cover": "https://np.nexprint.com/profile.png",
+                }
+            ],
+            "default_profile_id": "1957793219610607616",
+            "formats": [{"id": "3mf", "label": "3MF", "available": True}],
+        }
+        with (
+            mock.patch.object(action.auth, "authenticated", return_value=True),
+            mock.patch.object(
+                mod.NexprintSearcher,
+                "get_download_choices",
+                return_value=choices,
+            ),
+            mock.patch.object(action, "_download_and_import") as download,
+        ):
+            action._resolve_import(model)
+        download.assert_not_called()
+        message = action.win.posts[-1]
+        self.assertEqual(message["action"], "profile_choices")
+        self.assertEqual(message["picker_platform"], "Nexprint")
+        self.assertEqual(
+            message["profiles"][0]["cover"],
+            "https://np.nexprint.com/profile.png",
+        )
+
+    def test_nexprint_profile_choice_is_preserved_for_download(self):
+        _mod, action = self.make_action()
+        model = {
+            "platform": "Nexprint",
+            "_platform_key": "nexprint",
+            "url": "https://www.nexprint.com/en/models/G0149050",
+        }
+        with mock.patch.object(action, "_resolve_import") as resolve:
+            action._resolve_profile_choice(
+                model,
+                {"profile_id": "1957793219610607616", "format": "3mf"},
+            )
+        selected = resolve.call_args.args[0]
+        self.assertEqual(selected["_profile_id"], "1957793219610607616")
+        self.assertEqual(selected["_download_format"], "3mf")
+
+    def test_nexprint_card_prefetches_profiles_before_login(self):
+        mod, action = self.make_action()
+        model = {
+            "platform": "Nexprint",
+            "_platform_key": "nexprint",
+            "_model_id": "G0149050",
+        }
+        choices = {
+            "profiles": [
+                {
+                    "profile_id": "1957793219610607616",
+                    "cover": "https://np.nexprint.com/profile.png",
+                }
+            ],
+            "formats": [{"id": "3mf", "available": True}],
+        }
+        with mock.patch.object(
+            mod.NexprintSearcher, "get_download_choices", return_value=choices
+        ) as get_choices:
+            action._prefetch_profile_choices(model)
+        get_choices.assert_called_once_with(model, action.auth)
+        message = action.win.posts[-1]
+        self.assertEqual(message["action"], "profile_prefetched")
+        self.assertEqual(message["picker_platform"], "Nexprint")
+        self.assertEqual(
+            message["profiles"][0]["cover"],
+            "https://np.nexprint.com/profile.png",
+        )
+
     def test_makerworld_3mf_choice_preserves_explicit_profile(self):
         _mod, action = self.make_action()
         model = {

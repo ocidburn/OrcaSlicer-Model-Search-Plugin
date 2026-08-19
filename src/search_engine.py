@@ -6,7 +6,7 @@
 # name = "3D Model Search Engine"
 # description = "Search, sort, and import 3D-printable models from community and public institutional catalogs."
 # author = "Tommaso Bianchi"
-# version = "0.8.4"
+# version = "0.8.5"
 # ///
 
 import html
@@ -35,7 +35,7 @@ except ImportError:
 
 
 _BROWSER_UA = (
-    "OrcaSlicer-Model-Search-Plugin/0.8.4 "
+    "OrcaSlicer-Model-Search-Plugin/0.8.5 "
     "(+https://github.com/ocidburn/OrcaSlicer-Model-Search-Plugin)"
 )
 _STANDARD_BROWSER_UA = (
@@ -1667,6 +1667,14 @@ class NexprintSearcher:
     SEARCH_URL = (
         f"{NEXPRINT_BASE}/gateway/api/v1/model-library-server/model-base-info/search"
     )
+    DETAIL_URL = (
+        f"{NEXPRINT_BASE}/gateway/api/v1/model-library-server/model-base-info/get"
+    )
+    DOWNLOAD_URL = (
+        f"{NEXPRINT_BASE}/gateway/api/v1/model-library-server/common/"
+        "presigned-download-url"
+    )
+    MODEL_CONFIG_FILE = "5"
 
     @staticmethod
     def search(query, _context, options=None):
@@ -1726,31 +1734,256 @@ class NexprintSearcher:
     def get_files(model, auth):
         if not auth.authenticated("nexprint"):
             raise AuthRequired("Nexprint requires a logged-in auth_token session")
-        model_id = _model_identifier(
-            model,
-            "_model_id",
-            r"/models/(\d+)",
-            "Nexprint model id is missing",
-        )
         session = auth.session("nexprint")
+        detail = NexprintSearcher._load_detail(model, auth, session)
+        profile_id = str(model.get("_profile_id") or "").strip()
+        if not profile_id:
+            return NexprintSearcher._legacy_model_files(detail)
+        if not profile_id.isdigit():
+            raise ValueError("Select a Nexprint print profile before downloading")
+        if model.get("_download_format") != "3mf":
+            raise ValueError("Nexprint direct profile import supports 3MF only")
+        selected = NexprintSearcher._selected_profile(detail, profile_id)
+        file_info = NexprintSearcher._profile_file(selected)
+        signed = NexprintSearcher._signed_profile(
+            profile_id, file_info, auth, session
+        )
+        return [NexprintSearcher._profile_download(selected, file_info, signed, model)]
+
+    @staticmethod
+    def _legacy_model_files(detail):
+        records = detail.get("modelFileInfoList")
+        if not records:
+            records = detail.get("files")
+        if not records:
+            records = detail.get("modelFileList")
+        return _file_records(
+            records,
+            ("fileUrl", "url", "downloadUrl"),
+            ("fileName", "name"),
+        )
+
+    @staticmethod
+    def _selected_profile(detail, profile_id):
+        for item in detail.get("settingInfoList") or []:
+            if isinstance(item, dict) and str(item.get("id") or "") == profile_id:
+                return item
+        raise ValueError("The selected Nexprint print profile is unavailable")
+
+    @staticmethod
+    def _profile_file(selected):
+        file_info = selected.get("settingFile")
+        if not isinstance(file_info, dict) or not file_info.get("fileId"):
+            raise RuntimeError("The selected Nexprint profile has no downloadable 3MF")
+        return file_info
+
+    @staticmethod
+    def _signed_profile(profile_id, file_info, auth, session):
         response = auth.request(
             "nexprint",
-            "GET",
-            f"{NEXPRINT_BASE}/gateway/api/v1/model-library-server/model-base-info/get",
+            "POST",
+            NexprintSearcher.DOWNLOAD_URL,
             session=session,
-            params={"id": model_id},
+            json={
+                "fileInfoList": [
+                    {
+                        "fileId": str(file_info["fileId"]),
+                        "type": NexprintSearcher.MODEL_CONFIG_FILE,
+                        "bizId": profile_id,
+                    }
+                ]
+            },
             timeout=30,
         )
+        payload = NexprintSearcher._response_data(
+            response, "Nexprint could not create a signed profile URL", auth=True
+        )
+        files = payload.get("fileInfoList") if isinstance(payload, dict) else None
+        if not isinstance(files, list) or not files or not isinstance(files[0], dict):
+            raise RuntimeError("Nexprint did not return signed profile metadata")
+        return files[0]
+
+    @staticmethod
+    def _profile_download(selected, file_info, signed, model):
+        url = _coalesce(
+            signed.get("resultUrl"),
+            signed.get("downloadUrl"),
+            signed.get("fileUrl"),
+            signed.get("url"),
+        )
+        if not _is_http_url(url):
+            raise RuntimeError("Nexprint did not return a signed 3MF URL")
+        name_source = _coalesce(
+            file_info.get("fileName"),
+            selected.get("settingName"),
+            model.get("name"),
+            default="nexprint-profile.3mf",
+        )
+        name = _safe_filename(name_source, "nexprint-profile.3mf")
+        if os.path.splitext(name)[1].lower() != ".3mf":
+            name += ".3mf"
+        return {
+            "name": name,
+            "url": url,
+            "preview_url": NexprintSearcher._profile_cover(selected),
+            "size": _number(file_info.get("fileSize"), integer=True),
+        }
+
+    @staticmethod
+    def _response_data(response, error_message, *, auth=False):
         if response.status_code in (401, 403):
             raise AuthRequired(
                 "Nexprint session was rejected; refresh auth_token and log in again"
             )
-        detail = _api_data(response, "Nexprint detail API failed")
-        return _file_records(
-            detail.get("modelFileInfoList") or detail.get("files"),
-            ("fileUrl", "url", "downloadUrl"),
-            ("fileName", "name"),
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise TypeError("Nexprint returned an invalid API response")
+        code = _number(payload.get("code"), integer=True)
+        if code not in (None, 0, 200):
+            if auth and code in (401, 403):
+                raise AuthRequired(
+                    "Nexprint session was rejected; refresh auth_token and log in again"
+                )
+            raise RuntimeError(
+                str(payload.get("msg") or payload.get("message") or error_message)
+            )
+        data = payload.get("data")
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _model_id(model):
+        model_id = str(
+            _model_identifier(
+                model,
+                "_model_id",
+                r"/models/([A-Za-z0-9_-]+)",
+                "Nexprint model id is missing",
+            )
+        ).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", model_id):
+            raise ValueError("Nexprint model id is invalid")
+        return model_id
+
+    @staticmethod
+    def _load_detail(model, auth=None, session=None):
+        import requests
+
+        model_id = NexprintSearcher._model_id(model)
+        if auth is None:
+            response = requests.get(
+                NexprintSearcher.DETAIL_URL,
+                params={"id": model_id},
+                headers={"User-Agent": _BROWSER_UA},
+                timeout=30,
+            )
+        else:
+            response = auth.request(
+                "nexprint",
+                "GET",
+                NexprintSearcher.DETAIL_URL,
+                session=session,
+                params={"id": model_id},
+                timeout=30,
+            )
+        return NexprintSearcher._response_data(
+            response, "Nexprint detail API failed"
         )
+
+    @staticmethod
+    def _profile_cover(item):
+        cover = str(item.get("settingCoverImgUrl") or "")
+        if not _is_http_url(cover):
+            first_plate = NexprintSearcher._first_mapping(item.get("plateList"))
+            cover = str(first_plate.get("coverImgUrl") or "")
+        return cover if _is_http_url(cover) else ""
+
+    @staticmethod
+    def _first_mapping(values):
+        if not isinstance(values, list):
+            return {}
+        return next((value for value in values if isinstance(value, dict)), {})
+
+    @staticmethod
+    def _profile_filament(item):
+        filament = item.get("filamentType")
+        if not isinstance(filament, list):
+            filament = [filament] if filament else []
+        return ", ".join(str(value) for value in filament if value)
+
+    @staticmethod
+    def _measurement(value, suffix):
+        number = _number(value)
+        return f"{number:g}{suffix}" if number is not None else ""
+
+    @staticmethod
+    def _profile_record(item):
+        profile_id = str(item.get("id") or "")
+        file_info = item.get("settingFile")
+        if not profile_id or not isinstance(file_info, dict):
+            return None
+        if not file_info.get("fileId"):
+            return None
+        params = NexprintSearcher._first_mapping(item.get("settingParamList"))
+        plates = item.get("plateList")
+        if not isinstance(plates, list):
+            plates = []
+        statistics = item.get("statistics")
+        if not isinstance(statistics, dict):
+            statistics = {}
+        author = item.get("author")
+        if not isinstance(author, dict):
+            author = {}
+        return {
+            "profile_id": profile_id,
+            "title": _coalesce(item.get("settingName"), default="Print profile"),
+            "cover": NexprintSearcher._profile_cover(item),
+            "creator": _coalesce(author.get("nickname"), item.get("authorName")),
+            "printer": str(params.get("printerModel") or ""),
+            "filament": NexprintSearcher._profile_filament(item),
+            "layer_height": NexprintSearcher._measurement(
+                params.get("layerHeightMm"), "mm"
+            ),
+            "walls": _number(params.get("wallLoops"), integer=True),
+            "infill": NexprintSearcher._measurement(
+                params.get("infillDensity"), "%"
+            ),
+            "prediction_text": str(params.get("printTimeStr") or ""),
+            "plates": len(plates),
+            "rating": _number(item.get("score")),
+            "rating_count": _number(item.get("scoreCount"), integer=True),
+            "downloads": _number(
+                statistics.get("printSettingDownloadCount"), integer=True
+            ),
+            "size": _number(file_info.get("fileSize"), integer=True),
+        }
+
+    @staticmethod
+    def get_download_choices(model, auth=None):
+        detail = NexprintSearcher._load_detail(model, auth)
+        profiles = [
+            profile
+            for item in detail.get("settingInfoList") or []
+            if isinstance(item, dict)
+            and (profile := NexprintSearcher._profile_record(item)) is not None
+        ]
+        if not profiles:
+            raise RuntimeError("Nexprint returned no downloadable print profiles")
+        return {
+            "picker_platform": "Nexprint",
+            "profiles": profiles,
+            "default_profile_id": profiles[0]["profile_id"],
+            "formats": [
+                {
+                    "id": "3mf",
+                    "label": "3MF print profile",
+                    "description": (
+                        "Download and import the selected Nexprint print profile."
+                    ),
+                    "available": True,
+                }
+            ],
+        }
 
 
 class PrintablesSearcher:
@@ -4193,7 +4426,7 @@ function loadMoreResults(){if(searching||!canLoadMore)return;searching=true;$('s
 function modelIdentity(m){return String((m&&m._platform_key)||platformKey(m&&m.platform)||'')+'|'+String((m&&m._thing_id)||(m&&m._model_id)||(m&&m.url)||'')}
 function preloadMakerWorldImages(key,profiles){var images=[];(profiles||[]).forEach(function(p){var url=safeUrl(p.cover);if(!url)return;var img=new Image();img.decoding='async';img.src=url;images.push(img)});makerWorldPreloadedImages[key]=images}
 function cacheMakerWorldChoices(msg){var model=msg.model||selectedModel;if(!model)return;var key=modelIdentity(model);makerWorldChoicesCache[key]={profiles:msg.profiles||[],formats:msg.formats||[],default_profile_id:msg.default_profile_id||'',picker_platform:msg.picker_platform||model.platform||'MakerWorld'};makerWorldPrefetching[key]=false;if(!makerWorldPreloadedImages[key])preloadMakerWorldImages(key,msg.profiles||[])}
-function prefetchMakerWorld(m){var platform=platformKey(m&&m.platform);if(platform!=='makerworld'&&platform!=='crealitycloud')return;var key=modelIdentity(m);if(makerWorldChoicesCache[key]||makerWorldPrefetching[key])return;makerWorldPrefetching[key]=true;orca.postMessage({action:'prefetch_profile_choices',model:m})}
+function prefetchMakerWorld(m){var platform=platformKey(m&&m.platform);if(platform!=='makerworld'&&platform!=='crealitycloud'&&platform!=='nexprint')return;var key=modelIdentity(m);if(makerWorldChoicesCache[key]||makerWorldPrefetching[key])return;makerWorldPrefetching[key]=true;orca.postMessage({action:'prefetch_profile_choices',model:m})}
 function openModelDetail(m){var load=m._details_available&&!m._details_loaded&&!m._details_loading;if(load)m._details_loading=true;showDetail(m,true);prefetchMakerWorld(m);if(load)orca.postMessage({action:'model_details',model:m})}
 $('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)openModelDetail(m)});
 function showDetail(m,open){selectedModel=m;var loading=!!m._details_loading;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-metrics').innerHTML=metricText(m)?'<strong>Metrics:</strong> '+esc(metricText(m)):'';$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(loading?'Loading...':(m.license||'Unknown'))+'</span>';$('det-summary').textContent=loading?'Loading the official license and complete metrics...':(m.license_summary||'No license information available.');var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=m.result_type==='search_link';b.textContent=m.result_type==='search_link'?'Browser search only':(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
@@ -4204,7 +4437,7 @@ $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.targe
 function licenseClass(l){if(/CC|Creative Commons|CC0|Public Domain/i.test(l||''))return'license-cc';if(/All Rights Reserved|Standard Digital|Exclusive/i.test(l||''))return'license-arr';return''}
 function openExternal(url){orca.postMessage({action:'open_external',url:url})}
 function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedModel.download_url)}
-function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var platform=platformKey(selectedModel.platform);if(!selectedModel._download_format&&(platform==='makerworld'||platform==='crealitycloud')){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id,picker_platform:cached.picker_platform});$('status').textContent='Select a '+cached.picker_platform+' print profile and file format.';return}}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
+function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var platform=platformKey(selectedModel.platform);if(!selectedModel._download_format&&(platform==='makerworld'||platform==='crealitycloud'||platform==='nexprint')){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id,picker_platform:cached.picker_platform});$('status').textContent='Select a '+cached.picker_platform+' print profile and file format.';return}}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
 function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory'||p==='crealitycloud'||p==='thangs');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API',crealitycloud:'Creality Cloud account',thangs:'Thangs account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='makeronline'?'MakerOnline mo_access_token value or Cookie header':p==='crealitycloud'?'Creality model_token value or Cookie header':p==='thangs'?'Thangs Bearer access token':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=AUTH_HELP[p]||'Use the account credentials supplied by the selected platform.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
 function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active')||$('makerworld-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
 function closeAuth(){$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
@@ -4216,7 +4449,7 @@ function formatBytes(v){v=Number(v);if(!isFinite(v)||v<0)return'';var units=['B'
 function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){var name=f.name||('File '+(Number(f.index)+1)),image=safeUrl(f.preview_url),preview=image?'<img class="file-preview" src="'+esc(image)+'" loading="lazy" decoding="async" alt="'+esc(name)+' preview" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="file-preview-placeholder">No preview</span>',meta=formatBytes(f.size);html+='<label class="file-choice"><input type="checkbox" checked value="'+Number(f.index)+'" onchange="updateFileCount()">'+preview+'<span class="file-details"><span class="file-name">'+esc(name)+'</span>'+(meta?'<span class="file-meta">'+esc(meta)+'</span>':'')+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
 function setAllFiles(value){document.querySelectorAll('#file-list input[type=checkbox]').forEach(function(x){x.checked=!!value});updateFileCount()}
 function confirmFileImport(){var selected=[];document.querySelectorAll('#file-list input[type=checkbox]:checked').forEach(function(x){selected.push(parseInt(x.value,10))});if(!selected.length)return;$('file-import').disabled=true;$('status').textContent='Downloading selected files...';$('file-modal').classList.remove('active');syncBackdrop();orca.postMessage({action:'import_selected',indices:selected})}
-function profileMeta(p){var v=[];if(p.creator)v.push('by '+p.creator);if(p.printer)v.push(p.printer);if(p.layer_height)v.push(p.layer_height+' layer');if(p.walls)v.push(p.walls+' walls');if(p.infill)v.push(p.infill+' infill');if(p.prediction)v.push(Math.max(1,Math.round(Number(p.prediction)/3600*10)/10)+' h');if(p.plates)v.push(p.plates+' plate'+(Number(p.plates)===1?'':'s'));if(p.rating!=null)v.push('Rating '+p.rating+(p.rating_count?' ('+p.rating_count+')':''));return v.join(' / ')}
+function profileMeta(p){var v=[];if(p.creator)v.push('by '+p.creator);if(p.printer)v.push(p.printer);if(p.filament)v.push(p.filament);if(p.layer_height)v.push(p.layer_height+' layer');if(p.walls)v.push(p.walls+' walls');if(p.infill)v.push(p.infill+' infill');if(p.prediction_text)v.push(p.prediction_text);else if(p.prediction)v.push(Math.max(1,Math.round(Number(p.prediction)/3600*10)/10)+' h');if(p.plates)v.push(p.plates+' plate'+(Number(p.plates)===1?'':'s'));if(p.rating!=null)v.push('Rating '+p.rating+(p.rating_count?' ('+p.rating_count+')':''));if(p.downloads!=null)v.push('Downloads '+compactNumber(p.downloads));if(p.size!=null)v.push(formatBytes(p.size));return v.join(' / ')}
 function updateMakerWorldChoice(){var f=document.querySelector('#mw-formats input:checked');var p=document.querySelector('#mw-profiles input:checked'),platform=pendingMakerWorldModel&&pendingMakerWorldModel.platform||'platform';$('mw-import').disabled=!(f&&p);$('mw-import').textContent=f&&f.value==='raw_browser'?'Open STL/CAD files in '+platform:'Download selected 3MF'}
 function positionImagePreview(source){var preview=$('image-preview'),r=source.getBoundingClientRect(),gap=12,margin=10,left=r.right+gap,top=r.top;if(left+preview.offsetWidth>window.innerWidth-margin)left=r.left-preview.offsetWidth-gap;left=Math.max(margin,Math.min(left,window.innerWidth-preview.offsetWidth-margin));top=Math.max(margin,Math.min(top,window.innerHeight-preview.offsetHeight-margin));preview.style.left=Math.round(left)+'px';preview.style.top=Math.round(top)+'px';preview.style.visibility='visible'}
 function showImagePreview(source){var url=safeUrl(source.currentSrc||source.src);if(!url)return;var preview=$('image-preview');preview.src=url;preview.classList.add('active');preview.style.visibility='hidden';requestAnimationFrame(function(){positionImagePreview(source)})}
@@ -4790,7 +5023,7 @@ if orca is not None:
                     }
                 )
                 return
-            if spec.key in ("makerworld", "crealitycloud") and not model.get(
+            if spec.key in ("makerworld", "crealitycloud", "nexprint") and not model.get(
                 "_download_format"
             ):
                 self._show_profile_choices(model)
@@ -4811,7 +5044,11 @@ if orca is not None:
 
         def _profile_choices(self, model):
             spec = _platform_for_model(model)
-            if spec is None or spec.key not in ("makerworld", "crealitycloud"):
+            if spec is None or spec.key not in (
+                "makerworld",
+                "crealitycloud",
+                "nexprint",
+            ):
                 raise ValueError("This platform does not provide print profiles")
             loader = getattr(spec.adapter, "get_download_choices", None)
             if not callable(loader):
@@ -4880,6 +5117,27 @@ if orca is not None:
                 return
             if spec.key == "makerworld":
                 self._resolve_makerworld_choice(model, msg)
+                return
+            if spec.key == "nexprint":
+                profile_id = str(msg.get("profile_id") or "")
+                download_format = str(msg.get("format") or "")
+                if not profile_id.isdigit():
+                    self._post(
+                        {
+                            "action": "error",
+                            "message": "Select a Nexprint print profile.",
+                        }
+                    )
+                    return
+                if download_format != "3mf":
+                    self._post(
+                        {"action": "error", "message": "Select the 3MF format."}
+                    )
+                    return
+                selected = dict(model)
+                selected["_profile_id"] = profile_id
+                selected["_download_format"] = "3mf"
+                self._resolve_import(selected)
                 return
             if spec.key != "crealitycloud":
                 self._post({"action": "error", "message": "Invalid platform choice."})

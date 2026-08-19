@@ -10,11 +10,19 @@
 - A sign-in that can be redirected to the loopback origin completes with no
   copying at all: the receiver accepts `access_token`, `auth_token`, `token`,
   or `code` on `/callback`.
-- The receiver binds `127.0.0.1` only, requires a random single-use state
-  compared in constant time, refuses forged `Host` headers and cross-site
-  `Origin`/`Referer`, answers `no-store` and `no-referrer`, keeps the
-  credential out of its logs, and shuts down on success, on panel close, or
-  after five minutes.
+- The receiver binds loopback only and accepts every spelling of a loopback
+  `Host` (any 127.0.0.0/8 address, `::1`, `localhost`, any case, with or
+  without a port), which is the guard against DNS rebinding. It requires a
+  random single-use state compared in constant time, refuses a cross-site
+  submission by `Sec-Fetch-Site` (falling back to `Origin`), answers
+  `no-store` and `Referrer-Policy: same-origin`, keeps the credential out of
+  its logs, and shuts down on success, on panel close, or after five minutes.
+- A navigation is never judged by `Referer`: the portal page a user arrives
+  from can legitimately leak one, and the state value is the real guard.
+- An oversized submission is drained before the `413` is written so the
+  browser receives the error page instead of a reset connection, and the
+  favicon request browsers always make is answered with `204` rather than a
+  refusal that looks like the real failure.
 - A refused credential reports the reason and leaves the link usable, so a
   mistyped paste does not force the whole sign-in to be restarted.
 - If the loopback socket cannot be opened, the plugin reports it and the

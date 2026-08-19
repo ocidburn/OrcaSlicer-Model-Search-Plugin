@@ -355,8 +355,13 @@ How the endpoint is kept to itself:
   constant time. Without it the answer is `403`.
 - Requests are refused unless the `Host` header is loopback, and a page on any
   other site is refused by its `Origin`/`Referer`.
-- It serves nothing but the finish page and the callback, answers `no-store`
-  and `no-referrer`, and never writes the credential to a log.
+- It serves nothing but the finish page, the callback, and a silent favicon;
+  answers `no-store` and `Referrer-Policy: same-origin`, which keeps the state
+  off third-party sites while leaving the browser's own same-origin
+  relationship intact; and never writes the credential to a log.
+- A submission is judged by `Sec-Fetch-Site` when the browser reports it, and
+  by `Origin` otherwise. A browser may serialise the origin of its own form
+  post as `null`, so a null origin is not treated as hostile by itself.
 - It stops the moment a credential is accepted, when the account panel is
   closed, or after the timeout &mdash; whichever comes first.
 

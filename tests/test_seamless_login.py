@@ -16,6 +16,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.client import HTTPConnection
 from unittest import mock
 
 from tests._module_loader import load_plugin
@@ -63,6 +64,19 @@ def http(url, *, data=None, headers=None, method=None):
     except urllib.error.HTTPError as exc:
         with exc:
             return exc.code, exc.read().decode("utf-8"), exc.headers
+
+
+def raw(origin, method, path, headers=None, body=None):
+    """Issue a request with headers exactly as given, Host included."""
+    conn = HTTPConnection(origin.replace("http://", ""), timeout=10)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        response = conn.getresponse()
+        text = response.read().decode("utf-8", "replace")
+        title = text.split("<h1>")[1].split("</h1>")[0] if "<h1>" in text else ""
+        return response.status, title
+    finally:
+        conn.close()
 
 
 def endpoint_down(url, timeout=5):
@@ -242,10 +256,17 @@ class ReceiverContainmentTests(ReceiverTest):
         self.assertEqual(status, 403)
         self.assertEqual(self.saved, [])
 
-    def test_the_state_is_not_leaked_through_the_referer(self):
+    def test_the_state_is_not_leaked_to_other_sites(self):
+        """`same-origin`, deliberately, not `no-referrer`.
+
+        `no-referrer` made the browser serialize the Origin of the plugin's own
+        form post as `null`, which the submission check then turned away.
+        `same-origin` keeps the state away from third parties just as well
+        while leaving the same-origin relationship visible.
+        """
         rec = self.receiver()
         _status, _page, headers = http(rec.url)
-        self.assertEqual(headers.get("Referrer-Policy"), "no-referrer")
+        self.assertEqual(headers.get("Referrer-Policy"), "same-origin")
         self.assertEqual(headers.get("Cache-Control"), "no-store")
 
     def test_unknown_paths_are_not_served(self):
@@ -253,13 +274,15 @@ class ReceiverContainmentTests(ReceiverTest):
         status, _page, _headers = http(f"{rec.origin}/admin?state={rec.state}")
         self.assertEqual(status, 404)
 
-    def test_an_oversized_submission_is_refused(self):
+    def test_an_oversized_submission_is_refused_with_a_readable_answer(self):
+        """The client must get the error page, not a reset connection."""
         rec = self.receiver()
-        status, _page, _headers = http(
+        status, page, _headers = http(
             f"{rec.origin}/connect",
             data={"state": rec.state, "value": "x" * 100_000},
         )
-        self.assertEqual(status, 400)
+        self.assertEqual(status, 413)
+        self.assertIn("Paste only", page)
         self.assertEqual(self.saved, [])
 
     def test_each_receiver_gets_a_fresh_unguessable_state(self):
@@ -280,6 +303,89 @@ class ReceiverContainmentTests(ReceiverTest):
             time.sleep(0.05)
         self.assertIsNone(rec._server, "the receiver should have timed out")
         self.assertTrue(endpoint_down(f"{origin}/connect?state={rec.state}"))
+
+
+class BrowserBehaviourTests(ReceiverTest):
+    """Behaviours a real browser produced that synthetic requests did not."""
+
+    def form_post(self, rec, headers):
+        body = urllib.parse.urlencode({"state": rec.state, "value": "session=ok"})
+        sent = {"Content-Type": "application/x-www-form-urlencoded"}
+        sent.update(headers)
+        return raw(rec.origin, "POST", "/connect", sent, body)
+
+    def test_a_same_origin_form_post_with_a_null_origin_is_accepted(self):
+        """The exact failure a real browser hit: same-origin, Origin: null."""
+        rec = self.receiver()
+        status, title = self.form_post(
+            rec, {"Origin": "null", "Sec-Fetch-Site": "same-origin"}
+        )
+        self.assertEqual(status, 200, title)
+        self.assertEqual(title, "Connected")
+        self.assertEqual(len(self.saved), 1)
+
+    def test_a_cross_site_post_is_refused_even_with_a_plausible_origin(self):
+        rec = self.receiver()
+        status, title = self.form_post(
+            rec, {"Origin": rec.origin, "Sec-Fetch-Site": "cross-site"}
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(title, "Blocked")
+        self.assertEqual(self.saved, [])
+
+    def test_a_post_without_fetch_metadata_falls_back_to_the_origin(self):
+        rec = self.receiver()
+        status, _title = self.form_post(rec, {"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.saved, [])
+
+    def test_a_navigation_carrying_a_foreign_referer_is_still_served(self):
+        """The portal page the user came from may leak a Referer; that is fine."""
+        rec = self.receiver()
+        status, title = raw(
+            rec.origin,
+            "GET",
+            f"/connect?state={rec.state}",
+            {"Referer": "https://cults3d.com/en/users/sign_in"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(title, "Connect Cults3D")
+
+    def test_every_loopback_spelling_of_the_host_header_is_accepted(self):
+        rec = self.receiver()
+        port = rec.port
+        for host in (
+            f"127.0.0.1:{port}",
+            f"LOCALHOST:{port}",
+            f"localhost:{port}",
+            f"127.0.0.1.:{port}",
+            f"[::1]:{port}",
+            f"127.0.0.2:{port}",
+            "127.0.0.1",
+        ):
+            with self.subTest(host=host):
+                status, title = raw(
+                    rec.origin, "GET", f"/connect?state={rec.state}", {"Host": host}
+                )
+                self.assertEqual(status, 200, host)
+                self.assertEqual(title, "Connect Cults3D")
+
+    def test_a_non_loopback_host_header_is_named_in_the_refusal(self):
+        rec = self.receiver()
+        status, title = raw(
+            rec.origin,
+            "GET",
+            f"/connect?state={rec.state}",
+            {"Host": "rebound.example"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(title, "Blocked")
+
+    def test_the_favicon_request_is_answered_quietly(self):
+        """A browser always asks; a 403 here just looked like the real failure."""
+        rec = self.receiver()
+        status, _title = raw(rec.origin, "GET", "/favicon.ico")
+        self.assertEqual(status, 204)
 
 
 class CoordinatorLoginTests(unittest.TestCase):

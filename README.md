@@ -23,7 +23,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 
 ## Main features
 
-- Search across 13 model catalogs and browser fallbacks from one OrcaSlicer window.
+- Search across 14 model catalogs and browser fallbacks from one OrcaSlicer window, every one of them selected by default.
 - Load additional API result pages without discarding or duplicating models already shown.
 - Per-source progress shows loaded/visible counts, known catalog totals, more-page availability, first-page-only sources, and individual portal errors.
 - Sort merged results by relevance, normalized popularity, downloads, likes, rating, date, print count, name, or platform.
@@ -65,9 +65,6 @@ The selected search portals are remembered by the embedded UI and restored the n
 | **Makeronline / Anycubic** | Yes | Yes | Anycubic access token / Anycubic Slicer Next session |
 | **Cults3D** | Yes | Yes, for files available to the signed-in account | Cults3D browser session cookies |
 | **GrabCAD** | Yes | Yes, for files available to the signed-in account | GrabCAD browser session cookies |
-| **Smithsonian 3D** | Yes, official API | Yes, public STL ZIP | None |
-| **NASA 3D Resources** | Yes, official GitHub mirror | Yes, public STL/3MF | None |
-| **NIH 3D** | Yes | Public file when exposed; otherwise browser | None |
 | **YouMagine** | Yes | Public file when exposed; otherwise browser | None |
 | **Pinshape** | Yes | Yes, for public STL files; otherwise browser | None |
 
@@ -197,12 +194,6 @@ GrabCAD Community Library search/download requires a member session.
 
 Search and file resolution then use that saved GrabCAD browser session. Expired sessions are detected and rejected instead of returning a fake successful import.
 
-### Smithsonian 3D, NASA 3D Resources, and NIH 3D
-
-- Smithsonian uses its public file-search API and imports water-tight STL ZIP resources.
-- NASA searches the official public `nasa/NASA-3D-Resources` GitHub mirror and imports matching STL/3MF files from canonical raw URLs.
-- NIH 3D uses its current public Discover application. Direct files exposed by an entry are validated and imported; interactive file-selection flows remain in the browser.
-
 ### YouMagine and Pinshape
 
 - YouMagine and Pinshape use their current public HTML search pages.
@@ -218,7 +209,7 @@ Raw counters from different portals are not directly comparable. **Popularity (n
 
 The merged, sorted result set is paginated in the search window. The default is 100 cards per page, with 100, 150, 200, 250, and 300-card options, numbered page navigation, previous/next controls, and a visible result range. A new search returns to page one.
 
-This display pagination is separate from portal pagination. **Load next pages** fetches the next source page from every selected portal that reports more results, merges models without duplicates, and reapplies the active filters and global sort. Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, MyMiniFactory, Thangs, STLFinder, Smithsonian 3D, and NIH 3D support this flow. Other HTML catalogs and browser fallbacks are explicitly labelled **first page only** because they do not expose a stable paginated interface.
+This display pagination is separate from portal pagination. **Load next pages** fetches the next source page from every selected portal that reports more results, merges models without duplicates, and reapplies the active filters and global sort. Printables, MakerWorld, MakerOnline, Nexprint, Thingiverse, MyMiniFactory, Thangs, and STLFinder support this flow. Other HTML catalogs and browser fallbacks are explicitly labelled **first page only** because they do not expose a stable paginated interface.
 
 ## Search-source selection
 
@@ -236,13 +227,10 @@ The **Search portals** section contains one checkbox for every registered adapte
 - GrabCAD
 - Printables
 - MakerWorld
-- Smithsonian 3D
-- NASA 3D Resources
-- NIH 3D
 - YouMagine
 - Pinshape
 
-Use **Select all** or **Select none** for quick changes. The selected list is stored in the embedded UI's local storage.
+Every portal starts selected, so a first search covers all of them. Use **Select all** or **Select none** for quick changes. The selected list is stored in the embedded UI's local storage and restored on the next launch.
 
 A regression test checks that the UI checkbox set exactly matches the unified `_PLATFORMS` registry, so adding a future search adapter without exposing it in the UI causes the test suite to fail.
 

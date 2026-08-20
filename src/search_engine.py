@@ -699,8 +699,8 @@ class CloudflareClearance:
         host = str(target or "").strip().lower().strip(".")
         return host if re.fullmatch(r"[a-z0-9.-]{1,253}", host or "") else ""
 
-    @classmethod
-    def parse_cookie(cls, value):
+    @staticmethod
+    def parse_cookie(value):
         text = str(value or "").strip()
         if text.lower().startswith("cookie:"):
             text = text.split(":", 1)[1].strip()
@@ -4263,255 +4263,6 @@ class GrabcadSearcher:
         )
 
 
-class SmithsonianSearcher:
-    API = "https://3d-api.si.edu/api/v1.0/content/file/search"
-
-    @staticmethod
-    def search(query, _context, options=None):
-        import requests
-
-        page = _search_page_number(options)
-        response = requests.get(
-            SmithsonianSearcher.API,
-            params={
-                "q": query,
-                "model_type": "stl",
-                "start": (page - 1) * 30,
-                "rows": 30,
-            },
-            headers={"User-Agent": _BROWSER_UA},
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        results = []
-        for item in payload.get("rows") or []:
-            content = item.get("content") or {}
-            direct = content.get("uri") or ""
-            identifier = str(content.get("model_url") or "").split(":", 1)[-1]
-            results.append(
-                {
-                    "name": item.get("title") or "Untitled",
-                    "author": "Smithsonian Institution",
-                    "platform": "Smithsonian 3D",
-                    "thumbnail_url": "",
-                    "license": "Smithsonian Open Access",
-                    "license_url": "https://www.si.edu/openaccess",
-                    "license_summary": "Released through the Smithsonian Open Access initiative.",
-                    "download_url": direct,
-                    "url": (
-                        f"https://3d.si.edu/object/3d/{identifier}"
-                        if identifier
-                        else direct
-                    ),
-                    "_direct_file": direct,
-                    "requires_auth": False,
-                    "direct_import": bool(direct),
-                    "is_free": True,
-                }
-            )
-        total = _number(payload.get("rowCount"), integer=True)
-        return SearchPage(
-            results,
-            total=total,
-            has_more=bool(total is not None and page * 30 < total),
-        )
-
-    @staticmethod
-    def get_files(model, auth=None):
-        url = model.get("_direct_file") or model.get("download_url") or ""
-        if not url:
-            return []
-        name = os.path.basename(urllib.parse.urlsplit(url).path) or "smithsonian.zip"
-        return [{"name": urllib.parse.unquote(name), "url": url}]
-
-
-class NasaSearcher:
-    TREE_API = (
-        "https://api.github.com/repos/nasa/NASA-3D-Resources/git/trees/master"
-        "?recursive=1"
-    )
-    REPO = "https://github.com/nasa/NASA-3D-Resources"
-    RAW = "https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/"
-
-    @staticmethod
-    def search(query, _context, options=None):
-        import requests
-
-        response = requests.get(
-            NasaSearcher.TREE_API,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": _BROWSER_UA,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        terms = [term.casefold() for term in re.findall(r"[\w-]+", query)]
-        results = []
-        for item in response.json().get("tree") or []:
-            path = str(item.get("path") or "")
-            lower = path.casefold()
-            if item.get("type") != "blob" or not lower.endswith((".stl", ".3mf")):
-                continue
-            if terms and not all(term in lower for term in terms):
-                continue
-            quoted = urllib.parse.quote(path, safe="/")
-            direct = NasaSearcher.RAW + quoted
-            results.append(
-                {
-                    "name": os.path.splitext(os.path.basename(path))[0],
-                    "author": "NASA",
-                    "platform": "NASA 3D Resources",
-                    "thumbnail_url": "",
-                    "license": "NASA Media Usage Guidelines",
-                    "license_url": "https://www.nasa.gov/nasa-brand-center/images-and-media/",
-                    "license_summary": "NASA resource; review NASA's media usage guidelines.",
-                    "download_url": direct,
-                    "url": f"{NasaSearcher.REPO}/blob/master/{quoted}",
-                    "_direct_file": direct,
-                    "requires_auth": False,
-                    "direct_import": True,
-                    "is_free": True,
-                }
-            )
-            if len(results) >= 30:
-                break
-        return results
-
-    @staticmethod
-    def get_files(model, auth=None):
-        url = model.get("_direct_file") or model.get("download_url") or ""
-        name = os.path.basename(urllib.parse.urlsplit(url).path) or "nasa_model.stl"
-        return [{"name": urllib.parse.unquote(name), "url": url}] if url else []
-
-
-class Nih3DSearcher:
-    BASE = "https://3d.nih.gov"
-    _server_action: ClassVar[str] = ""
-
-    @classmethod
-    def _discover_search_action(cls, session):
-        if cls._server_action:
-            return cls._server_action
-        page = session.get(cls.BASE + "/discover", timeout=30)
-        page.raise_for_status()
-        paths = re.findall(r'<script[^>]+src="([^"]+)"', page.text, re.IGNORECASE)
-        path = next((value for value in paths if "/discover/page-" in value), "")
-        if not path:
-            raise RuntimeError("NIH 3D discover application script was not found")
-        script = session.get(urllib.parse.urljoin(cls.BASE, path), timeout=30)
-        script.raise_for_status()
-        match = re.search(
-            r'createServerReference\)\("([0-9a-f]{40,64})".{0,250}"discoverSearch"',
-            script.text,
-        )
-        if not match:
-            raise RuntimeError("NIH 3D search action was not found")
-        cls._server_action = match.group(1)
-        return cls._server_action
-
-    @staticmethod
-    def _flight_payload(response):
-        marker = response.text.find('1:{"status"')
-        if marker < 0:
-            return None
-        payload, _end = json.JSONDecoder().raw_decode(response.text[marker + 2 :])
-        return payload
-
-    @staticmethod
-    def search(query, _context, options=None):
-        import requests
-
-        terms = " ".join(re.findall(r"[\w-]+", query, re.UNICODE))[:160]
-        if not terms:
-            return []
-        page = _search_page_number(options)
-        start = (page - 1) * 30
-        expression = (
-            'type:entry AND submissionstatus:"Published" AND '
-            f"{terms}?start={start}&size=30&sort=publisheddate desc"
-        )
-        session = requests.Session()
-        session.headers.update({"User-Agent": _BROWSER_UA})
-        try:
-            payload = Nih3DSearcher._discover(session, expression)
-        finally:
-            session.close()
-        if not payload:
-            raise RuntimeError("NIH 3D search response format changed")
-        return Nih3DSearcher._rows(payload, page)
-
-    @staticmethod
-    def _discover(session, expression):
-        payload = None
-        for _attempt in range(2):
-            action = Nih3DSearcher._discover_search_action(session)
-            response = session.post(
-                Nih3DSearcher.BASE + "/discover",
-                data=json.dumps([expression]),
-                headers={
-                    "Accept": "text/x-component",
-                    "Content-Type": "text/plain;charset=UTF-8",
-                    "Next-Action": action,
-                },
-                timeout=30,
-            )
-            if response.status_code < 400:
-                payload = Nih3DSearcher._flight_payload(response)
-            if payload:
-                break
-            Nih3DSearcher._server_action = ""
-        return payload
-
-    @staticmethod
-    def _rows(payload, page):
-        results = []
-        hits = payload.get("hits") or {}
-        for hit in hits.get("hit") or []:
-            fields = hit.get("fields") or {}
-            identifier = str(_first(fields.get("paddedentryid") or fields.get("id")))
-            lic_name = str(_first(fields.get("license"), "Unknown"))
-            lic = _parse_license(lic_name.replace("CC-", "CC "))
-            page_url = f"{Nih3DSearcher.BASE}/entries/3DPX-{identifier}"
-            thumbnail = str(_first(fields.get("thumbnail")))
-            results.append(
-                {
-                    "name": str(_first(fields.get("title"), "Untitled")),
-                    "author": str(_first(fields.get("createdby"), "Unknown")),
-                    "platform": "NIH 3D",
-                    "thumbnail_url": urllib.parse.urljoin(
-                        Nih3DSearcher.BASE, thumbnail
-                    ),
-                    "license": lic["name"],
-                    "license_url": lic["url"],
-                    "license_summary": lic["summary"],
-                    "download_url": page_url,
-                    "url": page_url,
-                    "requires_auth": False,
-                    "direct_import": True,
-                    "downloads": _first(fields.get("downloadcount"), None),
-                    "views": _first(fields.get("viewcount"), None),
-                    "published_at": _first(fields.get("publisheddate"), None),
-                    "is_free": True,
-                }
-            )
-        total = _number(hits.get("found"), integer=True)
-        return SearchPage(
-            results,
-            total=total,
-            has_more=bool(total is not None and page * 30 < total),
-        )
-
-    @staticmethod
-    def get_files(model, auth=None):
-        return _public_page_files(
-            model,
-            no_direct_message=(
-                "NIH 3D uses an interactive file-selection flow for this entry. "
-                "Open it in the browser."
-            ),
-        )
 
 
 class YouMagineSearcher:
@@ -4680,14 +4431,6 @@ _PLATFORM_SPECS = (
         cookie_domain=".grabcad.com",
         session_recheck=True,
     ),
-    PlatformSpec(
-        "smithsonian",
-        "Smithsonian 3D",
-        SmithsonianSearcher,
-        search_page_size=30,
-    ),
-    PlatformSpec("nasa", "NASA 3D Resources", NasaSearcher),
-    PlatformSpec("nih3d", "NIH 3D", Nih3DSearcher, search_page_size=30),
     PlatformSpec("youmagine", "YouMagine", YouMagineSearcher),
     PlatformSpec("pinshape", "Pinshape", PinshapeSearcher),
 )
@@ -5065,21 +4808,18 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <div class="search-options"><label>Sort <select id="sort"><option value="relevance">Relevance</option><option value="popularity">Popularity (normalized)</option><option value="downloads">Downloads</option><option value="likes">Likes</option><option value="rating">Rating</option><option value="newest">Newest</option><option value="makes">Most printed</option><option value="name">Name</option><option value="platform">Platform</option></select></label><label><input id="free-only" type="checkbox"> Free only</label><label><input id="direct-only" type="checkbox"> Direct import only</label></div>
 <div class="source-head"><strong>Search portals</strong><div class="source-tools"><button class="secondary" onclick="setAllPortals(true)">Select all</button><button class="secondary" onclick="setAllPortals(false)">Select none</button><span id="source-count" class="source-count"></span></div></div>
 <div class="platforms" id="search-portals">
-<label class="portal-option"><input id="portal-thingiverse" class="portal-search" type="checkbox" data-platform="thingiverse"> Thingiverse</label>
+<label class="portal-option"><input id="portal-thingiverse" class="portal-search" type="checkbox" checked data-platform="thingiverse"> Thingiverse</label>
 <label class="portal-option"><input id="portal-cults3d" class="portal-search" type="checkbox" checked data-platform="cults3d"> Cults3D</label>
-<label class="portal-option"><input id="portal-yeggi" class="portal-search" type="checkbox" data-platform="yeggi"> Yeggi (browser)</label>
-<label class="portal-option"><input id="portal-myminifactory" class="portal-search" type="checkbox" data-platform="myminifactory"> MyMiniFactory</label>
-<label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" data-platform="thangs"> Thangs</label>
-<label class="portal-option"><input id="portal-stlfinder" class="portal-search" type="checkbox" data-platform="stlfinder"> STLFinder</label>
+<label class="portal-option"><input id="portal-yeggi" class="portal-search" type="checkbox" checked data-platform="yeggi"> Yeggi (browser)</label>
+<label class="portal-option"><input id="portal-myminifactory" class="portal-search" type="checkbox" checked data-platform="myminifactory"> MyMiniFactory</label>
+<label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" checked data-platform="thangs"> Thangs</label>
+<label class="portal-option"><input id="portal-stlfinder" class="portal-search" type="checkbox" checked data-platform="stlfinder"> STLFinder</label>
 <label class="portal-option"><input id="portal-makeronline" class="portal-search" type="checkbox" checked data-platform="makeronline"> Makeronline</label>
 <label class="portal-option"><input id="portal-crealitycloud" class="portal-search" type="checkbox" checked data-platform="crealitycloud"> Creality Cloud</label>
 <label class="portal-option"><input id="portal-nexprint" class="portal-search" type="checkbox" checked data-platform="nexprint"> Nexprint</label>
-<label class="portal-option"><input id="portal-grabcad" class="portal-search" type="checkbox" data-platform="grabcad"> GrabCAD</label>
+<label class="portal-option"><input id="portal-grabcad" class="portal-search" type="checkbox" checked data-platform="grabcad"> GrabCAD</label>
 <label class="portal-option"><input id="portal-printables" class="portal-search" type="checkbox" checked data-platform="printables"> Printables</label>
 <label class="portal-option"><input id="portal-makerworld" class="portal-search" type="checkbox" checked data-platform="makerworld"> MakerWorld</label>
-<label class="portal-option"><input id="portal-smithsonian" class="portal-search" type="checkbox" checked data-platform="smithsonian"> Smithsonian 3D</label>
-<label class="portal-option"><input id="portal-nasa" class="portal-search" type="checkbox" checked data-platform="nasa"> NASA 3D Resources</label>
-<label class="portal-option"><input id="portal-nih3d" class="portal-search" type="checkbox" checked data-platform="nih3d"> NIH 3D</label>
 <label class="portal-option"><input id="portal-youmagine" class="portal-search" type="checkbox" checked data-platform="youmagine"> YouMagine</label>
 <label class="portal-option"><input id="portal-pinshape" class="portal-search" type="checkbox" checked data-platform="pinshape"> Pinshape</label>
 </div>
@@ -5135,7 +4875,7 @@ function hideAuthHelp(button){if(activeAuthHelp!==button||button.matches(':hover
 function platformKey(display){return __PLATFORM_KEYS__[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
 function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory','crealitycloud','thangs'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
-var PORTAL_PREF_KEY='orca-model-search-portals-v2';
+var PORTAL_PREF_KEY='orca-model-search-portals-v3';
 function selectedPortals(){var ps=[];document.querySelectorAll('.portal-search:checked').forEach(function(x){ps.push(x.dataset.platform)});return ps}
 function updatePortalCount(){var all=document.querySelectorAll('.portal-search');var checked=document.querySelectorAll('.portal-search:checked');$('source-count').textContent=checked.length+' / '+all.length+' selected'}
 function savePortalSelection(){try{localStorage.setItem(PORTAL_PREF_KEY,JSON.stringify(selectedPortals()))}catch(e){}}

@@ -34,9 +34,6 @@ authoritative source.
 | Yeggi | Pre-filled official browser search | Browser interaction | Meta-search; original portal owns the file flow |
 | STLFinder | Public indexed model pages | Original portal credential, when required | Delegates only to a registered original portal |
 | Creality Cloud | Public JSON model search and Print Settings | None for search; user's `model_token` for signed 3MF | Selected signed 3MF profile; original STL/CAD stays in browser |
-| Smithsonian 3D | Public Smithsonian file API | None | Public STL ZIP resource |
-| NASA 3D Resources | Official NASA GitHub mirror | None | Canonical public STL/3MF raw files |
-| NIH 3D | Public Discover application | None | Validated public file when exposed; otherwise browser |
 | YouMagine | Current public HTML search | None | Validated public file when exposed; otherwise browser |
 | Pinshape | Current public HTML search | None | Validated public STL when exposed; otherwise browser |
 | Thangs | Public web JSON search metadata | None for search; user Bearer token for import | Official `downloadUrl` resolver returns a signed ZIP URL; models without it stay in browser |

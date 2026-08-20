@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Every portal checkbox now starts selected, so a first search covers the whole
+  list instead of a subset.
+- Bumped the stored portal-selection key so an existing saved selection, which
+  predates both the new default and the removals below, is discarded rather
+  than restored over them.
+- Removed the Smithsonian 3D, NASA 3D Resources, and NIH 3D adapters, registry
+  entries, portal checkboxes, live smoke checks, tests, and documentation.
+  They publish printable files but are museum and science archives rather than
+  3D printing catalogs, and the portal list is now limited to the latter.
+  (These three were removed once before in 0.6.0 and restored in 0.8.0; the
+  platform survey keeps their entry, marked as no longer registered.)
+- Corrected the catalog count in the README, which still said 13 while
+  seventeen were registered.
+
 - A Cloudflare clearance that arrives with a browser sign-in is now kept
   automatically. A `Cookie` header copied from a browser that has just passed a
   check already carries `cf_clearance`, and the hand-over page runs in that

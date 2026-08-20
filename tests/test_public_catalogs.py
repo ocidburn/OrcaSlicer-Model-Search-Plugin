@@ -1,4 +1,3 @@
-import json
 import unittest
 from unittest import mock
 
@@ -22,83 +21,6 @@ class Response:
 
 
 class PublicCatalogTests(unittest.TestCase):
-    def test_smithsonian_returns_direct_paginated_zip(self):
-        payload = {
-            "rowCount": 31,
-            "rows": [
-                {
-                    "title": "Apollo Hatch",
-                    "content": {
-                        "uri": "https://3d-api.si.edu/content/model.zip",
-                        "model_url": "3d_package:abc",
-                    },
-                }
-            ],
-        }
-        with mock.patch("requests.get", return_value=Response(payload)) as request:
-            rows = mod.SmithsonianSearcher.search("apollo", None, {"page": 1})
-        self.assertEqual(rows.total, 31)
-        self.assertTrue(rows.has_more)
-        self.assertEqual(rows[0]["platform"], "Smithsonian 3D")
-        self.assertTrue(rows[0]["direct_import"])
-        self.assertEqual(
-            mod.SmithsonianSearcher.get_files(rows[0])[0]["name"], "model.zip"
-        )
-        self.assertEqual(request.call_args.kwargs["params"]["start"], 0)
-
-    def test_nasa_filters_repository_tree_to_printable_files(self):
-        payload = {
-            "tree": [
-                {"type": "blob", "path": "3D Printing/Apollo/Apollo.stl"},
-                {"type": "blob", "path": "3D Printing/Apollo/readme.txt"},
-                {"type": "blob", "path": "3D Printing/Mars/Mars.stl"},
-            ]
-        }
-        with mock.patch("requests.get", return_value=Response(payload)):
-            rows = mod.NasaSearcher.search("apollo", None)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["name"], "Apollo")
-        self.assertTrue(rows[0]["download_url"].endswith("Apollo.stl"))
-        self.assertEqual(mod.NasaSearcher.get_files(rows[0])[0]["name"], "Apollo.stl")
-
-    def test_nih_parses_metrics_and_pagination_from_flight_response(self):
-        payload = {
-            "status": {"timems": 1},
-            "hits": {
-                "found": 31,
-                "hit": [
-                    {
-                        "fields": {
-                            "id": ["123"],
-                            "paddedentryid": ["000123"],
-                            "title": ["Heart"],
-                            "createdby": ["NIH"],
-                            "license": ["CC-BY"],
-                            "downloadcount": ["9"],
-                            "viewcount": ["20"],
-                        }
-                    }
-                ],
-            },
-        }
-        session = mock.Mock()
-        session.headers = {}
-        session.post.return_value = Response(text="0:{}\n1:" + json.dumps(payload))
-        with (
-            mock.patch("requests.Session", return_value=session),
-            mock.patch.object(
-                mod.Nih3DSearcher,
-                "_discover_search_action",
-                return_value="action-id",
-            ),
-        ):
-            rows = mod.Nih3DSearcher.search("heart", None, {"page": 1})
-        self.assertEqual(rows.total, 31)
-        self.assertTrue(rows.has_more)
-        self.assertEqual(rows[0]["downloads"], "9")
-        self.assertEqual(rows[0]["views"], "20")
-        self.assertEqual(rows[0]["license"], "CC BY")
-
     def test_yeggi_is_explicit_browser_meta_search(self):
         row = mod.YeggiSearcher.search("benchy", None)[0]
         self.assertEqual(row["platform"], "Yeggi")

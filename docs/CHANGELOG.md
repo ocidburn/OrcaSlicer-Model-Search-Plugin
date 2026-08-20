@@ -30,6 +30,7 @@
   pasted session cookies, instead of both being sent and leaving Cloudflare to
   choose between two values for one cookie name.
 
+
 - Added a browser sign-in hand-off. **Sign in in browser** opens the portal's
   login together with a short finish page served on loopback, so a session
   reaches OrcaSlicer without switching windows and retyping. The plugin still
@@ -70,6 +71,11 @@
 - Blocked search sources expose an **Add Cloudflare verification** action, and
   the import path reports `cloudflare_required` separately from other
   browser-only flows.
+
+## 0.8.9
+
+- Added an enlarged mouse-hover and keyboard-focus preview to every search-result
+  thumbnail while preserving intersection-based lazy loading.
 
 ## 0.8.8
 

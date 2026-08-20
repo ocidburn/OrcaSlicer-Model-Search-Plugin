@@ -250,12 +250,18 @@ class ReceiverContainmentTests(ReceiverTest):
 
     def test_a_forged_host_header_is_refused(self):
         rec = self.receiver()
-        status, _page, _headers = http(
-            f"{rec.origin}/connect",
-            data={"state": rec.state, "value": self.CREDENTIAL},
-            headers={"Host": "portal.example"},
-        )
-        self.assertEqual(status, 403)
+        try:
+            status, _page, _headers = http(
+                f"{rec.origin}/connect",
+                data={"state": rec.state, "value": self.CREDENTIAL},
+                headers={"Host": "portal.example"},
+            )
+        except (ConnectionAbortedError, ConnectionResetError):
+            # Some Windows network stacks reject a loopback request carrying a
+            # foreign Host before urllib can read the receiver's 403 response.
+            pass
+        else:
+            self.assertEqual(status, 403)
         self.assertEqual(self.saved, [])
 
     def test_the_state_is_not_leaked_to_other_sites(self):

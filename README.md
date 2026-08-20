@@ -2,7 +2,7 @@
 
 Search and import 3D models from multiple model portals without leaving OrcaSlicer.
 
-**Current plugin version: v0.8.8**
+**Current plugin version: v0.8.9**
 
 The plugin opens a non-modal `Search 3D Models` window, lets you choose which portals participate in each search, shows model/license metadata, resolves downloadable files, and imports supported geometry into the **currently open OrcaSlicer project**.
 
@@ -33,7 +33,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 - Selected-source counter and protection against starting a search with no portal selected.
 - Search-source selection is persisted between launches.
 - Search results include model name, author, platform, thumbnail and license information when the platform exposes it.
-- Search-result thumbnails load lazily as cards approach the visible area.
+- Search-result thumbnails load lazily as cards approach the visible area and show an enlarged preview on mouse hover or keyboard focus.
 - One-click **Open in browser** fallback for downloads that require a portal checkout, membership flow, CAPTCHA, or other interactive browser step.
 - Separate per-portal authentication sessions where authentication is actually required.
 - Every authentication card includes a keyboard-accessible help tooltip with portal-specific connection instructions.
@@ -508,7 +508,7 @@ python scripts/check_embedded_js.py > embedded-ui.js
 node --check embedded-ui.js
 ```
 
-The v0.8.8 validation gates are:
+The v0.8.9 validation gates are:
 
 - Python compile check
 - embedded JavaScript syntax check

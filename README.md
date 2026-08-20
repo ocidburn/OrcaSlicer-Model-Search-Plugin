@@ -389,6 +389,19 @@ usual reason a pasted clearance appears to do nothing. The panel deliberately
 does **not** prefill the User-Agent from the plugin window, because the
 embedded webview is not the browser that passed the check.
 
+If you reach a portal through **Sign in in browser**, the clearance usually
+arrives on its own. A `Cookie` header copied from a browser that has just
+passed a check already contains `cf_clearance`, and the hand-over page runs in
+that same browser, so it reports the matching `User-Agent` itself. Both halves
+are present, and the plugin keeps them without asking you to repeat the
+exercise here. The panel above stays for the cases where they are not — a
+clearance obtained separately, or one that has expired.
+
+The plugin's own panel deliberately does *not* prefill the User-Agent, because
+the OrcaSlicer window is an embedded webview and its agent is not the one that
+earned the clearance. The hand-over page is the opposite case, which is why the
+capture happens there.
+
 What to expect:
 
 - A clearance is tied to your current IP address and expires on Cloudflare's

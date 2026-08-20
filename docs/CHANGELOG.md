@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- A Cloudflare clearance that arrives with a browser sign-in is now kept
+  automatically. A `Cookie` header copied from a browser that has just passed a
+  check already carries `cf_clearance`, and the hand-over page runs in that
+  browser, so it reports the `User-Agent` the clearance is bound to. Both
+  halves arrive together and no second hand-over is needed.
+- The clearance is stored for the host the plugin actually talks to, taken from
+  the portal's registered authentication host.
+- Without a reported `User-Agent` no clearance is stored at all: one saved
+  under the wrong agent fails silently and reads as the portal rejecting the
+  account.
+- A stored clearance now replaces any `cf_clearance` already present in the
+  pasted session cookies, instead of both being sent and leaving Cloudflare to
+  choose between two values for one cookie name.
+
 - Added a browser sign-in hand-off. **Sign in in browser** opens the portal's
   login together with a short finish page served on loopback, so a session
   reaches OrcaSlicer without switching windows and retyping. The plugin still

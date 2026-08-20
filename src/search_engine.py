@@ -943,13 +943,13 @@ class LoginReceiver:
     def valid_state(self, value):
         return hmac.compare_digest(str(value or ""), self.state)
 
-    def submit(self, value):
+    def submit(self, value, user_agent=""):
         """Hand one credential to the plugin. Returns (accepted, message)."""
         with self._lock:
             if self._done:
                 return False, "This sign-in link has already been used."
         try:
-            self._on_credential(self.platform, value)
+            self._on_credential(self.platform, value, user_agent)
         except (AuthError, OSError, ValueError) as exc:
             return False, str(exc)
         with self._lock:
@@ -1141,7 +1141,9 @@ def _login_handler(receiver):
                 )
                 return
             value = _first(fields.get("value"), "")
-            ok, message = receiver.submit(value)
+            ok, message = receiver.submit(
+                value, _first(fields.get("user_agent"), "")
+            )
             if ok:
                 self._reply(200, _login_result(True, ""))
                 receiver.stop()
@@ -1170,9 +1172,14 @@ def _connect_page(platform, state, error):
         f"{problem}"
         '<form method="post" action="/connect">'
         f'<input type="hidden" name="state" value="{html.escape(state)}">'
+        '<input type="hidden" name="user_agent" id="ua">'
         '<textarea name="value" autofocus placeholder="Paste here"></textarea>'
         "<div><button type=\"submit\">Connect</button></div>"
         "</form>"
+        # This page runs in the browser that passed any Cloudflare check, so
+        # its own User-Agent is the one a clearance is bound to. Reading it
+        # here is the whole reason the hand-over happens in the browser.
+        "<script>document.getElementById('ua').value=navigator.userAgent</script>"
         "<p>This page is served by the plugin on your own machine and is "
         "reachable only from it. Nothing is sent anywhere else.</p>"
     )
@@ -5429,15 +5436,49 @@ if orca is not None:
             if receiver is not None:
                 receiver.stop()
 
-        def _store_login_credential(self, platform, value):
+        @staticmethod
+        def _clearance_host(spec):
+            """The host the plugin will actually talk to for this portal."""
+            if spec.auth_hosts:
+                return spec.auth_hosts[0]
+            return _url_host(spec.login_url)
+
+        def _adopt_clearance(self, platform, value, user_agent):
+            """Keep a Cloudflare clearance that arrived with the session.
+
+            A Cookie header copied from a browser that has just passed a
+            Cloudflare check already contains cf_clearance. That clearance is
+            bound to the browser's User-Agent, which the hand-over page reports
+            because it runs in that same browser -- so both halves are present
+            here and the user does not have to repeat the exercise in the
+            Cloudflare panel.
+            """
+            token = CloudflareClearance.parse_cookie(value)
+            spec = _platform(platform)
+            if not token or not user_agent or spec is None:
+                return ""
+            host = self._clearance_host(spec)
+            if not host:
+                return ""
+            try:
+                self.auth.clearance.save(host, token, user_agent)
+            except (AuthError, OSError, ValueError):
+                return ""
+            return host
+
+        def _store_login_credential(self, platform, value, user_agent=""):
             """Called from the loopback receiver once the user submits."""
             self.auth.save_token(platform, value, label="Browser sign-in")
+            host = self._adopt_clearance(platform, value, user_agent)
             with self._login_lock:
                 self._login = None
-            self._post_auth(
-                "auth_changed",
-                f"{_display_name(platform)} connected from your browser.",
-            )
+            message = f"{_display_name(platform)} connected from your browser."
+            if host:
+                message += (
+                    f" The Cloudflare verification for {host} came with it and "
+                    "was kept, together with that browser's User-Agent."
+                )
+            self._post_auth("auth_changed", message)
 
         def _do_start_login(self, platform):
             spec = _platform(platform)

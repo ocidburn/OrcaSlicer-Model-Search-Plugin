@@ -106,9 +106,11 @@ class ReceiverTest(unittest.TestCase):
             mod.AuthStore(os.path.join(self._tmp.name, "sessions.json"))
         )
         self.saved = []
+        self.agents = []
 
-    def store(self, platform, value):
+    def store(self, platform, value, user_agent=""):
         self.saved.append((platform, value))
+        self.agents.append(user_agent)
         self.auth.save_token(platform, value, label="Browser sign-in")
 
     def receiver(self, platform=None, timeout=30):
@@ -388,6 +390,34 @@ class BrowserBehaviourTests(ReceiverTest):
         self.assertEqual(status, 204)
 
 
+class UserAgentCaptureTests(ReceiverTest):
+    """The hand-over page runs in the browser that passed any Cloudflare check,
+    so it is the only place the right User-Agent can be read from."""
+
+    def test_the_page_reports_the_browser_it_runs_in(self):
+        rec = self.receiver()
+        _status, page, _headers = http(rec.url)
+        self.assertIn('name="user_agent"', page)
+        self.assertIn("navigator.userAgent", page)
+
+    def test_the_submitted_agent_reaches_the_plugin(self):
+        rec = self.receiver()
+        agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/141.0.0.0"
+        status, _page, _headers = http(
+            f"{rec.origin}/connect",
+            data={"state": rec.state, "value": "session=x", "user_agent": agent},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.agents, [agent])
+
+    def test_a_redirect_capture_simply_has_no_agent(self):
+        rec = self.receiver(platform="thingiverse")
+        query = urllib.parse.urlencode({"state": rec.state, "access_token": "tok"})
+        status, _page, _headers = http(f"{rec.origin}/callback?{query}")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.agents, [""])
+
+
 class CoordinatorLoginTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -479,6 +509,66 @@ class CoordinatorLoginTests(unittest.TestCase):
         self.assertIn("token field", self.posts[-1]["message"])
         with self.action._login_lock:
             self.assertIsNone(self.action._login)
+
+
+class ClearanceAdoptionTests(CoordinatorLoginTests):
+    """A Cookie header copied from a browser that just passed a Cloudflare
+    check already carries cf_clearance. Both halves it needs -- the cookie and
+    the agent it is bound to -- arrive together, so the user should not have to
+    repeat the exercise in the Cloudflare panel."""
+
+    AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/141.0.0.0"
+
+    def hand_over(self, value, agent):
+        opened = self.start()
+        local = next(u for u in opened if u.startswith("http://127.0.0.1:"))
+        state = urllib.parse.parse_qs(urllib.parse.urlsplit(local).query)["state"][0]
+        origin = local.split("/connect")[0]
+        return http(
+            f"{origin}/connect",
+            data={"state": state, "value": value, "user_agent": agent},
+        )
+
+    def test_a_clearance_arriving_with_the_session_is_kept(self):
+        status, _page, _headers = self.hand_over(
+            "session=SESS; cf_clearance=CFTOKEN; other=1", self.AGENT
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(self.action.auth.authenticated("cults3d"))
+        record = self.action.auth.clearance.for_url("https://cults3d.com/en")
+        self.assertEqual(record.get("cf_clearance"), "CFTOKEN")
+        self.assertEqual(record.get("user_agent"), self.AGENT)
+        self.assertIn("Cloudflare", self.posts[-1]["message"])
+
+    def test_without_an_agent_no_clearance_is_invented(self):
+        """A clearance under the wrong agent is worse than none: it fails
+        silently and looks like the portal rejecting the account."""
+        status, _page, _headers = self.hand_over(
+            "session=SESS; cf_clearance=CFTOKEN", ""
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(self.action.auth.authenticated("cults3d"))
+        self.assertEqual(self.action.auth.clearance.for_url("https://cults3d.com"), {})
+        self.assertNotIn("Cloudflare", self.posts[-1]["message"])
+
+    def test_a_session_without_a_clearance_stores_none(self):
+        status, _page, _headers = self.hand_over("session=SESS; other=1", self.AGENT)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.action.auth.clearance.status(), [])
+        self.assertNotIn("Cloudflare", self.posts[-1]["message"])
+
+    def test_the_clearance_is_stored_for_the_host_the_plugin_talks_to(self):
+        for key, expected in (
+            ("cults3d", "cults3d.com"),
+            ("grabcad", "grabcad.com"),
+            ("thangs", "production-api.thangs.com"),
+            ("makerworld", "api.bambulab.com"),
+        ):
+            with self.subTest(portal=key):
+                spec = self.script._platform(key)
+                self.assertEqual(
+                    self.script.SearchEngineScript._clearance_host(spec), expected
+                )
 
 
 class SeamlessLoginUiTests(unittest.TestCase):

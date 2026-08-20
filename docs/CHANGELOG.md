@@ -2,10 +2,34 @@
 
 ## Unreleased
 
-## 0.8.9
+- Every portal checkbox now starts selected, so a first search covers the whole
+  list instead of a subset.
+- Bumped the stored portal-selection key so an existing saved selection, which
+  predates both the new default and the removals below, is discarded rather
+  than restored over them.
+- Removed the Smithsonian 3D, NASA 3D Resources, and NIH 3D adapters, registry
+  entries, portal checkboxes, live smoke checks, tests, and documentation.
+  They publish printable files but are museum and science archives rather than
+  3D printing catalogs, and the portal list is now limited to the latter.
+  (These three were removed once before in 0.6.0 and restored in 0.8.0; the
+  platform survey keeps their entry, marked as no longer registered.)
+- Corrected the catalog count in the README, which still said 13 while
+  seventeen were registered.
 
-- Added an enlarged mouse-hover and keyboard-focus preview to every search-result
-  thumbnail while preserving intersection-based lazy loading.
+- A Cloudflare clearance that arrives with a browser sign-in is now kept
+  automatically. A `Cookie` header copied from a browser that has just passed a
+  check already carries `cf_clearance`, and the hand-over page runs in that
+  browser, so it reports the `User-Agent` the clearance is bound to. Both
+  halves arrive together and no second hand-over is needed.
+- The clearance is stored for the host the plugin actually talks to, taken from
+  the portal's registered authentication host.
+- Without a reported `User-Agent` no clearance is stored at all: one saved
+  under the wrong agent fails silently and reads as the portal rejecting the
+  account.
+- A stored clearance now replaces any `cf_clearance` already present in the
+  pasted session cookies, instead of both being sent and leaving Cloudflare to
+  choose between two values for one cookie name.
+
 
 - Added a browser sign-in hand-off. **Sign in in browser** opens the portal's
   login together with a short finish page served on loopback, so a session
@@ -15,11 +39,19 @@
 - A sign-in that can be redirected to the loopback origin completes with no
   copying at all: the receiver accepts `access_token`, `auth_token`, `token`,
   or `code` on `/callback`.
-- The receiver binds `127.0.0.1` only, requires a random single-use state
-  compared in constant time, refuses forged `Host` headers and cross-site
-  `Origin`/`Referer`, answers `no-store` and `no-referrer`, keeps the
-  credential out of its logs, and shuts down on success, on panel close, or
-  after five minutes.
+- The receiver binds loopback only and accepts every spelling of a loopback
+  `Host` (any 127.0.0.0/8 address, `::1`, `localhost`, any case, with or
+  without a port), which is the guard against DNS rebinding. It requires a
+  random single-use state compared in constant time, refuses a cross-site
+  submission by `Sec-Fetch-Site` (falling back to `Origin`), answers
+  `no-store` and `Referrer-Policy: same-origin`, keeps the credential out of
+  its logs, and shuts down on success, on panel close, or after five minutes.
+- A navigation is never judged by `Referer`: the portal page a user arrives
+  from can legitimately leak one, and the state value is the real guard.
+- An oversized submission is drained before the `413` is written so the
+  browser receives the error page instead of a reset connection, and the
+  favicon request browsers always make is answered with `204` rather than a
+  refusal that looks like the real failure.
 - A refused credential reports the reason and leaves the link usable, so a
   mistyped paste does not force the whole sign-in to be restarted.
 - If the loopback socket cannot be opened, the plugin reports it and the
@@ -39,6 +71,11 @@
 - Blocked search sources expose an **Add Cloudflare verification** action, and
   the import path reports `cloudflare_required` separately from other
   browser-only flows.
+
+## 0.8.9
+
+- Added an enlarged mouse-hover and keyboard-focus preview to every search-result
+  thumbnail while preserving intersection-based lazy loading.
 
 ## 0.8.8
 

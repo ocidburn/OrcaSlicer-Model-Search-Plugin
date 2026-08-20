@@ -699,8 +699,8 @@ class CloudflareClearance:
         host = str(target or "").strip().lower().strip(".")
         return host if re.fullmatch(r"[a-z0-9.-]{1,253}", host or "") else ""
 
-    @classmethod
-    def parse_cookie(cls, value):
+    @staticmethod
+    def parse_cookie(value):
         text = str(value or "").strip()
         if text.lower().startswith("cookie:"):
             text = text.split(":", 1)[1].strip()
@@ -806,6 +806,28 @@ def _cloudflare_challenge(url, auth=None, detail="", host=""):
 
 
 _LOGIN_TIMEOUT_SECONDS = 300
+_LOGIN_MAX_BODY_BYTES = 64 * 1024
+
+
+def _is_loopback_host(value):
+    """True when a Host or netloc names this machine's loopback interface.
+
+    Accepts every form a browser or a hand-typed URL may produce: any address
+    in 127.0.0.0/8, ``::1`` bracketed or not, and ``localhost``, in any case,
+    with or without a port or a trailing root dot.
+    """
+    host = str(value or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host.startswith("["):
+        host = host.partition("]")[0].lstrip("[")
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    host = host.rstrip(".")
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
 
 _LOGIN_PAGE_STYLE = (
     "body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:32px;"
@@ -869,6 +891,12 @@ class LoginReceiver:
         return f"http://{host}:{port}"
 
     @property
+    def port(self):
+        with self._lock:
+            server = self._server
+        return server.server_address[1] if server is not None else 0
+
+    @property
     def url(self):
         origin = self.origin
         if not origin:
@@ -915,13 +943,13 @@ class LoginReceiver:
     def valid_state(self, value):
         return hmac.compare_digest(str(value or ""), self.state)
 
-    def submit(self, value):
+    def submit(self, value, user_agent=""):
         """Hand one credential to the plugin. Returns (accepted, message)."""
         with self._lock:
             if self._done:
                 return False, "This sign-in link has already been used."
         try:
-            self._on_credential(self.platform, value)
+            self._on_credential(self.platform, value, user_agent)
         except (AuthError, OSError, ValueError) as exc:
             return False, str(exc)
         with self._lock:
@@ -944,30 +972,70 @@ def _login_handler(receiver):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(page)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Referrer-Policy", "same-origin")
             self.end_headers()
             self.wfile.write(page)
 
         def _is_local(self):
-            """Only this machine, and only pages this receiver served."""
-            host = self.headers.get("Host", "")
-            if not re.fullmatch(r"(?:127\.0\.0\.1|localhost)(?::\d+)?", host):
+            """Reject anything not addressed to this machine's loopback name.
+
+            This is the defence against DNS rebinding: a site that points its
+            own hostname at 127.0.0.1 still sends that hostname here.  It
+            deliberately ignores Referer -- a browser may carry one over from
+            the portal page the user just left, and rejecting that blocks a
+            perfectly ordinary navigation while adding nothing, because the
+            single-use state value is what actually guards this endpoint.
+            """
+            return _is_loopback_host(self.headers.get("Host"))
+
+        def _origin_allowed(self):
+            """Defence in depth for submissions: refuse a cross-site POST.
+
+            The single-use state value is what actually guards this endpoint;
+            this only turns away an obvious cross-site submission.  Two browser
+            behaviours matter here.  A browser states the relationship directly
+            in Sec-Fetch-Site, which is the most reliable signal available.  And
+            a browser may serialize the Origin of its own same-origin form post
+            as ``null``, so a null Origin cannot be treated as hostile on its
+            own -- rejecting it blocked the plugin's own hand-over page.
+            """
+            site = str(self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if site:
+                return site in ("same-origin", "none")
+            origin = str(self.headers.get("Origin") or "").strip()
+            if not origin or origin.lower() == "null":
+                return True
+            parsed = urllib.parse.urlsplit(origin)
+            if not _is_loopback_host(parsed.netloc):
                 return False
-            origin = receiver.origin
-            for name in ("Origin", "Referer"):
-                value = self.headers.get(name)
-                if value and origin and not value.startswith(origin):
-                    return False
-            return True
+            return parsed.port == receiver.port
 
         def _query(self):
             parsed = urllib.parse.urlsplit(self.path)
             return parsed.path, urllib.parse.parse_qs(parsed.query)
 
+        def _blocked(self):
+            """A dead-end 403 is impossible to diagnose; name what arrived."""
+            host = html.escape(str(self.headers.get("Host") or "(none)"))
+            self._reply(
+                403,
+                _login_page(
+                    "Blocked",
+                    "<p>This page answers only requests addressed to this "
+                    "machine over its loopback interface.</p>"
+                    f"<p>The request arrived with <code>Host: {host}</code>.</p>",
+                ),
+            )
+
         def do_GET(self):
             path, query = self._query()
             if not self._is_local():
-                self._reply(403, _login_page("Blocked", "<p>Local requests only.</p>"))
+                self._blocked()
+                return
+            if path == "/favicon.ico":
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
                 return
             if not receiver.valid_state(_first(query.get("state"))):
                 self._reply(
@@ -1010,20 +1078,59 @@ def _login_handler(receiver):
                 # truncate it.
                 receiver.stop()
 
-        def do_POST(self):
-            if not self._is_local():
-                self._reply(403, _login_page("Blocked", "<p>Local requests only.</p>"))
-                return
+        def _read_body(self):
+            """Consume the request body before anything is written back.
+
+            Replying while the client is still uploading gets the connection
+            reset instead of the response, so every refusal below reads first.
+            Oversized bodies are drained only up to a bound, never buffered.
+            """
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = 0
-            if length <= 0 or length > 64 * 1024:
+            if length <= 0:
+                return 0, ""
+            capped = min(length, 4 * _LOGIN_MAX_BODY_BYTES)
+            remaining = capped
+            chunks = []
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                if length <= _LOGIN_MAX_BODY_BYTES:
+                    chunks.append(chunk)
+            return length, b"".join(chunks).decode("utf-8", "replace")
+
+        def do_POST(self):
+            length, body = self._read_body()
+            if not self._is_local():
+                self._blocked()
+                return
+            if not self._origin_allowed():
+                self._reply(
+                    403,
+                    _login_page(
+                        "Blocked",
+                        "<p>This submission came from another site.</p>",
+                    ),
+                )
+                return
+            if length <= 0:
                 self._reply(400, _login_page("Bad request", "<p>Empty submission.</p>"))
                 return
-            fields = urllib.parse.parse_qs(
-                self.rfile.read(length).decode("utf-8", "replace")
-            )
+            if length > _LOGIN_MAX_BODY_BYTES:
+                self._reply(
+                    413,
+                    _login_page(
+                        "Too large",
+                        "<p>That is far more than a session value. Paste only "
+                        "the cookie or token itself.</p>",
+                    ),
+                )
+                return
+            fields = urllib.parse.parse_qs(body)
             if not receiver.valid_state(_first(fields.get("state"))):
                 self._reply(
                     403,
@@ -1034,7 +1141,9 @@ def _login_handler(receiver):
                 )
                 return
             value = _first(fields.get("value"), "")
-            ok, message = receiver.submit(value)
+            ok, message = receiver.submit(
+                value, _first(fields.get("user_agent"), "")
+            )
             if ok:
                 self._reply(200, _login_result(True, ""))
                 receiver.stop()
@@ -1063,9 +1172,14 @@ def _connect_page(platform, state, error):
         f"{problem}"
         '<form method="post" action="/connect">'
         f'<input type="hidden" name="state" value="{html.escape(state)}">'
+        '<input type="hidden" name="user_agent" id="ua">'
         '<textarea name="value" autofocus placeholder="Paste here"></textarea>'
         "<div><button type=\"submit\">Connect</button></div>"
         "</form>"
+        # This page runs in the browser that passed any Cloudflare check, so
+        # its own User-Agent is the one a clearance is bound to. Reading it
+        # here is the whole reason the hand-over happens in the browser.
+        "<script>document.getElementById('ua').value=navigator.userAgent</script>"
         "<p>This page is served by the plugin on your own machine and is "
         "reachable only from it. Nothing is sent anywhere else.</p>"
     )
@@ -1286,6 +1400,13 @@ class AuthManager:
         cookies = self.clearance.apply(url, headers)
         if not cookies:
             return
+        # A pasted Cookie header often already carries a cf_clearance from the
+        # same browser visit. Sending both leaves Cloudflare to pick between
+        # two values for one name, so the stored clearance -- the one whose
+        # User-Agent is known -- replaces any copy already in the jar.
+        for cookie in list(session.cookies):
+            if cookie.name == CloudflareClearance.COOKIE:
+                session.cookies.clear(cookie.domain, cookie.path, cookie.name)
         # Scope to the exact host so a later redirect cannot carry it elsewhere.
         session.cookies.set(
             CloudflareClearance.COOKIE,
@@ -4142,255 +4263,6 @@ class GrabcadSearcher:
         )
 
 
-class SmithsonianSearcher:
-    API = "https://3d-api.si.edu/api/v1.0/content/file/search"
-
-    @staticmethod
-    def search(query, _context, options=None):
-        import requests
-
-        page = _search_page_number(options)
-        response = requests.get(
-            SmithsonianSearcher.API,
-            params={
-                "q": query,
-                "model_type": "stl",
-                "start": (page - 1) * 30,
-                "rows": 30,
-            },
-            headers={"User-Agent": _BROWSER_UA},
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        results = []
-        for item in payload.get("rows") or []:
-            content = item.get("content") or {}
-            direct = content.get("uri") or ""
-            identifier = str(content.get("model_url") or "").split(":", 1)[-1]
-            results.append(
-                {
-                    "name": item.get("title") or "Untitled",
-                    "author": "Smithsonian Institution",
-                    "platform": "Smithsonian 3D",
-                    "thumbnail_url": "",
-                    "license": "Smithsonian Open Access",
-                    "license_url": "https://www.si.edu/openaccess",
-                    "license_summary": "Released through the Smithsonian Open Access initiative.",
-                    "download_url": direct,
-                    "url": (
-                        f"https://3d.si.edu/object/3d/{identifier}"
-                        if identifier
-                        else direct
-                    ),
-                    "_direct_file": direct,
-                    "requires_auth": False,
-                    "direct_import": bool(direct),
-                    "is_free": True,
-                }
-            )
-        total = _number(payload.get("rowCount"), integer=True)
-        return SearchPage(
-            results,
-            total=total,
-            has_more=bool(total is not None and page * 30 < total),
-        )
-
-    @staticmethod
-    def get_files(model, auth=None):
-        url = model.get("_direct_file") or model.get("download_url") or ""
-        if not url:
-            return []
-        name = os.path.basename(urllib.parse.urlsplit(url).path) or "smithsonian.zip"
-        return [{"name": urllib.parse.unquote(name), "url": url}]
-
-
-class NasaSearcher:
-    TREE_API = (
-        "https://api.github.com/repos/nasa/NASA-3D-Resources/git/trees/master"
-        "?recursive=1"
-    )
-    REPO = "https://github.com/nasa/NASA-3D-Resources"
-    RAW = "https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/"
-
-    @staticmethod
-    def search(query, _context, options=None):
-        import requests
-
-        response = requests.get(
-            NasaSearcher.TREE_API,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": _BROWSER_UA,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        terms = [term.casefold() for term in re.findall(r"[\w-]+", query)]
-        results = []
-        for item in response.json().get("tree") or []:
-            path = str(item.get("path") or "")
-            lower = path.casefold()
-            if item.get("type") != "blob" or not lower.endswith((".stl", ".3mf")):
-                continue
-            if terms and not all(term in lower for term in terms):
-                continue
-            quoted = urllib.parse.quote(path, safe="/")
-            direct = NasaSearcher.RAW + quoted
-            results.append(
-                {
-                    "name": os.path.splitext(os.path.basename(path))[0],
-                    "author": "NASA",
-                    "platform": "NASA 3D Resources",
-                    "thumbnail_url": "",
-                    "license": "NASA Media Usage Guidelines",
-                    "license_url": "https://www.nasa.gov/nasa-brand-center/images-and-media/",
-                    "license_summary": "NASA resource; review NASA's media usage guidelines.",
-                    "download_url": direct,
-                    "url": f"{NasaSearcher.REPO}/blob/master/{quoted}",
-                    "_direct_file": direct,
-                    "requires_auth": False,
-                    "direct_import": True,
-                    "is_free": True,
-                }
-            )
-            if len(results) >= 30:
-                break
-        return results
-
-    @staticmethod
-    def get_files(model, auth=None):
-        url = model.get("_direct_file") or model.get("download_url") or ""
-        name = os.path.basename(urllib.parse.urlsplit(url).path) or "nasa_model.stl"
-        return [{"name": urllib.parse.unquote(name), "url": url}] if url else []
-
-
-class Nih3DSearcher:
-    BASE = "https://3d.nih.gov"
-    _server_action: ClassVar[str] = ""
-
-    @classmethod
-    def _discover_search_action(cls, session):
-        if cls._server_action:
-            return cls._server_action
-        page = session.get(cls.BASE + "/discover", timeout=30)
-        page.raise_for_status()
-        paths = re.findall(r'<script[^>]+src="([^"]+)"', page.text, re.IGNORECASE)
-        path = next((value for value in paths if "/discover/page-" in value), "")
-        if not path:
-            raise RuntimeError("NIH 3D discover application script was not found")
-        script = session.get(urllib.parse.urljoin(cls.BASE, path), timeout=30)
-        script.raise_for_status()
-        match = re.search(
-            r'createServerReference\)\("([0-9a-f]{40,64})".{0,250}"discoverSearch"',
-            script.text,
-        )
-        if not match:
-            raise RuntimeError("NIH 3D search action was not found")
-        cls._server_action = match.group(1)
-        return cls._server_action
-
-    @staticmethod
-    def _flight_payload(response):
-        marker = response.text.find('1:{"status"')
-        if marker < 0:
-            return None
-        payload, _end = json.JSONDecoder().raw_decode(response.text[marker + 2 :])
-        return payload
-
-    @staticmethod
-    def search(query, _context, options=None):
-        import requests
-
-        terms = " ".join(re.findall(r"[\w-]+", query, re.UNICODE))[:160]
-        if not terms:
-            return []
-        page = _search_page_number(options)
-        start = (page - 1) * 30
-        expression = (
-            'type:entry AND submissionstatus:"Published" AND '
-            f"{terms}?start={start}&size=30&sort=publisheddate desc"
-        )
-        session = requests.Session()
-        session.headers.update({"User-Agent": _BROWSER_UA})
-        try:
-            payload = Nih3DSearcher._discover(session, expression)
-        finally:
-            session.close()
-        if not payload:
-            raise RuntimeError("NIH 3D search response format changed")
-        return Nih3DSearcher._rows(payload, page)
-
-    @staticmethod
-    def _discover(session, expression):
-        payload = None
-        for _attempt in range(2):
-            action = Nih3DSearcher._discover_search_action(session)
-            response = session.post(
-                Nih3DSearcher.BASE + "/discover",
-                data=json.dumps([expression]),
-                headers={
-                    "Accept": "text/x-component",
-                    "Content-Type": "text/plain;charset=UTF-8",
-                    "Next-Action": action,
-                },
-                timeout=30,
-            )
-            if response.status_code < 400:
-                payload = Nih3DSearcher._flight_payload(response)
-            if payload:
-                break
-            Nih3DSearcher._server_action = ""
-        return payload
-
-    @staticmethod
-    def _rows(payload, page):
-        results = []
-        hits = payload.get("hits") or {}
-        for hit in hits.get("hit") or []:
-            fields = hit.get("fields") or {}
-            identifier = str(_first(fields.get("paddedentryid") or fields.get("id")))
-            lic_name = str(_first(fields.get("license"), "Unknown"))
-            lic = _parse_license(lic_name.replace("CC-", "CC "))
-            page_url = f"{Nih3DSearcher.BASE}/entries/3DPX-{identifier}"
-            thumbnail = str(_first(fields.get("thumbnail")))
-            results.append(
-                {
-                    "name": str(_first(fields.get("title"), "Untitled")),
-                    "author": str(_first(fields.get("createdby"), "Unknown")),
-                    "platform": "NIH 3D",
-                    "thumbnail_url": urllib.parse.urljoin(
-                        Nih3DSearcher.BASE, thumbnail
-                    ),
-                    "license": lic["name"],
-                    "license_url": lic["url"],
-                    "license_summary": lic["summary"],
-                    "download_url": page_url,
-                    "url": page_url,
-                    "requires_auth": False,
-                    "direct_import": True,
-                    "downloads": _first(fields.get("downloadcount"), None),
-                    "views": _first(fields.get("viewcount"), None),
-                    "published_at": _first(fields.get("publisheddate"), None),
-                    "is_free": True,
-                }
-            )
-        total = _number(hits.get("found"), integer=True)
-        return SearchPage(
-            results,
-            total=total,
-            has_more=bool(total is not None and page * 30 < total),
-        )
-
-    @staticmethod
-    def get_files(model, auth=None):
-        return _public_page_files(
-            model,
-            no_direct_message=(
-                "NIH 3D uses an interactive file-selection flow for this entry. "
-                "Open it in the browser."
-            ),
-        )
 
 
 class YouMagineSearcher:
@@ -4559,14 +4431,6 @@ _PLATFORM_SPECS = (
         cookie_domain=".grabcad.com",
         session_recheck=True,
     ),
-    PlatformSpec(
-        "smithsonian",
-        "Smithsonian 3D",
-        SmithsonianSearcher,
-        search_page_size=30,
-    ),
-    PlatformSpec("nasa", "NASA 3D Resources", NasaSearcher),
-    PlatformSpec("nih3d", "NIH 3D", Nih3DSearcher, search_page_size=30),
     PlatformSpec("youmagine", "YouMagine", YouMagineSearcher),
     PlatformSpec("pinshape", "Pinshape", PinshapeSearcher),
 )
@@ -4944,21 +4808,18 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <div class="search-options"><label>Sort <select id="sort"><option value="relevance">Relevance</option><option value="popularity">Popularity (normalized)</option><option value="downloads">Downloads</option><option value="likes">Likes</option><option value="rating">Rating</option><option value="newest">Newest</option><option value="makes">Most printed</option><option value="name">Name</option><option value="platform">Platform</option></select></label><label><input id="free-only" type="checkbox"> Free only</label><label><input id="direct-only" type="checkbox"> Direct import only</label></div>
 <div class="source-head"><strong>Search portals</strong><div class="source-tools"><button class="secondary" onclick="setAllPortals(true)">Select all</button><button class="secondary" onclick="setAllPortals(false)">Select none</button><span id="source-count" class="source-count"></span></div></div>
 <div class="platforms" id="search-portals">
-<label class="portal-option"><input id="portal-thingiverse" class="portal-search" type="checkbox" data-platform="thingiverse"> Thingiverse</label>
+<label class="portal-option"><input id="portal-thingiverse" class="portal-search" type="checkbox" checked data-platform="thingiverse"> Thingiverse</label>
 <label class="portal-option"><input id="portal-cults3d" class="portal-search" type="checkbox" checked data-platform="cults3d"> Cults3D</label>
-<label class="portal-option"><input id="portal-yeggi" class="portal-search" type="checkbox" data-platform="yeggi"> Yeggi (browser)</label>
-<label class="portal-option"><input id="portal-myminifactory" class="portal-search" type="checkbox" data-platform="myminifactory"> MyMiniFactory</label>
-<label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" data-platform="thangs"> Thangs</label>
-<label class="portal-option"><input id="portal-stlfinder" class="portal-search" type="checkbox" data-platform="stlfinder"> STLFinder</label>
+<label class="portal-option"><input id="portal-yeggi" class="portal-search" type="checkbox" checked data-platform="yeggi"> Yeggi (browser)</label>
+<label class="portal-option"><input id="portal-myminifactory" class="portal-search" type="checkbox" checked data-platform="myminifactory"> MyMiniFactory</label>
+<label class="portal-option"><input id="portal-thangs" class="portal-search" type="checkbox" checked data-platform="thangs"> Thangs</label>
+<label class="portal-option"><input id="portal-stlfinder" class="portal-search" type="checkbox" checked data-platform="stlfinder"> STLFinder</label>
 <label class="portal-option"><input id="portal-makeronline" class="portal-search" type="checkbox" checked data-platform="makeronline"> Makeronline</label>
 <label class="portal-option"><input id="portal-crealitycloud" class="portal-search" type="checkbox" checked data-platform="crealitycloud"> Creality Cloud</label>
 <label class="portal-option"><input id="portal-nexprint" class="portal-search" type="checkbox" checked data-platform="nexprint"> Nexprint</label>
-<label class="portal-option"><input id="portal-grabcad" class="portal-search" type="checkbox" data-platform="grabcad"> GrabCAD</label>
+<label class="portal-option"><input id="portal-grabcad" class="portal-search" type="checkbox" checked data-platform="grabcad"> GrabCAD</label>
 <label class="portal-option"><input id="portal-printables" class="portal-search" type="checkbox" checked data-platform="printables"> Printables</label>
 <label class="portal-option"><input id="portal-makerworld" class="portal-search" type="checkbox" checked data-platform="makerworld"> MakerWorld</label>
-<label class="portal-option"><input id="portal-smithsonian" class="portal-search" type="checkbox" checked data-platform="smithsonian"> Smithsonian 3D</label>
-<label class="portal-option"><input id="portal-nasa" class="portal-search" type="checkbox" checked data-platform="nasa"> NASA 3D Resources</label>
-<label class="portal-option"><input id="portal-nih3d" class="portal-search" type="checkbox" checked data-platform="nih3d"> NIH 3D</label>
 <label class="portal-option"><input id="portal-youmagine" class="portal-search" type="checkbox" checked data-platform="youmagine"> YouMagine</label>
 <label class="portal-option"><input id="portal-pinshape" class="portal-search" type="checkbox" checked data-platform="pinshape"> Pinshape</label>
 </div>
@@ -5014,7 +4875,7 @@ function hideAuthHelp(button){if(activeAuthHelp!==button||button.matches(':hover
 function platformKey(display){return __PLATFORM_KEYS__[display]||String(display||'').toLowerCase()}
 function isAuthed(model){if(!model||!model.requires_auth)return true;var s=authStates[platformKey(model.platform)];return !!(s&&s.authenticated)}
 function updateAuth(states){authStates=states||{};['makerworld','nexprint','makeronline','cults3d','grabcad','thingiverse','myminifactory','crealitycloud','thangs'].forEach(function(p){var s=authStates[p]||{};$("auth-"+p).textContent=s.authenticated?("Connected: "+(s.label||'session')):'Not connected'});if(selectedModel)showDetail(selectedModel,false)}
-var PORTAL_PREF_KEY='orca-model-search-portals-v2';
+var PORTAL_PREF_KEY='orca-model-search-portals-v3';
 function selectedPortals(){var ps=[];document.querySelectorAll('.portal-search:checked').forEach(function(x){ps.push(x.dataset.platform)});return ps}
 function updatePortalCount(){var all=document.querySelectorAll('.portal-search');var checked=document.querySelectorAll('.portal-search:checked');$('source-count').textContent=checked.length+' / '+all.length+' selected'}
 function savePortalSelection(){try{localStorage.setItem(PORTAL_PREF_KEY,JSON.stringify(selectedPortals()))}catch(e){}}
@@ -5315,15 +5176,49 @@ if orca is not None:
             if receiver is not None:
                 receiver.stop()
 
-        def _store_login_credential(self, platform, value):
+        @staticmethod
+        def _clearance_host(spec):
+            """The host the plugin will actually talk to for this portal."""
+            if spec.auth_hosts:
+                return spec.auth_hosts[0]
+            return _url_host(spec.login_url)
+
+        def _adopt_clearance(self, platform, value, user_agent):
+            """Keep a Cloudflare clearance that arrived with the session.
+
+            A Cookie header copied from a browser that has just passed a
+            Cloudflare check already contains cf_clearance. That clearance is
+            bound to the browser's User-Agent, which the hand-over page reports
+            because it runs in that same browser -- so both halves are present
+            here and the user does not have to repeat the exercise in the
+            Cloudflare panel.
+            """
+            token = CloudflareClearance.parse_cookie(value)
+            spec = _platform(platform)
+            if not token or not user_agent or spec is None:
+                return ""
+            host = self._clearance_host(spec)
+            if not host:
+                return ""
+            try:
+                self.auth.clearance.save(host, token, user_agent)
+            except (AuthError, OSError, ValueError):
+                return ""
+            return host
+
+        def _store_login_credential(self, platform, value, user_agent=""):
             """Called from the loopback receiver once the user submits."""
             self.auth.save_token(platform, value, label="Browser sign-in")
+            host = self._adopt_clearance(platform, value, user_agent)
             with self._login_lock:
                 self._login = None
-            self._post_auth(
-                "auth_changed",
-                f"{_display_name(platform)} connected from your browser.",
-            )
+            message = f"{_display_name(platform)} connected from your browser."
+            if host:
+                message += (
+                    f" The Cloudflare verification for {host} came with it and "
+                    "was kept, together with that browser's User-Agent."
+                )
+            self._post_auth("auth_changed", message)
 
         def _do_start_login(self, platform):
             spec = _platform(platform)

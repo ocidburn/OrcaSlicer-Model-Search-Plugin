@@ -54,14 +54,18 @@ Notes on individual entries:
 
 ## Public-domain and institutional catalogs
 
-Low traffic, but every file is openly licensed and print-oriented, so license
-resolution is unambiguous.
+Low traffic, but every file is openly licensed, so license resolution is
+unambiguous. **None of them is registered any more:** they are museum and
+science archives that happen to publish printable files, rather than 3D
+printing catalogs, and the portal list is now limited to the latter. They
+remain the strongest option if a guaranteed-free licence matters more than
+print-readiness.
 
 | Platform | Link | Content | Registered |
 |---|---|---|---|
-| NIH 3D | https://3d.nih.gov | Anatomy, biomedical, molecular models | Yes |
-| Smithsonian 3D | https://3d.si.edu | Museum scans, mostly CC0 | Yes |
-| NASA 3D Resources | https://nasa3d.arc.nasa.gov | Spacecraft and planetary models, public domain | Yes |
+| NIH 3D | https://3d.nih.gov | Anatomy, biomedical, molecular models | No |
+| Smithsonian 3D | https://3d.si.edu | Museum scans, mostly CC0 | No |
+| NASA 3D Resources | https://nasa3d.arc.nasa.gov | Spacecraft and planetary models, public domain | No |
 
 ## Ecosystem changes in 2026
 

@@ -234,6 +234,30 @@ class ClearanceRequestTests(unittest.TestCase):
                 session.cookies.get("cf_clearance", domain="attacker.example")
             )
 
+    def test_a_stored_clearance_replaces_one_pasted_with_the_session(self):
+        """A browser visit that passed the check leaves cf_clearance in the
+        Cookie header the user copies for the login. Sending that copy as well
+        would leave Cloudflare choosing between two values for one name, and
+        only the stored one has a known User-Agent behind it."""
+        with tempfile.TemporaryDirectory() as td:
+            auth = self.manager(td)
+            auth.save_token(
+                "cults3d", "session=SESS; cf_clearance=STALE; other=1", label="x"
+            )
+            auth.clearance.save("cults3d.com", "cf_clearance=FRESH", "UA/Real")
+            session = auth.session("cults3d")
+            headers = {"User-Agent": "plugin/1.0"}
+            auth._apply_clearance(session, "https://cults3d.com/en", headers)
+
+            values = [c.value for c in session.cookies if c.name == "cf_clearance"]
+            self.assertEqual(values, ["FRESH"])
+            self.assertEqual(headers["User-Agent"], "UA/Real")
+            # The rest of the pasted session must survive untouched.
+            self.assertEqual(
+                {c.name for c in session.cookies},
+                {"session", "other", "cf_clearance"},
+            )
+
     def test_no_clearance_leaves_the_request_exactly_as_before(self):
         with tempfile.TemporaryDirectory() as td:
             auth = self.manager(td)
@@ -248,6 +272,7 @@ class ChallengeReportingTests(unittest.TestCase):
     def test_challenge_names_the_blocked_host_and_the_handoff(self):
         url = "https://cults3d.com/en/tags/benchy"
         session = mock.Mock()
+        session.cookies = requests.cookies.RequestsCookieJar()
         session.request.side_effect = [challenge_response(url) for _ in range(2)]
         with (
             mock.patch("requests.Session", return_value=session),
@@ -268,6 +293,7 @@ class ChallengeReportingTests(unittest.TestCase):
             )
             auth.clearance.save("cults3d.com", "cf_clearance=stale", "UA/1")
             session = mock.Mock()
+            session.cookies = requests.cookies.RequestsCookieJar()
             session.request.side_effect = [challenge_response(url) for _ in range(2)]
 
             with (

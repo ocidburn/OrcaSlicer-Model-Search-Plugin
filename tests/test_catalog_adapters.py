@@ -786,9 +786,6 @@ class RegistryAndUiTests(unittest.TestCase):
             "crealitycloud",
             "nexprint",
             "grabcad",
-            "smithsonian",
-            "nasa",
-            "nih3d",
             "youmagine",
             "pinshape",
         }
@@ -804,14 +801,14 @@ class RegistryAndUiTests(unittest.TestCase):
             "Creality Cloud",
             "Nexprint",
             "GrabCAD",
-            "Smithsonian 3D",
-            "NASA 3D Resources",
-            "NIH 3D",
             "YouMagine",
             "Pinshape",
         }
         self.assertTrue(display.issubset(mod._PLATFORMS_BY_DISPLAY))
         removed_keys = {
+            "smithsonian",
+            "nasa",
+            "nih3d",
             "sketchfab",
             "cgtrader",
             "free3d",
@@ -827,6 +824,9 @@ class RegistryAndUiTests(unittest.TestCase):
             "Free3D",
             "3DfindIT",
             "3DExport",
+            "Smithsonian 3D",
+            "NASA 3D Resources",
+            "NIH 3D",
             "Wikimedia Commons",
             "Zortrax Library",
             "QIDI Maker",
@@ -858,9 +858,6 @@ class RegistryAndUiTests(unittest.TestCase):
         for platform in (
             "yeggi",
             "stlfinder",
-            "smithsonian",
-            "nasa",
-            "nih3d",
             "youmagine",
             "pinshape",
         ):
@@ -988,8 +985,6 @@ class RegistryAndUiTests(unittest.TestCase):
                 "thangs",
                 "stlfinder",
                 "crealitycloud",
-                "smithsonian",
-                "nih3d",
             },
         )
 

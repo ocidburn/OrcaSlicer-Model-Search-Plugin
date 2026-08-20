@@ -28,9 +28,6 @@ SEARCHES = (
     ("stlfinder", "benchy"),
     ("thangs", "benchy"),
     ("crealitycloud", "benchy"),
-    ("smithsonian", "apollo"),
-    ("nasa", "apollo"),
-    ("nih3d", "heart"),
     ("youmagine", "cube"),
     ("pinshape", "benchy"),
 )

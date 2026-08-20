@@ -1393,6 +1393,13 @@ class AuthManager:
         cookies = self.clearance.apply(url, headers)
         if not cookies:
             return
+        # A pasted Cookie header often already carries a cf_clearance from the
+        # same browser visit. Sending both leaves Cloudflare to pick between
+        # two values for one name, so the stored clearance -- the one whose
+        # User-Agent is known -- replaces any copy already in the jar.
+        for cookie in list(session.cookies):
+            if cookie.name == CloudflareClearance.COOKIE:
+                session.cookies.clear(cookie.domain, cookie.path, cookie.name)
         # Scope to the exact host so a later redirect cannot carry it elsewhere.
         session.cookies.set(
             CloudflareClearance.COOKIE,

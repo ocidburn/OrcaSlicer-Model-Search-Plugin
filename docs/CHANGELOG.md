@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added a control that erases every stored authorization detail at once. The
+  account panel could only drop one portal session at a time, so there was no
+  way to remove everything the plugin had saved on this computer. Portal
+  sessions and Cloudflare clearances share one file, and it is now unlinked
+  rather than blanked, so nothing of the previous contents survives on disk.
+- A sign-in still in flight is cancelled before the erase, otherwise it would
+  write a fresh credential moments afterwards. The reported counts come from
+  the store itself, so the message says what actually went instead of claiming
+  success over an already-empty file. The button arms on the first click and
+  confirms on the second.
 - GrabCAD search now uses the community JSON API instead of scraping the
   library HTML, and no longer demands an account. Its `community/api/v1/models`
   endpoints answer anonymously, so results, metrics and the file listing arrive

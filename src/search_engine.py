@@ -1832,12 +1832,6 @@ def _fetch_html(url, auth=None, platform="", timeout=30):
 
 def _looks_like_login_page(raw, platform=""):
     sample = (raw or "")[:300000].lower()
-    if platform == "grabcad":
-        return (
-            "sign in or create account" in sample
-            or "sign in with email" in sample
-            or ('action="/login"' in sample and "forgot password" in sample)
-        )
     if platform == "cults3d":
         return (
             "/users/sign_in" in sample
@@ -1847,9 +1841,7 @@ def _looks_like_login_page(raw, platform=""):
     return False
 
 
-def _extract_catalog_models(
-    raw, base_url, path_pattern, platform, requires_auth=False, limit=30
-):
+def _extract_catalog_models(raw, base_url, path_pattern, platform, limit=30):
     parser = _parse_catalog_html(raw)
     regex = re.compile(path_pattern, re.IGNORECASE)
     found = []
@@ -1884,7 +1876,9 @@ def _extract_catalog_models(
                 "license_summary": "Open the model page to review the exact license before importing.",
                 "download_url": canonical,
                 "url": canonical,
-                "requires_auth": requires_auth,
+                # Scraped catalogs are public; portals that gate their downloads
+                # raise the flag themselves once the rows come back.
+                "requires_auth": False,
             }
         )
 
@@ -1909,27 +1903,17 @@ def _extract_catalog_models(
     return found
 
 
-def _catalog_search(
-    query, url_templates, path_pattern, platform, auth=None, requires_auth=False
-):
+def _catalog_search(query, url_templates, path_pattern, platform):
     last_error = None
     for template in url_templates:
         url = template.format(query=urllib.parse.quote(query.strip(), safe=""))
         try:
-            raw, final_url = _fetch_html(
-                url,
-                auth=auth if requires_auth else None,
-                platform="grabcad" if requires_auth else "",
-            )
-            if requires_auth and _looks_like_login_page(raw, "grabcad"):
-                raise AuthRequired(
-                    "GrabCAD search requires a signed-in GrabCAD browser session."
-                )
-            models = _extract_catalog_models(
-                raw, final_url, path_pattern, platform, requires_auth=requires_auth
-            )
+            raw, final_url = _fetch_html(url)
+            models = _extract_catalog_models(raw, final_url, path_pattern, platform)
             if models:
                 return models
+        # Both subclass RuntimeError, so they have to escape before the
+        # try-the-next-template handler below swallows them.
         except AuthRequired:
             raise
         except BrowserRequired:
@@ -4263,41 +4247,203 @@ class CrealityCloudSearcher:
         ]
 
 
+GRABCAD_BASE = "https://grabcad.com"
+GRABCAD_API = GRABCAD_BASE + "/community/api/v1/models"
+# The library API honors per_page up to 100 and silently falls back to 24 above
+# it, so this is the largest page size that actually arrives.
+GRABCAD_PAGE_SIZE = 100
+_GRABCAD_MAX_FOLDERS = 6
+
+# GrabCAD accepts any sort value but only acts on these; everything else quietly
+# returns the default relevance order. "popular" is deliberately absent: it is a
+# curated subset rather than an ordering and drops roughly three quarters of the
+# matches, so popularity is served by the real "likes" sort instead.
+_GRABCAD_SORTS = {"likes": "likes", "newest": "recent", "popularity": "likes"}
+
+# Search results name the authoring tool rather than the published file, so this
+# lists the tools whose exports OrcaSlicer can actually open.
+_GRABCAD_LOADABLE_SYSTEMS = frozenset(
+    {"3D Manufacturing Format", "Fusion 360", "OBJ", "STEP / IGES", "STL"}
+)
+
+# GrabCAD sits behind a WAF that answers 403 to the plugin's own User-Agent, so
+# these public reads borrow the standard browser identity the HTML fetches use.
+_GRABCAD_HEADERS = {
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": GRABCAD_BASE,
+    "Referer": GRABCAD_BASE + "/library",
+    "User-Agent": _STANDARD_BROWSER_UA,
+}
+
+
+def _grabcad_thumbnail(item):
+    """Drop GrabCAD's placeholder art so the card falls back to its own frame."""
+    preview = item.get("preview_image") or ""
+    if not _is_http_url(preview):
+        return ""
+    name = os.path.basename(urllib.parse.urlsplit(preview).path)
+    return "" if name.startswith("missing") else preview
+
+
+def _grabcad_result(item):
+    slug = item.get("cached_slug") or ""
+    url = f"{GRABCAD_BASE}/library/{slug}" if slug else ""
+    author = item.get("author") if isinstance(item.get("author"), dict) else {}
+    systems = {
+        software.get("name")
+        for software in item.get("softwares") or ()
+        if isinstance(software, dict)
+    }
+    return {
+        "name": _clean_web_text(item.get("name")) or "Untitled",
+        "author": _clean_web_text(author.get("name")) or "Unknown",
+        "platform": "GrabCAD",
+        "thumbnail_url": _grabcad_thumbnail(item),
+        "license": "GrabCAD Community Terms",
+        "license_url": GRABCAD_BASE + "/terms",
+        "license_summary": (
+            "Free to download with a GrabCAD account. Reuse follows GrabCAD's "
+            "community terms rather than a Creative Commons license."
+        ),
+        "download_url": url,
+        "url": url,
+        "_slug": slug,
+        # Browsing is open; only the download endpoint asks for the account.
+        "requires_auth": True,
+        "direct_import": bool(systems & _GRABCAD_LOADABLE_SYSTEMS),
+        "downloads": item.get("downloads_count"),
+        "likes": item.get("likes_count"),
+        "published_at": item.get("created_at"),
+        "is_free": True,
+    }
+
+
+def _grabcad_file_records(items):
+    """Order a folder listing so files OrcaSlicer can open are fetched first."""
+    records = []
+    for item in items:
+        url = item.get("download_url") or ""
+        name = _clean_web_text(item.get("name")) or ""
+        if not _is_http_url(url) or not name:
+            continue
+        extension = os.path.splitext(name)[1].lower()
+        if extension in _IMAGE_EXTS:
+            continue
+        records.append(
+            {
+                "name": name,
+                "url": url,
+                "preview_url": (item.get("rendering_urls") or {}).get("large") or "",
+                "_loadable": extension in _LOADABLE_MODEL_EXTS,
+            }
+        )
+    records.sort(key=lambda record: not record["_loadable"])
+    for record in records:
+        record.pop("_loadable")
+    return records
+
+
+def _grabcad_model_files(slug):
+    """List a model's files, following the folders the root listing exposes.
+
+    The root call only reports files stored at the top level, so a model that
+    tucks its geometry into a folder looks empty without the walk. Screenshot
+    folders are the common case, hence the budget rather than a full traversal.
+    """
+    import requests
+
+    listing_url = f"{GRABCAD_API}/{urllib.parse.quote(slug, safe='')}/files"
+    collected, visited, pending = [], set(), [None]
+    while pending and len(visited) <= _GRABCAD_MAX_FOLDERS:
+        folder_id = pending.pop(0)
+        response = requests.get(
+            listing_url,
+            params={"folder_id": folder_id} if folder_id else None,
+            headers=_GRABCAD_HEADERS,
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise TypeError("GrabCAD returned an invalid file listing")
+        for folder in body.get("folders") or ():
+            identifier = folder.get("id") if isinstance(folder, dict) else None
+            if identifier and identifier not in visited:
+                visited.add(identifier)
+                pending.append(identifier)
+        collected.extend(
+            item for item in body.get("files") or () if isinstance(item, dict)
+        )
+    return _grabcad_file_records(collected)
+
+
 class GrabcadSearcher:
-    BASE = "https://grabcad.com"
-    SEARCH_URLS = (
-        BASE + "/library?query={query}",
-        BASE + "/library?utf8=%E2%9C%93&query={query}",
-    )
-    PATH_RE = r"/library/[a-z0-9%._~+()-]+"
+    BASE = GRABCAD_BASE
+    API_URL = GRABCAD_API
 
     @staticmethod
-    def search(query, context, options=None):
-        if not isinstance(context, AuthManager) or not context.authenticated("grabcad"):
-            raise AuthRequired(
-                "GrabCAD requires a free member account to access/download Community Library models. Connect a browser session first."
-            )
-        return _catalog_search(
-            query,
-            GrabcadSearcher.SEARCH_URLS,
-            GrabcadSearcher.PATH_RE,
-            "GrabCAD",
-            auth=context,
-            requires_auth=True,
+    def search(query, _context, options=None):
+        import requests
+
+        page = _search_page_number(options)
+        requested_sort = (
+            str(options.get("sort") or "") if isinstance(options, dict) else ""
+        )
+        payload = {
+            "query": query,
+            "time": "all_time",
+            "page": page,
+            "per_page": GRABCAD_PAGE_SIZE,
+        }
+        sort = _GRABCAD_SORTS.get(requested_sort)
+        if sort:
+            payload["sort"] = sort
+        response = requests.post(
+            GrabcadSearcher.API_URL,
+            json=payload,
+            headers=_GRABCAD_HEADERS,
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise TypeError("GrabCAD returned an invalid search response")
+        results = [
+            _grabcad_result(item)
+            for item in body.get("models") or ()
+            if isinstance(item, dict)
+            and not item.get("is_hidden")
+            and not item.get("is_tainted")
+        ]
+        # total_entries counts the unfiltered page set, so paging stays correct
+        # even when hidden or tainted models thin out a page.
+        return _search_page_result(
+            results, page, GRABCAD_PAGE_SIZE, body.get("total_entries")
         )
 
     @staticmethod
     def get_files(model, auth):
-        if not auth.authenticated("grabcad"):
-            raise AuthRequired("GrabCAD requires a signed-in browser session")
-        return _public_page_files(
+        if auth is None or not auth.authenticated("grabcad"):
+            raise AuthRequired(
+                "Browsing GrabCAD works signed out, but downloading a Community "
+                "Library file needs a free GrabCAD account. Connect a browser "
+                "session first."
+            )
+        slug = _model_identifier(
             model,
-            auth=auth,
-            platform_key="grabcad",
-            no_direct_message="GrabCAD did not expose a downloadable CAD file to this browser session. Open the model page and refresh the saved Cookie header if necessary.",
+            "_slug",
+            r"/library/([a-z0-9%._~+()-]+)",
+            "GrabCAD model URL is missing its library slug",
         )
-
-
+        files = _grabcad_model_files(slug)
+        if not files:
+            raise BrowserRequired(
+                "GrabCAD listed no downloadable CAD file for this model. Open the "
+                "model page to see what it publishes.",
+                model.get("url", ""),
+            )
+        return files
 
 
 class YouMagineSearcher:
@@ -4464,7 +4610,7 @@ _PLATFORM_SPECS = (
         login_url="https://login.grabcad.com/login",
         referer="https://grabcad.com/library",
         cookie_domain=".grabcad.com",
-        session_recheck=True,
+        search_page_size=GRABCAD_PAGE_SIZE,
     ),
     PlatformSpec("youmagine", "YouMagine", YouMagineSearcher),
     PlatformSpec("pinshape", "Pinshape", PinshapeSearcher),
@@ -4838,6 +4984,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
   <div class="account"><div class="account-head"><strong>Creality Cloud</strong><button type="button" class="auth-help" data-platform="crealitycloud" aria-label="Creality Cloud authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-crealitycloud" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('crealitycloud')">Account</button></div>
   <div class="account"><div class="account-head"><strong>Thangs</strong><button type="button" class="auth-help" data-platform="thangs" aria-label="Thangs authorization instructions" aria-describedby="auth-tooltip" onmouseenter="showAuthHelp(this)" onmouseleave="hideAuthHelp(this)" onfocus="showAuthHelp(this)" onblur="hideAuthHelp(this)">?</button></div><span id="auth-thangs" class="auth-state">Checking...</span><button class="secondary" onclick="openAuth('thangs')">Access token</button></div>
 </div>
+<div class="account-tools"><button id="forget-all" type="button" class="danger" onclick="forgetAllAuth()">Delete all authorization data</button><span>Removes every saved portal session and Cloudflare verification from this computer.</span></div>
 <div id="auth-tooltip" class="auth-tooltip" role="tooltip"></div>
 <div class="search-row"><input id="query" placeholder="Search for 3D models..."><button id="search-btn" onclick="doSearch()">Search</button></div>
 <div class="search-options"><label>Sort <select id="sort"><option value="relevance">Relevance</option><option value="popularity">Popularity (normalized)</option><option value="downloads">Downloads</option><option value="likes">Likes</option><option value="rating">Rating</option><option value="newest">Newest</option><option value="makes">Most printed</option><option value="name">Name</option><option value="platform">Platform</option></select></label><label><input id="free-only" type="checkbox"> Free only</label><label><input id="direct-only" type="checkbox"> Direct import only</label></div>
@@ -4902,7 +5049,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <script>
 var selectedModel=null, searching=false, canLoadMore=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[], pendingMakerWorldModel=null, activeAuthHelp=null, resultImageObserver=null, makerWorldChoicesCache={}, makerWorldPrefetching={}, makerWorldPreloadedImages={}, currentPage=1, pageSize=100;
 var $=function(id){return document.getElementById(id)};
-var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login in your browser. After MakerOnline returns, copy the mo_access_token cookie value (or its Cookie header), paste it below, and connect. You can alternatively import the Anycubic Slicer Next session. The plugin never reads the browser profile or password.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'A GrabCAD Community Library membership is required. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.',crealitycloud:'Open the official Creality Cloud login and sign in. In the signed-in browser session, copy the model_token cookie value (or a Cookie header containing model_token and model_user_id), paste it below, and connect. The plugin never reads your browser profile or password.',thangs:'Open the official Thangs sign-in page and log in. In the signed-in browser developer tools, copy the token from an Authorization: Bearer request header, paste it below, and connect. The token is sent only to Thangs and never to the signed storage URL.'};
+var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login in your browser. After MakerOnline returns, copy the mo_access_token cookie value (or its Cookie header), paste it below, and connect. You can alternatively import the Anycubic Slicer Next session. The plugin never reads the browser profile or password.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'Searching GrabCAD needs no account; a free GrabCAD membership is only required to download. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.',crealitycloud:'Open the official Creality Cloud login and sign in. In the signed-in browser session, copy the model_token cookie value (or a Cookie header containing model_token and model_user_id), paste it below, and connect. The plugin never reads your browser profile or password.',thangs:'Open the official Thangs sign-in page and log in. In the signed-in browser developer tools, copy the token from an Authorization: Bearer request header, paste it below, and connect. The token is sent only to Thangs and never to the signed storage URL.'};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function safeUrl(s){try{var u=new URL(String(s||''));return(u.protocol==='http:'||u.protocol==='https:')?u.href:''}catch(e){return''}}
 function showAuthHelp(button){var tooltip=$('auth-tooltip'),text=AUTH_HELP[button.dataset.platform]||'';if(!text)return;activeAuthHelp=button;tooltip.textContent=text;tooltip.classList.add('active');tooltip.style.left='0px';tooltip.style.top='0px';var r=button.getBoundingClientRect(),gap=8,margin=8,left=Math.max(margin,Math.min(window.innerWidth-tooltip.offsetWidth-margin,r.left+r.width/2-tooltip.offsetWidth/2)),top=r.bottom+gap;if(top+tooltip.offsetHeight>window.innerHeight-margin)top=Math.max(margin,r.top-tooltip.offsetHeight-gap);tooltip.style.left=Math.round(left)+'px';tooltip.style.top=Math.round(top)+'px'}
@@ -4973,6 +5120,9 @@ function hideImagePreview(source,force){if(!force&&source&&(source.matches(':hov
 function showMakerWorldChoices(msg){cacheMakerWorldChoices(msg);pendingMakerWorldModel=msg.model||selectedModel;var platform=msg.picker_platform||pendingMakerWorldModel.platform||'platform',profiles=msg.profiles||[],formats=msg.formats||[],defaultId=String(msg.default_profile_id||'');$('profile-picker-title').textContent='Choose '+platform+' download';$('profile-picker-note').textContent='Select a print profile and file format. 3MF uses the official signed profile URL.';var phtml='';profiles.forEach(function(p,i){var id=String(p.profile_id||''),title=p.title||'Print profile';var image=safeUrl(p.cover),summary=p.summary?'<span class="mw-summary">'+esc(p.summary)+'</span>':'';phtml+='<label class="mw-profile"><input type="radio" name="mw-profile" value="'+esc(id)+'" '+((id===defaultId||(!defaultId&&i===0))?'checked':'')+' onchange="updateMakerWorldChoice()">'+(image?'<img class="mw-cover" src="'+esc(image)+'" alt="'+esc(title)+'" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="mw-cover"></span>')+'<span><span class="mw-title">'+esc(title)+'</span>'+summary+'<span class="mw-meta">'+esc(profileMeta(p))+'</span></span></label>'});$('mw-profiles').innerHTML=phtml;var fhtml='',first=true;formats.forEach(function(f){if(f.available===false)return;fhtml+='<label class="mw-format"><input type="radio" name="mw-format" value="'+esc(f.id)+'" '+(first?'checked':'')+' onchange="updateMakerWorldChoice()"><span><strong>'+esc(f.label)+'</strong><small>'+esc(f.description||'')+'</small></span></label>';first=false});$('mw-formats').innerHTML=fhtml;$('makerworld-modal').classList.add('active');syncBackdrop();updateMakerWorldChoice()}
 function confirmMakerWorldChoice(){var p=document.querySelector('#mw-profiles input:checked'),f=document.querySelector('#mw-formats input:checked');if(!p||!f||!pendingMakerWorldModel)return;var platform=pendingMakerWorldModel.platform||'platform';$('mw-import').disabled=true;$('status').textContent=f.value==='3mf'?'Resolving selected '+platform+' profile...':'Opening '+platform+'...';orca.postMessage({action:'resolve_profile_choice',model:pendingMakerWorldModel,profile_id:p.value,format:f.value})}
 function submitAuth(){var token=$('auth-token').value.trim(),email=$('auth-email').value.trim(),password=$('auth-password').value,code=$('auth-code').value.trim();if(authPlatform==='nexprint'&&!token){$('status').textContent='Nexprint: paste auth_token after signing in.';return}if(authPlatform==='makeronline'&&!token){$('status').textContent='Makeronline: import the Anycubic Slicer Next session or paste an access token.';return}if(authPlatform==='crealitycloud'&&!token){$('status').textContent='Creality Cloud: paste model_token after signing in.';return}if(authPlatform==='thangs'&&!token){$('status').textContent='Thangs: paste the Bearer access token after signing in.';return}if(authPlatform==='grabcad'&&!token){$('status').textContent='GrabCAD: paste the Cookie header/session cookies after signing in.';return}if(authPlatform==='cults3d'&&!token){$('status').textContent='Cults3D: paste the Cookie header/session cookies after signing in.';return}if((authPlatform==='thingiverse'||authPlatform==='myminifactory')&&!token){$('status').textContent='Paste the API token/key first.';return}orca.postMessage({action:'auth_login',platform:authPlatform,token:token,email:email,password:password,code:code});$('auth-submit').disabled=true;$('status').textContent='Saving session...'}
+var forgetArmed=false,forgetTimer=null;
+function resetForgetButton(){forgetArmed=false;clearTimeout(forgetTimer);var b=$('forget-all');if(b){b.disabled=false;b.textContent='Delete all authorization data'}}
+function forgetAllAuth(){var b=$('forget-all');if(!forgetArmed){forgetArmed=true;b.textContent='Click again to erase everything';clearTimeout(forgetTimer);forgetTimer=setTimeout(resetForgetButton,5000);$('status').textContent='This removes every saved portal session and Cloudflare verification. Click again to confirm.';return}clearTimeout(forgetTimer);forgetArmed=false;b.disabled=true;b.textContent='Erasing...';$('status').textContent='Removing saved authorization data...';orca.postMessage({action:'auth_forget_all'})}
 function logoutAuth(){orca.postMessage({action:'auth_logout',platform:authPlatform});closeAuth()}
 function startSeamlessLogin(){if(!authPlatform)return;orca.postMessage({action:'auth_start_login',platform:authPlatform});$('status').textContent='Opening the portal sign-in and a local finish page...'}
 function openOfficialLogin(){orca.postMessage({action:'auth_open_login',platform:authPlatform});if(authPlatform==='makeronline')$('status').textContent='Anycubic login opened. After MakerOnline returns, copy mo_access_token, paste it here, and connect.'}
@@ -4984,7 +5134,6 @@ orca.onMessage(function(msg){
   }else if(msg.action==='model_details'){
     applyModelDetails(msg.model||{},!!msg.background);
   }else if(msg.action==='login_pending'){
-<div class="account-tools"><button id="forget-all" type="button" class="danger" onclick="forgetAllAuth()">Delete all authorization data</button><span>Removes every saved portal session and Cloudflare verification from this computer.</span></div>
     $('status').textContent='Sign in in the browser, then finish on the local page that opened. OrcaSlicer picks the session up automatically (link valid for '+Math.round((msg.timeout||300)/60)+' min).';
   }else if(msg.action==='login_cancelled'){
     $('status').textContent='Browser sign-in cancelled.';
@@ -5120,9 +5269,6 @@ if orca is not None:
                 "search_more": self._handle_search_more,
                 "model_details": self._handle_model_details,
                 "prefetch_profile_choices": self._handle_profile_prefetch,
-var forgetArmed=false,forgetTimer=null;
-function resetForgetButton(){forgetArmed=false;clearTimeout(forgetTimer);var b=$('forget-all');if(b){b.disabled=false;b.textContent='Delete all authorization data'}}
-function forgetAllAuth(){var b=$('forget-all');if(!forgetArmed){forgetArmed=true;b.textContent='Click again to erase everything';clearTimeout(forgetTimer);forgetTimer=setTimeout(resetForgetButton,5000);$('status').textContent='This removes every saved portal session and Cloudflare verification. Click again to confirm.';return}clearTimeout(forgetTimer);forgetArmed=false;b.disabled=true;b.textContent='Erasing...';$('status').textContent='Removing saved authorization data...';orca.postMessage({action:'auth_forget_all'})}
                 "resolve_import": self._handle_resolve_import,
                 "resolve_profile_choice": self._handle_profile_choice,
                 "import_selected": self._handle_import_selected,
@@ -5132,6 +5278,7 @@ function forgetAllAuth(){var b=$('forget-all');if(!forgetArmed){forgetArmed=true
                 "auth_logout": self._handle_auth_logout,
                 "auth_open_login": self._handle_auth_open_login,
                 "auth_import_anycubic": self._handle_auth_import_anycubic,
+                "auth_forget_all": self._handle_auth_forget_all,
                 "auth_start_login": self._handle_auth_start_login,
                 "auth_cancel_login": self._handle_auth_cancel_login,
                 "cloudflare_save": self._handle_cloudflare_save,
@@ -5201,6 +5348,41 @@ function forgetAllAuth(){var b=$('forget-all');if(!forgetArmed){forgetArmed=true
 
         def _handle_auth_import_anycubic(self, _msg):
             self._start(self._do_import_anycubic)
+
+        def _handle_auth_forget_all(self, _msg):
+            self._start(self._do_forget_all)
+
+        def _do_forget_all(self):
+            """Erase every saved authorization detail on this computer."""
+            # A sign-in still in flight would write a fresh credential moments
+            # after the erase, so it is cancelled first.
+            self._stop_login()
+            try:
+                summary = self.auth.forget_all()
+            except OSError as exc:
+                self._post(
+                    {
+                        "action": "error",
+                        "message": f"Could not remove the credential file: {exc}",
+                    }
+                )
+                return
+            portals, clearances = summary["portals"], summary["clearances"]
+            if not portals and not clearances:
+                message = "There was no saved authorization data to remove."
+            else:
+                parts = []
+                if portals:
+                    parts.append(
+                        f"{portals} portal session" + ("s" if portals != 1 else "")
+                    )
+                if clearances:
+                    parts.append(
+                        f"{clearances} Cloudflare verification"
+                        + ("s" if clearances != 1 else "")
+                    )
+                message = "Removed " + " and ".join(parts) + " from this computer."
+            self._post_auth("auth_changed", message)
 
         def _handle_auth_start_login(self, msg):
             self._start(self._do_start_login, msg.get("platform", ""))
@@ -5278,7 +5460,6 @@ function forgetAllAuth(){var b=$('forget-all');if(!forgetArmed){forgetArmed=true
                         "action": "error",
                         "message": (
                             "Could not open the local sign-in endpoint "
-                "auth_forget_all": self._handle_auth_forget_all,
                             f"({exc}). Use the token field instead."
                         ),
                     }
@@ -5349,41 +5530,6 @@ function forgetAllAuth(){var b=$('forget-all');if(!forgetArmed){forgetArmed=true
             platform = msg.get("platform", "")
             token = (msg.get("token") or "").strip()
             email = (msg.get("email") or "").strip()
-        def _handle_auth_forget_all(self, _msg):
-            self._start(self._do_forget_all)
-
-        def _do_forget_all(self):
-            """Erase every saved authorization detail on this computer."""
-            # A sign-in still in flight would write a fresh credential moments
-            # after the erase, so it is cancelled first.
-            self._stop_login()
-            try:
-                summary = self.auth.forget_all()
-            except OSError as exc:
-                self._post(
-                    {
-                        "action": "error",
-                        "message": f"Could not remove the credential file: {exc}",
-                    }
-                )
-                return
-            portals, clearances = summary["portals"], summary["clearances"]
-            if not portals and not clearances:
-                message = "There was no saved authorization data to remove."
-            else:
-                parts = []
-                if portals:
-                    parts.append(
-                        f"{portals} portal session" + ("s" if portals != 1 else "")
-                    )
-                if clearances:
-                    parts.append(
-                        f"{clearances} Cloudflare verification"
-                        + ("s" if clearances != 1 else "")
-                    )
-                message = "Removed " + " and ".join(parts) + " from this computer."
-            self._post_auth("auth_changed", message)
-
             if token:
                 self.auth.save_token(
                     platform, token, label=email or "Connected session"

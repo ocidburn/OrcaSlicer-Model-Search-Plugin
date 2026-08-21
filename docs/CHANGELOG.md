@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- GrabCAD search now uses the community JSON API instead of scraping the
+  library HTML, and no longer demands an account. Its `community/api/v1/models`
+  endpoints answer anonymously, so results, metrics and the file listing arrive
+  without a session; only the download endpoint is gated. Previously the plugin
+  refused to return a single GrabCAD result until a `Cookie` header was pasted.
+- GrabCAD results carry real download counts, likes, publication dates and
+  authors, and pages hold 100 rows instead of the 24 the HTML page exposed.
+- The plugin never sends GrabCAD's `popular` sort: it is a curated subset rather
+  than an ordering and drops roughly three quarters of the matches. Sort values
+  GrabCAD accepts but ignores are not sent either, so the order is never
+  misreported.
+- Dropped the now-unreachable authenticated branch of the shared catalog
+  scraper, along with the GrabCAD login-page sniffing it fed. An expired GrabCAD
+  session is reported from the 401 the download endpoint returns.
 - Every portal checkbox now starts selected, so a first search covers the whole
   list instead of a subset.
 - Bumped the stored portal-selection key so an existing saved selection, which

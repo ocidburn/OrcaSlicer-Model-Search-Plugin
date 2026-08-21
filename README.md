@@ -64,7 +64,7 @@ The selected search portals are remembered by the embedded UI and restored the n
 | **Nexprint / Elegoo** | Yes | Yes | `auth_token` session cookie |
 | **Makeronline / Anycubic** | Yes | Yes | Anycubic access token / Anycubic Slicer Next session |
 | **Cults3D** | Yes | Yes, for files available to the signed-in account | Cults3D browser session cookies |
-| **GrabCAD** | Yes | Yes, for files available to the signed-in account | GrabCAD browser session cookies |
+| **GrabCAD** | Yes, JSON library API, no account needed | Yes, for files available to the signed-in account | GrabCAD browser session cookies for import only |
 | **YouMagine** | Yes | Public file when exposed; otherwise browser | None |
 | **Pinshape** | Yes | Yes, for public STL files; otherwise browser | None |
 
@@ -186,13 +186,15 @@ the plugin does not attempt to solve or bypass the challenge.
 
 ### GrabCAD
 
-GrabCAD Community Library search/download requires a member session.
+Browsing the GrabCAD Community Library needs no account: search and the file
+listing both use the public `community/api/v1/models` endpoints. Only the
+download endpoint is gated, so a free member session is required to import.
 
 1. Open the official GrabCAD login from the account panel.
 2. Sign in in your browser.
 3. Paste the Cookie header/session cookie string into the plugin.
 
-Search and file resolution then use that saved GrabCAD browser session. Expired sessions are detected and rejected instead of returning a fake successful import.
+File downloads then use that saved GrabCAD browser session. Expired sessions are detected and rejected instead of returning a fake successful import.
 
 ### YouMagine and Pinshape
 

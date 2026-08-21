@@ -863,17 +863,41 @@ CULTS_MODEL_PAGE = """
 </body></html>
 """
 
-GRABCAD_PAGE = """
-<html><body>
-<a href="/library/precision-bracket">Precision bracket</a>
-</body></html>
-"""
+GRABCAD_RESULTS = {
+    "per_page": 100,
+    "total_entries": 1,
+    "models": [
+        {
+            "name": "Precision bracket",
+            "cached_slug": "precision-bracket",
+            "preview_image": "https://grabcad.com/screenshots/pics/x/card.jpg",
+            "likes_count": 4,
+            "downloads_count": 91,
+            "created_at": "2025-02-03T10:00:00Z",
+            "softwares": [{"name": "STEP / IGES"}],
+            "is_hidden": False,
+            "is_tainted": False,
+            "author": {"name": "Bracket Maker", "cached_slug": "bracket-maker-1"},
+        }
+    ],
+}
 
-GRABCAD_MODEL_PAGE = """
-<html><body>
-<a href="https://files.grabcad.test/bracket.step">Download</a>
-</body></html>
-"""
+GRABCAD_DOWNLOAD = (
+    "https://grabcad.com/community/api/v1/models/precision-bracket"
+    "/files/download?cadid=deadbeef"
+)
+
+GRABCAD_FILES = {
+    "cached_slug": "precision-bracket",
+    "folders": [],
+    "files": [
+        {
+            "name": "bracket.step",
+            "extension": "step",
+            "download_url": GRABCAD_DOWNLOAD,
+        }
+    ],
+}
 
 
 class Cults3DScenario(ScenarioTest):
@@ -927,25 +951,31 @@ class Cults3DScenario(ScenarioTest):
 class GrabCadScenario(ScenarioTest):
     COOKIE = "_grabcad_session=gc-secret; other=1"
 
-    def test_search_is_refused_before_a_session_is_saved(self):
+    def test_search_needs_no_session(self):
+        """The library API is public; only the download endpoint is gated."""
+        net = self.network()
+        net.add("community/api/v1/models", Response(json_data=GRABCAD_RESULTS))
+        results = mod.GrabcadSearcher.search("bracket", self.fresh_auth(), {})
+        self.assertEqual(results[0]["name"], "Precision bracket")
+        self.assertTrue(results[0]["requires_auth"])
+        for call in net.calls:
+            self.assertFalse(call.cookies, "an anonymous search must carry no cookie")
+
+    def test_import_is_refused_before_a_session_is_saved(self):
+        model = {"url": "https://grabcad.com/library/precision-bracket"}
         with self.assertRaises(mod.AuthRequired):
-            mod.GrabcadSearcher.search("bracket", self.fresh_auth(), {})
+            mod.GrabcadSearcher.get_files(model, self.fresh_auth())
 
     def test_end_to_end_search_resolve_and_import(self):
         auth = self.connected("grabcad", self.COOKIE)
         net = self.network()
+        # The download URL contains the listing path, so it is routed first.
+        net.add("files/download", model_file("bracket.step"))
         net.add(
-            "grabcad.com/library?",
-            Response(text=GRABCAD_PAGE, url="https://grabcad.com/library"),
+            "community/api/v1/models/precision-bracket/files",
+            Response(json_data=GRABCAD_FILES),
         )
-        net.add(
-            "grabcad.com/library/precision-bracket",
-            Response(
-                text=GRABCAD_MODEL_PAGE,
-                url="https://grabcad.com/library/precision-bracket",
-            ),
-        )
-        net.add("files.grabcad.test/bracket.step", model_file("bracket.step"))
+        net.add("community/api/v1/models", Response(json_data=GRABCAD_RESULTS))
 
         results = mod.GrabcadSearcher.search("bracket", auth, {})
         model = results[0]
@@ -957,20 +987,24 @@ class GrabCadScenario(ScenarioTest):
         self.assertEqual(posts[-1]["action"], "imported")
         self.assert_file_downloaded("bracket.step", MODEL_BODY)
 
-        page_call = net.calls_to("grabcad.com/library/precision-bracket")[0]
-        self.assertIn("_grabcad_session=gc-secret", page_call.cookies or "")
+        download_call = net.calls_to("files/download")[0]
+        self.assertIn("_grabcad_session=gc-secret", download_call.cookies or "")
         self.assert_only_reached(net, "gc-secret", ("grabcad.com",))
 
     def test_a_signed_out_session_is_surfaced(self):
         auth = self.connected("grabcad", self.COOKIE)
         net = self.network()
+        net.add("files/download", Response(status=401, url=GRABCAD_DOWNLOAD))
         net.add(
-            "grabcad.com/library/precision-bracket",
-            Response(status=401, url="https://grabcad.com/library/precision-bracket"),
+            "community/api/v1/models/precision-bracket/files",
+            Response(json_data=GRABCAD_FILES),
         )
         model = {"url": "https://grabcad.com/library/precision-bracket"}
-        with self.assertRaises(mod.AuthRequired):
-            mod.GrabcadSearcher.get_files(model, auth)
+
+        files = mod.GrabcadSearcher.get_files(model, auth)
+        posts = self.download_and_import("grabcad", files, auth)
+        self.assertEqual(posts[-1]["action"], "auth_required")
+        self.assertEqual(posts[-1]["platform"], "grabcad")
 
 
 # ---------------------------------------------------------------------------
@@ -997,10 +1031,11 @@ class AllAuthorizedPortalsTests(ScenarioTest):
 
     # Entry points that must refuse before a credential exists. Keyed by
     # portal so a new authorized portal cannot quietly arrive without one.
+    # GrabCAD is deliberately absent: its library API answers anonymously, so
+    # only file resolution is gated there.
     GATED_SEARCHES: ClassVar[dict] = {
         "thingiverse": lambda auth: mod.ThingiverseSearcher.search("x", auth, {}),
         "myminifactory": lambda auth: mod.MyMiniFactorySearcher.search("x", auth, {}),
-        "grabcad": lambda auth: mod.GrabcadSearcher.search("x", auth, {}),
     }
 
     GATED_RESOLVERS: ClassVar[dict] = {
@@ -1058,7 +1093,7 @@ class AllAuthorizedPortalsTests(ScenarioTest):
         gated = {
             spec.key
             for spec in mod._PLATFORM_SPECS
-            if spec.key in ("thingiverse", "myminifactory", "grabcad")
+            if spec.key in ("thingiverse", "myminifactory")
         }
         self.assertEqual(set(self.GATED_SEARCHES), gated)
         net = self.network()

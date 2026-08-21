@@ -534,25 +534,85 @@ class CatalogSearchTests(unittest.TestCase):
             post.call_args.kwargs["headers"]["__CXY_UID_"], "5925463110"
         )
 
-    def test_grabcad_requires_session_for_search(self):
-        with tempfile.TemporaryDirectory() as td:
-            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
-            with self.assertRaises(mod.AuthRequired):
-                mod.GrabcadSearcher.search("bracket", auth)
+    @staticmethod
+    def _grabcad_payload(**overrides):
+        model = {
+            "name": "Ender 3 bracket",
+            "cached_slug": "ender-3-bracket-1",
+            "preview_image": "https://grabcad.com/screenshots/pics/abc/card.jpg",
+            "likes_count": 23,
+            "downloads_count": 422,
+            "created_at": "2025-07-25T21:30:39Z",
+            "softwares": [{"name": "STEP / IGES"}, {"name": "Rendering"}],
+            "is_tainted": False,
+            "is_hidden": False,
+            "author": {"name": "Tester", "cached_slug": "tester-1"},
+        }
+        model.update(overrides)
+        return {"per_page": 100, "total_entries": 742, "models": [model]}
 
-    def test_grabcad_search_with_session(self):
-        html = '<a href="/library/test-bracket-1">Test bracket</a>'
+    def test_grabcad_search_uses_json_api_without_a_session(self):
+        payload = self._grabcad_payload()
         with tempfile.TemporaryDirectory() as td:
             auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
-            auth.save_token("grabcad", "session_id=abc123", label="test")
-            with mock.patch.object(
-                mod,
-                "_fetch_html",
-                return_value=(html, "https://grabcad.com/library?query=bracket"),
-            ):
-                rows = mod.GrabcadSearcher.search("bracket", auth)
-        self.assertTrue(rows[0]["requires_auth"])
-        self.assertEqual(rows[0]["platform"], "GrabCAD")
+            with mock.patch(
+                "requests.post", return_value=FakeResponse(payload)
+            ) as post:
+                rows = mod.GrabcadSearcher.search("bracket", auth, {"page": 2})
+        self.assertEqual(post.call_args.args[0], mod.GRABCAD_API)
+        body = post.call_args.kwargs["json"]
+        self.assertEqual(body["query"], "bracket")
+        self.assertEqual(body["page"], 2)
+        self.assertEqual(body["per_page"], 100)
+        row = rows[0]
+        self.assertEqual(row["platform"], "GrabCAD")
+        self.assertEqual(row["name"], "Ender 3 bracket")
+        self.assertEqual(row["author"], "Tester")
+        self.assertEqual(row["url"], "https://grabcad.com/library/ender-3-bracket-1")
+        self.assertEqual(row["downloads"], 422)
+        self.assertEqual(row["likes"], 23)
+        self.assertEqual(row["published_at"], "2025-07-25T21:30:39Z")
+        self.assertEqual(rows.total, 742)
+        self.assertTrue(rows.has_more)
+        # Browsing is anonymous, but importing still needs the account.
+        self.assertTrue(row["requires_auth"])
+        self.assertTrue(row["direct_import"])
+
+    def test_grabcad_search_never_requests_the_curated_popular_subset(self):
+        # GrabCAD's "popular" is a filter that drops most matches, so the
+        # popularity option has to fall through to a real ordering instead.
+        for requested, expected in (
+            ("popularity", "likes"),
+            ("likes", "likes"),
+            ("newest", "recent"),
+        ):
+            with mock.patch(
+                "requests.post", return_value=FakeResponse(self._grabcad_payload())
+            ) as post:
+                mod.GrabcadSearcher.search("bracket", None, {"sort": requested})
+            self.assertEqual(post.call_args.kwargs["json"]["sort"], expected)
+        for requested in ("relevance", "downloads", "rating", ""):
+            with mock.patch(
+                "requests.post", return_value=FakeResponse(self._grabcad_payload())
+            ) as post:
+                mod.GrabcadSearcher.search("bracket", None, {"sort": requested})
+            self.assertNotIn("sort", post.call_args.kwargs["json"])
+
+    def test_grabcad_search_skips_hidden_and_placeholder_previews(self):
+        payload = self._grabcad_payload(
+            preview_image="https://grabcad.com/screenshots/pics/missing_card.png",
+            softwares=[{"name": "SOLIDWORKS"}],
+        )
+        payload["models"].append(dict(payload["models"][0], is_hidden=True))
+        payload["models"].append(dict(payload["models"][0], is_tainted=True))
+        with mock.patch("requests.post", return_value=FakeResponse(payload)):
+            rows = mod.GrabcadSearcher.search("bracket", None)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["thumbnail_url"], "")
+        # No importable authoring format means direct import cannot be promised.
+        self.assertFalse(rows[0]["direct_import"])
+        # Paging still follows the unfiltered count the API reported.
+        self.assertEqual(rows.total, 742)
 
 
 class DownloadResolverTests(unittest.TestCase):
@@ -746,17 +806,78 @@ class DownloadResolverTests(unittest.TestCase):
             ):
                 mod.Cults3DSearcher.get_files(model, auth)
 
-    def test_grabcad_stale_session_is_reported_as_auth_error(self):
+    def test_grabcad_download_without_a_session_is_an_auth_error(self):
         model = {"url": "https://grabcad.com/library/example-1"}
-        html = "<h2>Sign In or Create Account</h2><div>Sign in with email</div>"
         with tempfile.TemporaryDirectory() as td:
             auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
-            auth.save_token("grabcad", "sid=expired")
             with (
-                mock.patch.object(
-                    mod, "_fetch_html", return_value=(html, model["url"])
-                ),
+                mock.patch("requests.get") as get,
                 self.assertRaises(mod.AuthRequired),
+            ):
+                mod.GrabcadSearcher.get_files(model, auth)
+        # The listing is public, so the account is checked before spending a call.
+        get.assert_not_called()
+
+    def test_grabcad_files_walk_folders_and_put_loadable_files_first(self):
+        root = {
+            "cached_slug": "example-1",
+            "folders": [{"id": 42, "name": "Pictures"}],
+            "files": [
+                {
+                    "name": "notes.txt",
+                    "extension": "txt",
+                    "download_url": "https://grabcad.com/community/api/v1/models/example-1/files/download?cadid=a",
+                },
+                {
+                    "name": "bracket.step",
+                    "extension": "step",
+                    "download_url": "https://grabcad.com/community/api/v1/models/example-1/files/download?cadid=b",
+                    "rendering_urls": {"large": "https://grabcad.com/pics/large.png"},
+                },
+            ],
+        }
+        nested = {
+            "cached_slug": "example-1",
+            "folders": [],
+            "files": [
+                {
+                    "name": "View1.png",
+                    "extension": "png",
+                    "download_url": "https://grabcad.com/community/api/v1/models/example-1/files/download?cadid=c",
+                },
+                {
+                    "name": "body.stl",
+                    "extension": "stl",
+                    "download_url": "https://grabcad.com/community/api/v1/models/example-1/files/download?cadid=d",
+                },
+            ],
+        }
+        model = {"url": "https://grabcad.com/library/example-1", "_slug": "example-1"}
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("grabcad", "Cookie: sid=secret")
+            with mock.patch(
+                "requests.get",
+                side_effect=(FakeResponse(root), FakeResponse(nested)),
+            ) as get:
+                files = mod.GrabcadSearcher.get_files(model, auth)
+        self.assertEqual(get.call_args_list[1].kwargs["params"], {"folder_id": 42})
+        # Images never reach the slicer, and loadable geometry is fetched first.
+        self.assertEqual(
+            [item["name"] for item in files], ["bracket.step", "body.stl", "notes.txt"]
+        )
+        self.assertEqual(files[0]["preview_url"], "https://grabcad.com/pics/large.png")
+        self.assertNotIn("_loadable", files[0])
+
+    def test_grabcad_model_without_files_offers_the_browser(self):
+        listing = {"cached_slug": "example-1", "folders": [], "files": []}
+        model = {"url": "https://grabcad.com/library/example-1", "_slug": "example-1"}
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("grabcad", "Cookie: sid=secret")
+            with (
+                mock.patch("requests.get", return_value=FakeResponse(listing)),
+                self.assertRaises(mod.BrowserRequired),
             ):
                 mod.GrabcadSearcher.get_files(model, auth)
 
@@ -850,8 +971,10 @@ class RegistryAndUiTests(unittest.TestCase):
             {"makerworld", "nexprint", "crealitycloud"},
         )
         self.assertEqual(
+            # GrabCAD is absent: it no longer reads HTML pages, so an expired
+            # session surfaces as a 401 on the download instead.
             {spec.key for spec in mod._PLATFORM_SPECS if spec.session_recheck},
-            {"cults3d", "grabcad"},
+            {"cults3d"},
         )
 
     def test_only_authenticated_sites_have_auth_controls(self):
@@ -985,6 +1108,7 @@ class RegistryAndUiTests(unittest.TestCase):
                 "thangs",
                 "stlfinder",
                 "crealitycloud",
+                "grabcad",
             },
         )
 

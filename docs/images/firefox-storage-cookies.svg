@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" width="760" height="430" role="img" aria-labelledby="ff-title ff-desc">
+  <title id="ff-title">Firefox developer tools: the Storage panel showing cookies for a portal</title>
+  <desc id="ff-desc">A schematic of the Firefox Storage panel. Step 1 marks the Storage tab in the tool strip. Step 2 marks the portal address listed under Cookies in the left tree. Step 3 marks a cookie row in the table on the right, where the value is copied from.</desc>
+
+  <style>
+    .frame { fill: #ffffff; stroke: #b9c0c8; stroke-width: 1.5; }
+    .bar   { fill: #f2f4f7; }
+    .divider { stroke: #d7dce2; stroke-width: 1; }
+    .t     { font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; fill: #1d2430; }
+    .lbl   { font-size: 13px; }
+    .small { font-size: 12px; fill: #5a6673; }
+    .head  { font-size: 12.5px; fill: #45505d; font-weight: 600; }
+    .mono  { font-family: "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace; font-size: 12.5px; fill: #1d2430; }
+    .tab-on { fill: #e3edfb; stroke: #2f6fd0; stroke-width: 1.5; }
+    .row-on { fill: #fff5d6; stroke: #d9a300; stroke-width: 1.5; }
+    .pin   { fill: #d64545; }
+    .pin-t { font-family: "Segoe UI", Arial, sans-serif; font-size: 12px; font-weight: 700; fill: #ffffff; }
+    .cap   { font-family: "Segoe UI", Arial, sans-serif; font-size: 12.5px; fill: #d64545; font-weight: 600; }
+    .note  { font-family: "Segoe UI", Arial, sans-serif; font-size: 12px; fill: #5a6673; }
+  </style>
+
+  <text class="t" x="0" y="14" style="font-size:14px;font-weight:700">Firefox &#8212; Storage panel <tspan class="note">(schematic, not a screenshot)</tspan></text>
+
+  <rect class="frame" x="0" y="26" width="590" height="330" rx="6"/>
+
+  <!-- tool strip -->
+  <rect class="bar" x="1" y="27" width="588" height="30" rx="5"/>
+  <line class="divider" x1="1" y1="57" x2="589" y2="57"/>
+  <text class="t lbl" x="16"  y="47">Inspector</text>
+  <text class="t lbl" x="86"  y="47">Console</text>
+  <text class="t lbl" x="152" y="47">Debugger</text>
+  <text class="t lbl" x="226" y="47">Network</text>
+  <rect class="tab-on" x="292" y="31" width="66" height="22" rx="4"/>
+  <text class="t lbl" x="302" y="47" style="font-weight:700">Storage</text>
+  <text class="t lbl" x="374" y="47">Memory</text>
+
+  <!-- left tree -->
+  <line class="divider" x1="210" y1="57" x2="210" y2="355"/>
+  <text class="t head"  x="16" y="78">Storage tree</text>
+  <text class="t lbl"   x="16" y="102">&#9656; Cache Storage</text>
+  <text class="t lbl"   x="16" y="126" style="font-weight:700">&#9662; Cookies</text>
+  <rect class="row-on" x="26" y="134" width="172" height="22" rx="4"/>
+  <text class="mono"    x="34" y="150">https://cults3d.com</text>
+  <text class="t lbl"   x="16" y="180">&#9656; Indexed DB</text>
+  <text class="t lbl"   x="16" y="204">&#9656; Local Storage</text>
+  <text class="t lbl"   x="16" y="228">&#9656; Session Storage</text>
+
+  <!-- table -->
+  <text class="t head" x="226" y="78">Name</text>
+  <text class="t head" x="376" y="78">Value</text>
+  <line class="divider" x1="222" y1="86" x2="578" y2="86"/>
+
+  <text class="mono" x="226" y="108">_cults3d_session</text>
+  <text class="mono" x="376" y="108">s%3AhQ7v…9fA</text>
+  <line class="divider" x1="222" y1="118" x2="578" y2="118"/>
+
+  <rect class="row-on" x="222" y="122" width="356" height="26" rx="4"/>
+  <text class="mono" x="226" y="140" style="font-weight:700">cf_clearance</text>
+  <text class="mono" x="376" y="140" style="font-weight:700">Xk2p…q1Z</text>
+  <line class="divider" x1="222" y1="152" x2="578" y2="152"/>
+
+  <text class="mono" x="226" y="174">locale</text>
+  <text class="mono" x="376" y="174">en</text>
+  <line class="divider" x1="222" y1="184" x2="578" y2="184"/>
+
+  <!-- context menu -->
+  <rect class="frame" x="300" y="196" width="196" height="76" rx="5"/>
+  <text class="t lbl" x="314" y="218">Copy</text>
+  <rect class="row-on" x="304" y="226" width="188" height="22" rx="4"/>
+  <text class="t lbl" x="314" y="242" style="font-weight:700">Copy Value</text>
+  <text class="t lbl" x="314" y="264">Delete</text>
+  <text class="note"  x="300" y="288">right-click the row</text>
+
+  <!-- pins -->
+  <circle class="pin" cx="325" cy="24" r="11"/><text class="pin-t" x="321" y="28">1</text>
+  <circle class="pin" cx="14"  cy="145" r="11"/><text class="pin-t" x="10"  y="149">2</text>
+  <circle class="pin" cx="212" cy="135" r="11"/><text class="pin-t" x="208" y="139">3</text>
+
+  <!-- captions -->
+  <text class="cap" x="612" y="46">1</text>
+  <text class="note" x="626" y="46">Open the</text>
+  <text class="note" x="626" y="62">Storage tab</text>
+
+  <text class="cap" x="612" y="150">2</text>
+  <text class="note" x="626" y="150">Pick the portal</text>
+  <text class="note" x="626" y="166">under Cookies</text>
+
+  <text class="cap" x="612" y="248">3</text>
+  <text class="note" x="626" y="248">Right-click the</text>
+  <text class="note" x="626" y="264">row you need,</text>
+  <text class="note" x="626" y="280">then Copy Value</text>
+
+  <text class="note" x="0" y="382">Open with F12, or Tools &#8250; Browser Tools &#8250; Web Developer Tools.</text>
+  <text class="note" x="0" y="400">The Storage tab may be hidden behind the &#187; overflow button when the window is narrow.</text>
+  <text class="note" x="0" y="418">Copy Value gives the value alone; the plugin also accepts a whole Cookie header.</text>
+</svg>

@@ -22,7 +22,7 @@ The popularity score is a 1-10 logarithmic scale derived from those visits:
 | 9 | Cults3D | https://cults3d.com | 14.1M | #2,588 | ~3.2M models | Free and paid | Yes |
 | 8 | Thingiverse | https://www.thingiverse.com | 11.7M | #3,449 | ~2.5M models | Free only | Yes |
 | 7 | Yeggi | https://www.yeggi.com | 5.9M | #9,828 | 4.86M indexed | Meta-search | Yes, browser |
-| 6 | GrabCAD | https://grabcad.com/library | 3.4M | #11,968 | 5M CAD files | Free, membership | Yes |
+| 6 | GrabCAD | https://grabcad.com/library | 3.4M | #11,968 | 5M CAD files | Free, account to download | Yes |
 | 6 | MyMiniFactory | https://www.myminifactory.com | 2.7M | #16,677 | Hundreds of thousands | Free, paid, Tribes | Yes |
 | 6 | Creality Cloud | https://www.crealitycloud.com | 2.4M | #20,018 | 400K+ models | Free and paid | Yes |
 | 5 | Thangs | https://thangs.com | 1.1M | #45,671 | 14M indexed | Free and paid | Yes |
@@ -44,7 +44,12 @@ Notes on individual entries:
   to Turnstile, while STLFinder delegates an indexed model to its registered
   original portal and that portal's authentication/download rules.
 - **GrabCAD** is a CAD library rather than a print portal. It is kept because
-  it is the strongest free source for functional and mechanical parts.
+  it is the strongest free source for functional and mechanical parts. Its
+  `community/api/v1/models` endpoints answer anonymously, so search and the file
+  listing need no account; only the download endpoint is gated, and it answers
+  401 rather than serving a login page. Note that its sort parameter accepts any
+  value but acts on only three, and that `popular` is a curated subset rather
+  than an ordering, so the plugin never sends it.
 - **Thangs** adds geometric similarity search but has been losing traffic since
   the Shapeways acquisition. Its JSON text search also supplies an authenticated
   `downloadUrl`; the plugin resolves that URL with the user's token and imports

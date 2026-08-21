@@ -28,7 +28,7 @@ authoritative source.
 | Makeronline | Public search endpoint | User Anycubic token for import | Account-authorized files |
 | Nexprint | Public model and print-profile gateway | User `auth_token` for import | Explicitly selected profile resolved through the official signed 3MF endpoint |
 | Cults3D | Public HTML catalog | User browser cookies for files | Account/checkout rules preserved |
-| GrabCAD | Member HTML catalog | User browser cookies | Member download rules preserved |
+| GrabCAD | Public community JSON API | User browser cookies for downloads | Member download rules preserved |
 | Thingiverse | Official API | Personal developer access token | Official files API |
 | MyMiniFactory | Documented API v2 | Personal API key | API-key metadata; OAuth/store downloads stay in browser |
 | Yeggi | Pre-filled official browser search | Browser interaction | Meta-search; original portal owns the file flow |

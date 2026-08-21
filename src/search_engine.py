@@ -619,6 +619,21 @@ class AuthStore:
             data.pop(platform, None)
             self._write(data)
 
+    def clear(self):
+        """Remove every stored credential, leaving no file behind.
+
+        Unlinking rather than writing an empty document means nothing of the
+        previous contents survives on disk for a later reader to recover.
+        """
+        with self._lock:
+            try:
+                os.remove(self.path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # If the file cannot be unlinked, at least leave it empty.
+                self._write({})
+
 
 def _host_matches(host, suffixes):
     host = (host or "").lower().rstrip(".")
@@ -1270,6 +1285,26 @@ class AuthManager:
 
     def logout(self, platform):
         self.store.delete(platform)
+
+    def forget_all(self):
+        """Drop every portal session and every stored Cloudflare clearance.
+
+        Both live in the same file, so this is one erase. The counts are
+        returned so the interface can say what actually went, rather than
+        claiming success over an already-empty store.
+        """
+        data = self.store.load()
+        clearances = data.get(CloudflareClearance.STORE_KEY)
+        summary = {
+            "portals": sum(
+                1
+                for key in data
+                if key != CloudflareClearance.STORE_KEY and _platform(key) is not None
+            ),
+            "clearances": len(clearances) if isinstance(clearances, dict) else 0,
+        }
+        self.store.clear()
+        return summary
 
     @staticmethod
     def normalize_token(platform, token):
@@ -4783,7 +4818,7 @@ PAGE = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box} body{font-family:var(--orca-font,sans-serif);background:var(--orca-bg,#1e1e1e);color:var(--orca-fg,#eee);padding:16px;margin:0}
 button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}.search-row input{flex:1;padding:8px 12px;border:1px solid var(--orca-border,#444);border-radius:6px;background:var(--orca-bg,#1e1e1e);color:inherit}.btn,button{padding:7px 12px;border:0;border-radius:6px;background:var(--orca-accent,#4a9eff);color:var(--orca-accent-fg,#fff);cursor:pointer}.secondary{background:transparent!important;border:1px solid var(--orca-border,#555)!important;color:var(--orca-fg,#eee)!important}.danger{background:#7a3030!important}.muted{color:var(--orca-muted,#999)}
-.accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account-head{display:flex;align-items:center;justify-content:space-between;gap:6px}.account strong{display:block;font-size:.86em}.auth-help{width:20px;height:20px;min-width:20px;padding:0!important;border:1px solid var(--orca-border,#666)!important;border-radius:50%!important;background:transparent!important;color:var(--orca-muted,#aaa)!important;font-size:.75em;font-weight:700;line-height:18px}.auth-help:hover,.auth-help:focus{border-color:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent,#4a9eff)!important;outline:none}.auth-tooltip{position:fixed;z-index:80;display:none;width:min(330px,calc(100vw - 24px));padding:9px 11px;border:1px solid var(--orca-border,#666);border-radius:7px;background:var(--orca-bg,#202020);color:var(--orca-fg,#eee);box-shadow:0 5px 20px rgba(0,0,0,.5);font-size:.76em;line-height:1.4;text-align:left;pointer-events:none}.auth-tooltip.active{display:block}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.search-options{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:-4px 0 10px;font-size:.82em}.search-options select{padding:5px 8px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.search-options label{display:flex;align-items:center;gap:5px}.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 6px}.source-head strong{font-size:.9em}.source-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.source-tools button{padding:4px 8px;font-size:.76em}.source-count{font-size:.76em;color:var(--orca-muted,#999)}.platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;margin-bottom:12px}.portal-option{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.84em;color:var(--orca-fg,#eee);cursor:pointer;user-select:none}.portal-option:hover{border-color:var(--orca-accent,#4a9eff)}.portal-option input{margin:0;accent-color:var(--orca-accent,#4a9eff)}
+.accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:10px 0}.account{border:1px solid var(--orca-border,#444);border-radius:7px;padding:8px}.account-head{display:flex;align-items:center;justify-content:space-between;gap:6px}.account strong{display:block;font-size:.86em}.auth-help{width:20px;height:20px;min-width:20px;padding:0!important;border:1px solid var(--orca-border,#666)!important;border-radius:50%!important;background:transparent!important;color:var(--orca-muted,#aaa)!important;font-size:.75em;font-weight:700;line-height:18px}.auth-help:hover,.auth-help:focus{border-color:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent,#4a9eff)!important;outline:none}.auth-tooltip{position:fixed;z-index:80;display:none;width:min(330px,calc(100vw - 24px));padding:9px 11px;border:1px solid var(--orca-border,#666);border-radius:7px;background:var(--orca-bg,#202020);color:var(--orca-fg,#eee);box-shadow:0 5px 20px rgba(0,0,0,.5);font-size:.76em;line-height:1.4;text-align:left;pointer-events:none}.auth-tooltip.active{display:block}.auth-state{display:block;font-size:.75em;color:var(--orca-muted,#999);margin:3px 0 7px}.search-options{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:-4px 0 10px;font-size:.82em}.search-options select{padding:5px 8px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.search-options label{display:flex;align-items:center;gap:5px}.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 6px}.source-head strong{font-size:.9em}.source-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.source-tools button{padding:4px 8px;font-size:.76em}.source-count{font-size:.76em;color:var(--orca-muted,#999)}.platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:7px;margin-bottom:12px}.portal-option{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.84em;color:var(--orca-fg,#eee);cursor:pointer;user-select:none}.portal-option:hover{border-color:var(--orca-accent,#4a9eff)}.portal-option input{margin:0;accent-color:var(--orca-accent,#4a9eff)}.account-tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:2px 0 12px}.account-tools button{padding:5px 10px;font-size:.8em}.account-tools span{font-size:.76em;color:var(--orca-muted,#999)}
 #results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}.card{border:1px solid var(--orca-border,#444);border-radius:8px;padding:10px;cursor:pointer}.card:hover{border-color:var(--orca-accent,#4a9eff)}.card img{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#333}.result-image{opacity:0;transition:opacity .18s ease;cursor:zoom-in}.result-image.loaded{opacity:1}.result-image:focus{outline:2px solid var(--orca-accent,#4a9eff);outline-offset:2px}.card h3{font-size:.9em;margin:6px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.author{font-size:.78em;color:var(--orca-muted,#888)}.metrics{font-size:.72em;color:var(--orca-muted,#999);min-height:1.2em;margin-top:3px}.license-badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.72em;margin-top:4px;background:#444}.license-cc{background:#1a5c2a;color:#8f8}.license-arr{background:#5c3a1a;color:#fc6}
 .pagination{display:none;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin:14px 0 4px}.pagination.active{display:flex}.pagination-summary{font-size:.8em;color:var(--orca-muted,#999);margin-right:4px}.pagination label{display:flex;align-items:center;gap:5px;font-size:.8em;color:var(--orca-muted,#999)}.pagination select{padding:5px 7px;border:1px solid var(--orca-border,#555);border-radius:5px;background:var(--orca-bg,#222);color:inherit}.page-numbers{display:flex;align-items:center;gap:4px}.page-button{min-width:34px;padding:6px 8px}.page-button.current{background:var(--orca-accent,#4a9eff)!important;color:var(--orca-accent-fg,#fff)!important;border-color:var(--orca-accent,#4a9eff)!important}.page-ellipsis{padding:0 2px;color:var(--orca-muted,#999)}
 .source-results{display:none;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px;margin:0 0 12px}.source-results.active{display:grid}.source-result{padding:7px 9px;border:1px solid var(--orca-border,#444);border-radius:6px;font-size:.75em}.source-result strong,.source-result span,.source-result small{display:block}.source-result span{color:var(--orca-muted,#999);margin-top:2px}.source-result small{color:#e78b8b;margin-top:3px;overflow-wrap:anywhere}.source-browser{margin-top:7px;padding:4px 8px;font-size:1em}.load-more-row{display:none;justify-content:center;margin:10px 0 4px}.load-more-row.active{display:flex}.load-more-row button{min-width:220px}.cf-list{margin:8px 0 2px;font-size:.76em}.cf-head{color:var(--orca-muted,#999);margin-bottom:4px}.cf-row{display:flex;gap:8px;align-items:baseline;padding:3px 0;border-top:1px solid var(--orca-border,#3a3a3a)}.cf-row strong{flex:0 0 auto}.cf-row span{color:var(--orca-muted,#999);overflow-wrap:anywhere}.source-verify{margin-top:7px;margin-left:6px;padding:4px 8px;font-size:1em}
@@ -4949,13 +4984,14 @@ orca.onMessage(function(msg){
   }else if(msg.action==='model_details'){
     applyModelDetails(msg.model||{},!!msg.background);
   }else if(msg.action==='login_pending'){
+<div class="account-tools"><button id="forget-all" type="button" class="danger" onclick="forgetAllAuth()">Delete all authorization data</button><span>Removes every saved portal session and Cloudflare verification from this computer.</span></div>
     $('status').textContent='Sign in in the browser, then finish on the local page that opened. OrcaSlicer picks the session up automatically (link valid for '+Math.round((msg.timeout||300)/60)+' min).';
   }else if(msg.action==='login_cancelled'){
     $('status').textContent='Browser sign-in cancelled.';
   }else if(msg.action==='cloudflare_required'){
     $('status').textContent=msg.message||'Cloudflare verification is required.';openCloudflare(msg.host||'',msg.url||'');
   }else if(msg.action==='auth_status'||msg.action==='auth_changed'){
-    updateAuth(msg.states||{});renderCloudflare(msg.cloudflare);$('auth-submit').disabled=false;$('cf-submit').disabled=false;
+    updateAuth(msg.states||{});renderCloudflare(msg.cloudflare);$('auth-submit').disabled=false;$('cf-submit').disabled=false;resetForgetButton();
     if($('cloudflare-modal').classList.contains('active')&&msg.action==='auth_changed')closeCloudflare();
     if(msg.action==='auth_changed'){
       closeAuth();$('status').textContent=msg.message||'Account session updated.';
@@ -5084,6 +5120,9 @@ if orca is not None:
                 "search_more": self._handle_search_more,
                 "model_details": self._handle_model_details,
                 "prefetch_profile_choices": self._handle_profile_prefetch,
+var forgetArmed=false,forgetTimer=null;
+function resetForgetButton(){forgetArmed=false;clearTimeout(forgetTimer);var b=$('forget-all');if(b){b.disabled=false;b.textContent='Delete all authorization data'}}
+function forgetAllAuth(){var b=$('forget-all');if(!forgetArmed){forgetArmed=true;b.textContent='Click again to erase everything';clearTimeout(forgetTimer);forgetTimer=setTimeout(resetForgetButton,5000);$('status').textContent='This removes every saved portal session and Cloudflare verification. Click again to confirm.';return}clearTimeout(forgetTimer);forgetArmed=false;b.disabled=true;b.textContent='Erasing...';$('status').textContent='Removing saved authorization data...';orca.postMessage({action:'auth_forget_all'})}
                 "resolve_import": self._handle_resolve_import,
                 "resolve_profile_choice": self._handle_profile_choice,
                 "import_selected": self._handle_import_selected,
@@ -5239,6 +5278,7 @@ if orca is not None:
                         "action": "error",
                         "message": (
                             "Could not open the local sign-in endpoint "
+                "auth_forget_all": self._handle_auth_forget_all,
                             f"({exc}). Use the token field instead."
                         ),
                     }
@@ -5309,6 +5349,41 @@ if orca is not None:
             platform = msg.get("platform", "")
             token = (msg.get("token") or "").strip()
             email = (msg.get("email") or "").strip()
+        def _handle_auth_forget_all(self, _msg):
+            self._start(self._do_forget_all)
+
+        def _do_forget_all(self):
+            """Erase every saved authorization detail on this computer."""
+            # A sign-in still in flight would write a fresh credential moments
+            # after the erase, so it is cancelled first.
+            self._stop_login()
+            try:
+                summary = self.auth.forget_all()
+            except OSError as exc:
+                self._post(
+                    {
+                        "action": "error",
+                        "message": f"Could not remove the credential file: {exc}",
+                    }
+                )
+                return
+            portals, clearances = summary["portals"], summary["clearances"]
+            if not portals and not clearances:
+                message = "There was no saved authorization data to remove."
+            else:
+                parts = []
+                if portals:
+                    parts.append(
+                        f"{portals} portal session" + ("s" if portals != 1 else "")
+                    )
+                if clearances:
+                    parts.append(
+                        f"{clearances} Cloudflare verification"
+                        + ("s" if clearances != 1 else "")
+                    )
+                message = "Removed " + " and ".join(parts) + " from this computer."
+            self._post_auth("auth_changed", message)
+
             if token:
                 self.auth.save_token(
                     platform, token, label=email or "Connected session"

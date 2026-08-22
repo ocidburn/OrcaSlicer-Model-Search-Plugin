@@ -568,9 +568,45 @@ class AuthStore:
     and is written with restrictive permissions where the OS supports them.
     """
 
+    # One lock per credential file, shared by every AuthStore opened over it.
+    # Search workers build their own AuthManager (and so their own AuthStore)
+    # over the same path, so a per-instance lock would leave those writers
+    # unserialised against the plugin's own store and lose whole records.
+    _locks: ClassVar[dict] = {}
+    _epochs: ClassVar[dict] = {}
+    _locks_guard = threading.Lock()
+
+    @classmethod
+    def _lock_for(cls, path):
+        key = os.path.normcase(os.path.abspath(path))
+        with cls._locks_guard:
+            lock = cls._locks.get(key)
+            if lock is None:
+                lock = cls._locks[key] = threading.RLock()
+            return lock
+
     def __init__(self, path=None):
         self.path = path or _auth_file()
-        self._lock = threading.RLock()
+        self._key = os.path.normcase(os.path.abspath(self.path))
+        self._lock = self._lock_for(self.path)
+
+    def epoch(self):
+        """Counter bumped by every erase.
+
+        A sign-in captures this before its network round-trip and hands it back
+        when it finally writes, so a credential that was already in flight when
+        the user erased everything is dropped instead of recreating the file.
+        """
+        with self._lock:
+            return self._epochs.get(self._key, 0)
+
+    def _check_epoch(self, epoch):
+        if epoch is not None and epoch != self._epochs.get(self._key, 0):
+            raise AuthError(
+                "Stored authorization was erased while this sign-in was in "
+                "flight, so the new credential was discarded. Sign in again "
+                "if you still want it saved."
+            )
 
     def load(self):
         with self._lock:
@@ -602,16 +638,32 @@ class AuthStore:
         except OSError:
             pass
 
-    def set(self, platform, value):
+    def set(self, platform, value, epoch=None):
         value = dict(value or {})
         # Defense in depth: never let caller accidentally persist a password.
         for key in tuple(value):
             if str(key).lower() in ("password", "passwd", "secret"):
                 value.pop(key)
         with self._lock:
+            self._check_epoch(epoch)
             data = self.load()
             data[platform] = value
             self._write(data)
+
+    def mutate(self, platform, update):
+        """Read-modify-write one top-level key under a single lock hold.
+
+        Callers that edit a mapping in place -- the Cloudflare clearances all
+        live under one key -- would otherwise load, edit and store across two
+        separate lock acquisitions and lose a concurrent edit to a sibling
+        host with no error raised.
+        """
+        with self._lock:
+            data = self.load()
+            current = data.get(platform)
+            data[platform] = update(current if isinstance(current, dict) else {})
+            self._write(data)
+            return data[platform]
 
     def delete(self, platform):
         with self._lock:
@@ -626,6 +678,9 @@ class AuthStore:
         previous contents survives on disk for a later reader to recover.
         """
         with self._lock:
+            # Bump first: a writer that captured the old epoch is now refused
+            # even if it lands microseconds after the unlink.
+            self._epochs[self._key] = self._epochs.get(self._key, 0) + 1
             try:
                 os.remove(self.path)
             except FileNotFoundError:
@@ -715,13 +770,24 @@ class CloudflareClearance:
         return host if re.fullmatch(r"[a-z0-9.-]{1,253}", host or "") else ""
 
     @staticmethod
-    def parse_cookie(value):
+    def parse_cookie(value, named_only=False):
+        """Pull cf_clearance out of a pasted cookie string.
+
+        `named_only` refuses the bare-value form. The Cloudflare panel accepts
+        a bare value because the user is knowingly pasting a clearance there,
+        but anything that adopts a clearance out of a credential the user
+        supplied for something else must insist on seeing the cookie named --
+        otherwise an ordinary bearer token, which is just as bare, is stored
+        and later replayed as if it were a Cloudflare clearance.
+        """
         text = str(value or "").strip()
         if text.lower().startswith("cookie:"):
             text = text.split(":", 1)[1].strip()
         match = re.search(r"(?:^|[;\s])cf_clearance=([^;\s]+)", text)
         if match:
             return match.group(1).strip()
+        if named_only:
+            return ""
         # A bare cookie value is accepted; some other cookie pair is not.
         return "" if "=" in text or " " in text else text
 
@@ -746,9 +812,16 @@ class CloudflareClearance:
             "user_agent": agent,
             "saved_at": int(time.time()),
         }
-        records = self._records()
-        records[host] = record
-        self.store.set(self.STORE_KEY, records)
+        def add(records):
+            records = {
+                str(name): dict(value)
+                for name, value in records.items()
+                if isinstance(value, dict)
+            }
+            records[host] = record
+            return records
+
+        self.store.mutate(self.STORE_KEY, add)
         return dict(record, host=host)
 
     def for_url(self, url):
@@ -778,14 +851,23 @@ class CloudflareClearance:
 
     def forget(self, target):
         host = self.normalize_host(target)
-        records = self._records()
-        removed = [name for name in records if host and _host_matches(host, (name,))]
-        if not removed:
+        if not host:
             return False
-        for name in removed:
-            records.pop(name, None)
-        self.store.set(self.STORE_KEY, records)
-        return True
+        dropped = []
+
+        def remove(records):
+            records = {
+                str(name): dict(value)
+                for name, value in records.items()
+                if isinstance(value, dict)
+            }
+            for name in [name for name in records if _host_matches(host, (name,))]:
+                records.pop(name, None)
+                dropped.append(name)
+            return records
+
+        self.store.mutate(self.STORE_KEY, remove)
+        return bool(dropped)
 
     def status(self):
         return [
@@ -939,6 +1021,10 @@ class LoginReceiver:
 
     def stop(self):
         with self._lock:
+            # Retire the receiver as well as the socket: a POST that already
+            # passed the accept can still be inside submit(), and without this
+            # it would store a credential after the user cancelled or erased.
+            self._done = True
             server, self._server = self._server, None
             timer, self._timer = self._timer, None
         if timer is not None:
@@ -963,12 +1049,16 @@ class LoginReceiver:
         with self._lock:
             if self._done:
                 return False, "This sign-in link has already been used."
+            # Claim the slot before the callback runs, so two submissions
+            # racing through the check cannot both store a credential.
+            self._done = True
         try:
             self._on_credential(self.platform, value, user_agent)
         except (AuthError, OSError, ValueError) as exc:
+            with self._lock:
+                # The credential was refused, so let the user try again.
+                self._done = False
             return False, str(exc)
-        with self._lock:
-            self._done = True
         return True, ""
 
 
@@ -1284,7 +1374,19 @@ class AuthManager:
         return out
 
     def logout(self, platform):
+        """Drop the session and the clearance that arrived with it.
+
+        The clearance is stored under the portal's own host, so leaving it
+        behind would keep a cookie copied from the user's browser on disk
+        after the interface has reported the portal as disconnected.
+        """
         self.store.delete(platform)
+        spec = _platform(platform)
+        host = (spec.auth_hosts[0] if spec and spec.auth_hosts else "") or (
+            _url_host(spec.login_url) if spec else ""
+        )
+        if host:
+            self.clearance.forget(host)
 
     def forget_all(self):
         """Drop every portal session and every stored Cloudflare clearance.
@@ -1337,7 +1439,7 @@ class AuthManager:
         return token
 
     def save_token(
-        self, platform, token, label="", refresh_token=None, expires_in=None
+        self, platform, token, label="", refresh_token=None, expires_in=None, epoch=None
     ):
         spec = _platform(platform)
         if spec is None or not spec.requires_auth:
@@ -1369,7 +1471,7 @@ class AuthManager:
                 data["expires_at"] = int(time.time()) + int(expires_in)
             except (TypeError, ValueError):
                 pass
-        self.store.set(platform, data)
+        self.store.set(platform, data, epoch=epoch)
         return data
 
     def _request_headers(self, platform, url):
@@ -1549,7 +1651,7 @@ class AuthManager:
             or "MakerWorld did not return an access token"
         )
 
-    def login_makerworld(self, account, password=None, code=None):
+    def login_makerworld(self, account, password=None, code=None, epoch=None):
         import requests
 
         account, payload = self._makerworld_login_payload(account, password, code)
@@ -1567,6 +1669,7 @@ class AuthManager:
             label=account,
             refresh_token=data.get("refreshToken"),
             expires_in=data.get("expiresIn"),
+            epoch=epoch,
         )
 
     @staticmethod
@@ -1991,7 +2094,16 @@ def _request_probe(session, url, auth, platform, use_range):
 
 
 def _probe_result(response, platform):
-    if response.status_code in (401, 403) and _session_recheck(platform):
+    spec = _platform(platform)
+    # The probed URLs are scraped off the model page and routinely point at
+    # CDNs and storage hosts. Only a refusal from the portal's own host says
+    # anything about the session; anything else is just a dead candidate.
+    if (
+        response.status_code in (401, 403)
+        and _session_recheck(platform)
+        and spec is not None
+        and _host_matches(_url_host(response.url), spec.auth_hosts)
+    ):
         raise AuthRequired(
             f"{_display_name(platform)} session was rejected while resolving files."
         )
@@ -2183,10 +2295,12 @@ def _normalize_download_files(files):
     for index, item in enumerate(files or ()):
         if not isinstance(item, dict) or not item.get("url"):
             continue
+        name = item.get("name") or f"model_{index + 1}.3mf"
+        extension = os.path.splitext(name)[1].lower()
         normalized.append(
             {
                 "url": item["url"],
-                "name": item.get("name") or f"model_{index + 1}.3mf",
+                "name": name,
                 "preview_url": item.get("preview_url") or "",
                 "size": item.get("size"),
             }
@@ -4946,14 +5060,25 @@ def _download_stream(url, name, dest_dir, auth, platform):
         except OSError:
             pass
         raise
+        # Only the portal itself can reject a session. These downloads are
+        # mostly short-lived presigned URLs on storage hosts that never see
+        # the credential, so treating their 403 as an expiry would delete a
+        # perfectly good token because a link went stale.
     finally:
         if response is not None:
             response.close()
         session.close()
+            and _host_matches(_url_host(response.url or url), spec.auth_hosts)
     return path
 
 
 # ---------------------------------------------------------------------------
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"{_display_name(platform)} refused the download link "
+                f"(HTTP {response.status_code}). It has probably expired -- "
+                "start the import again."
+            )
 # Web UI
 # ---------------------------------------------------------------------------
 
@@ -5236,6 +5361,7 @@ if orca is not None:
                 width=980,
                 height=720,
                 on_message=self.on_message,
+            self._login_epoch = None
                 on_close=self.on_close,
             )
             return _orca.ExecutionResult.success()
@@ -5393,7 +5519,12 @@ if orca is not None:
 
         def _stop_login(self):
             with self._login_lock:
-                receiver, self._login = self._login, None
+                self._stop_login_locked()
+
+        def _stop_login_locked(self):
+            """Retire the current receiver. The caller must hold _login_lock."""
+            receiver, self._login = self._login, None
+            self._login_epoch = None
             if receiver is not None:
                 receiver.stop()
 
@@ -5411,10 +5542,16 @@ if orca is not None:
             Cloudflare check already contains cf_clearance. That clearance is
             bound to the browser's User-Agent, which the hand-over page reports
             because it runs in that same browser -- so both halves are present
+                # stop() marks the receiver used before closing the socket, so
+                # a submission already in flight cannot still store a token.
             here and the user does not have to repeat the exercise in the
             Cloudflare panel.
             """
-            token = CloudflareClearance.parse_cookie(value)
+            # named_only: the submitted value is a portal credential, not a
+            # clearance the user chose to paste. Only an explicit cf_clearance=
+            # pair may be adopted, or every bare bearer token would be stored a
+            # second time as a fake clearance and replayed as that cookie.
+            token = CloudflareClearance.parse_cookie(value, named_only=True)
             spec = _platform(platform)
             if not token or not user_agent or spec is None:
                 return ""
@@ -5429,7 +5566,11 @@ if orca is not None:
 
         def _store_login_credential(self, platform, value, user_agent=""):
             """Called from the loopback receiver once the user submits."""
-            self.auth.save_token(platform, value, label="Browser sign-in")
+            with self._login_lock:
+                epoch = self._login_epoch
+            # Refuses the write if the credential store was erased while the
+            # user was away in the browser.
+            self.auth.save_token(platform, value, label="Browser sign-in", epoch=epoch)
             host = self._adopt_clearance(platform, value, user_agent)
             with self._login_lock:
                 self._login = None
@@ -5448,11 +5589,19 @@ if orca is not None:
                     {"action": "error", "message": "This portal does not use a session."}
                 )
                 return
-            self._stop_login()
-            receiver = LoginReceiver(platform, self._store_login_credential)
-            try:
-                url = receiver.start()
-            except OSError as exc:
+            # Serialise the whole start: without this a double click races
+            # two _do_start_login workers past _stop_login, both bind a socket,
+            # and the second assignment orphans the first receiver where
+            # cancel, window close and the erase control can no longer reach it.
+            with self._login_lock:
+                self._stop_login_locked()
+                receiver = LoginReceiver(platform, self._store_login_credential)
+                try:
+                    url = receiver.start()
+                except OSError as exc:
+                    # `exc` is unbound once the except block ends.
+                    receiver, error = None, str(exc)
+            if receiver is None:
                 # A sandbox may refuse the loopback socket. Fall back to the
                 # existing paste flow rather than leaving the user stuck.
                 self._post(
@@ -5460,7 +5609,7 @@ if orca is not None:
                         "action": "error",
                         "message": (
                             "Could not open the local sign-in endpoint "
-                            f"({exc}). Use the token field instead."
+                            f"({error}). Use the token field instead."
                         ),
                     }
                 )
@@ -5483,6 +5632,7 @@ if orca is not None:
             self._start(self._do_cloudflare_save, msg)
 
         def _handle_cloudflare_forget(self, msg):
+                self._login_epoch = self.auth.store.epoch()
             host = CloudflareClearance.normalize_host(msg.get("host") or "")
             removed = self.auth.clearance.forget(host) if host else False
             self._post_auth(
@@ -5532,7 +5682,7 @@ if orca is not None:
             email = (msg.get("email") or "").strip()
             if token:
                 self.auth.save_token(
-                    platform, token, label=email or "Connected session"
+                    platform, token, label=email or "Connected session", epoch=epoch
                 )
                 return
             if platform == "makerworld":
@@ -5546,6 +5696,9 @@ if orca is not None:
 
         def _do_auth_login(self, msg):
             import requests
+            # Captured before any network round-trip: a portal login can take
+            # tens of seconds, and the erase control stays clickable meanwhile.
+            epoch = self.auth.store.epoch()
 
             platform = msg.get("platform", "")
             # Never log the incoming message: it may contain a password/token.
@@ -5556,6 +5709,7 @@ if orca is not None:
                     {
                         "action": "auth_challenge",
                         "platform": platform,
+                    epoch=epoch,
                         "message": str(exc),
                     }
                 )

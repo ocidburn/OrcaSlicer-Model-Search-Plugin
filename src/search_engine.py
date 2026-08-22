@@ -134,8 +134,50 @@ def _auth_file():
     return os.path.join(_orca_data_dir(), "model_search_auth", "sessions.json")
 
 
+_RESTRICTED_DIRS = set()
+
+
+def _restrict_windows_dir(path):
+    """Hand the current user sole access to a directory on Windows.
+
+    os.chmod only toggles the read-only attribute there: for mode 0o700 it
+    clears that flag, returns successfully, and never touches the ACL -- so the
+    credential file silently inherited whatever its parent allowed, and the
+    OSError fallback could not fire because nothing failed. icacls is the only
+    way to set a real ACL without leaving the standard library.
+    """
+    user = os.environ.get("USERNAME") or ""
+    if not user:
+        return False
+    try:
+        completed = subprocess.run(  # nosec B603 B607
+            [
+                "icacls",
+                path,
+                "/inheritance:r",
+                "/grant:r",
+                f"{user}:(OI)(CI)F",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 def _ensure_private_dir(path):
     os.makedirs(path, exist_ok=True)
+    if os.name == "nt":
+        # Once per directory: this runs before every credential write and
+        # every download, and the ACL does not need reapplying each time.
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in _RESTRICTED_DIRS:
+            _restrict_windows_dir(path)
+            _RESTRICTED_DIRS.add(key)
+        return
     try:
         os.chmod(path, 0o700)
     except OSError:
@@ -361,6 +403,7 @@ def _timestamp(value):
 
 def _normalize_result(item, source_rank=0):
     normalized = dict(item or {})
+    normalized["thumbnail_url"] = _safe_display_url(normalized.get("thumbnail_url"))
     for field in _COMMON_RESULT_FIELDS:
         normalized.setdefault(field, None)
     for field in ("downloads", "likes", "rating_count", "views", "makes"):
@@ -564,13 +607,50 @@ def _display_name(key):
 class AuthStore:
     """Small token-only credential store.
 
-    Passwords are never persisted.  The file lives below Orca's data directory
-    and is written with restrictive permissions where the OS supports them.
+    Passwords are never persisted.  The file lives below Orca's data directory,
+    whose access is narrowed to the current user: a POSIX mode on Unix, and an
+    explicit ACL on Windows, where chmod cannot express one.
     """
+
+    # One lock per credential file, shared by every AuthStore opened over it.
+    # Search workers build their own AuthManager (and so their own AuthStore)
+    # over the same path, so a per-instance lock would leave those writers
+    # unserialised against the plugin's own store and lose whole records.
+    _locks: ClassVar[dict] = {}
+    _epochs: ClassVar[dict] = {}
+    _locks_guard = threading.Lock()
+
+    @classmethod
+    def _lock_for(cls, path):
+        key = os.path.normcase(os.path.abspath(path))
+        with cls._locks_guard:
+            lock = cls._locks.get(key)
+            if lock is None:
+                lock = cls._locks[key] = threading.RLock()
+            return lock
 
     def __init__(self, path=None):
         self.path = path or _auth_file()
-        self._lock = threading.RLock()
+        self._key = os.path.normcase(os.path.abspath(self.path))
+        self._lock = self._lock_for(self.path)
+
+    def epoch(self):
+        """Counter bumped by every erase.
+
+        A sign-in captures this before its network round-trip and hands it back
+        when it finally writes, so a credential that was already in flight when
+        the user erased everything is dropped instead of recreating the file.
+        """
+        with self._lock:
+            return self._epochs.get(self._key, 0)
+
+    def _check_epoch(self, epoch):
+        if epoch is not None and epoch != self._epochs.get(self._key, 0):
+            raise AuthError(
+                "Stored authorization was erased while this sign-in was in "
+                "flight, so the new credential was discarded. Sign in again "
+                "if you still want it saved."
+            )
 
     def load(self):
         with self._lock:
@@ -602,16 +682,32 @@ class AuthStore:
         except OSError:
             pass
 
-    def set(self, platform, value):
+    def set(self, platform, value, epoch=None):
         value = dict(value or {})
         # Defense in depth: never let caller accidentally persist a password.
         for key in tuple(value):
             if str(key).lower() in ("password", "passwd", "secret"):
                 value.pop(key)
         with self._lock:
+            self._check_epoch(epoch)
             data = self.load()
             data[platform] = value
             self._write(data)
+
+    def mutate(self, platform, update):
+        """Read-modify-write one top-level key under a single lock hold.
+
+        Callers that edit a mapping in place -- the Cloudflare clearances all
+        live under one key -- would otherwise load, edit and store across two
+        separate lock acquisitions and lose a concurrent edit to a sibling
+        host with no error raised.
+        """
+        with self._lock:
+            data = self.load()
+            current = data.get(platform)
+            data[platform] = update(current if isinstance(current, dict) else {})
+            self._write(data)
+            return data[platform]
 
     def delete(self, platform):
         with self._lock:
@@ -626,6 +722,9 @@ class AuthStore:
         previous contents survives on disk for a later reader to recover.
         """
         with self._lock:
+            # Bump first: a writer that captured the old epoch is now refused
+            # even if it lands microseconds after the unlink.
+            self._epochs[self._key] = self._epochs.get(self._key, 0) + 1
             try:
                 os.remove(self.path)
             except FileNotFoundError:
@@ -681,6 +780,27 @@ def _reject_obvious_local_target(url):
         raise ValueError("Refusing a private/local download URL")
 
 
+def _safe_display_url(url):
+    """Drop an image URL the interface should not be asked to fetch.
+
+    The webview loads thumbnails and covers directly, so the class of target
+    the download path refuses should not be handed to it either. Only the
+    literal forms are checked -- a hostname is left alone, because resolving
+    every thumbnail would mean a blocking DNS lookup per card and an <img>
+    cannot read a cross-origin response back anyway.
+    """
+    if not _is_http_url(url):
+        return ""
+    host = _url_host(url)
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+        return ""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return url
+    return url if ip.is_global else ""
+
+
 class CloudflareClearance:
     """Replay a Cloudflare check that a human completed in their own browser.
 
@@ -715,13 +835,24 @@ class CloudflareClearance:
         return host if re.fullmatch(r"[a-z0-9.-]{1,253}", host or "") else ""
 
     @staticmethod
-    def parse_cookie(value):
+    def parse_cookie(value, named_only=False):
+        """Pull cf_clearance out of a pasted cookie string.
+
+        `named_only` refuses the bare-value form. The Cloudflare panel accepts
+        a bare value because the user is knowingly pasting a clearance there,
+        but anything that adopts a clearance out of a credential the user
+        supplied for something else must insist on seeing the cookie named --
+        otherwise an ordinary bearer token, which is just as bare, is stored
+        and later replayed as if it were a Cloudflare clearance.
+        """
         text = str(value or "").strip()
         if text.lower().startswith("cookie:"):
             text = text.split(":", 1)[1].strip()
         match = re.search(r"(?:^|[;\s])cf_clearance=([^;\s]+)", text)
         if match:
             return match.group(1).strip()
+        if named_only:
+            return ""
         # A bare cookie value is accepted; some other cookie pair is not.
         return "" if "=" in text or " " in text else text
 
@@ -746,9 +877,16 @@ class CloudflareClearance:
             "user_agent": agent,
             "saved_at": int(time.time()),
         }
-        records = self._records()
-        records[host] = record
-        self.store.set(self.STORE_KEY, records)
+        def add(records):
+            records = {
+                str(name): dict(value)
+                for name, value in records.items()
+                if isinstance(value, dict)
+            }
+            records[host] = record
+            return records
+
+        self.store.mutate(self.STORE_KEY, add)
         return dict(record, host=host)
 
     def for_url(self, url):
@@ -778,14 +916,23 @@ class CloudflareClearance:
 
     def forget(self, target):
         host = self.normalize_host(target)
-        records = self._records()
-        removed = [name for name in records if host and _host_matches(host, (name,))]
-        if not removed:
+        if not host:
             return False
-        for name in removed:
-            records.pop(name, None)
-        self.store.set(self.STORE_KEY, records)
-        return True
+        dropped = []
+
+        def remove(records):
+            records = {
+                str(name): dict(value)
+                for name, value in records.items()
+                if isinstance(value, dict)
+            }
+            for name in [name for name in records if _host_matches(host, (name,))]:
+                records.pop(name, None)
+                dropped.append(name)
+            return records
+
+        self.store.mutate(self.STORE_KEY, remove)
+        return bool(dropped)
 
     def status(self):
         return [
@@ -939,6 +1086,10 @@ class LoginReceiver:
 
     def stop(self):
         with self._lock:
+            # Retire the receiver as well as the socket: a POST that already
+            # passed the accept can still be inside submit(), and without this
+            # it would store a credential after the user cancelled or erased.
+            self._done = True
             server, self._server = self._server, None
             timer, self._timer = self._timer, None
         if timer is not None:
@@ -963,12 +1114,16 @@ class LoginReceiver:
         with self._lock:
             if self._done:
                 return False, "This sign-in link has already been used."
+            # Claim the slot before the callback runs, so two submissions
+            # racing through the check cannot both store a credential.
+            self._done = True
         try:
             self._on_credential(self.platform, value, user_agent)
         except (AuthError, OSError, ValueError) as exc:
+            with self._lock:
+                # The credential was refused, so let the user try again.
+                self._done = False
             return False, str(exc)
-        with self._lock:
-            self._done = True
         return True, ""
 
 
@@ -1284,7 +1439,19 @@ class AuthManager:
         return out
 
     def logout(self, platform):
+        """Drop the session and the clearance that arrived with it.
+
+        The clearance is stored under the portal's own host, so leaving it
+        behind would keep a cookie copied from the user's browser on disk
+        after the interface has reported the portal as disconnected.
+        """
         self.store.delete(platform)
+        spec = _platform(platform)
+        host = (spec.auth_hosts[0] if spec and spec.auth_hosts else "") or (
+            _url_host(spec.login_url) if spec else ""
+        )
+        if host:
+            self.clearance.forget(host)
 
     def forget_all(self):
         """Drop every portal session and every stored Cloudflare clearance.
@@ -1337,7 +1504,7 @@ class AuthManager:
         return token
 
     def save_token(
-        self, platform, token, label="", refresh_token=None, expires_in=None
+        self, platform, token, label="", refresh_token=None, expires_in=None, epoch=None
     ):
         spec = _platform(platform)
         if spec is None or not spec.requires_auth:
@@ -1369,7 +1536,7 @@ class AuthManager:
                 data["expires_at"] = int(time.time()) + int(expires_in)
             except (TypeError, ValueError):
                 pass
-        self.store.set(platform, data)
+        self.store.set(platform, data, epoch=epoch)
         return data
 
     def _request_headers(self, platform, url):
@@ -1452,11 +1619,26 @@ class AuthManager:
 
     def request(self, platform, method, url, session=None, **kwargs):
         """Request a URL while rebuilding scoped auth headers after every redirect."""
-        import requests
-
         if not _is_http_url(url):
             raise ValueError("Refusing non-HTTP URL")
+        # Mirrors what requests' own module-level helpers do: a session this
+        # call opened is closed again on the way out, unless the caller is
+        # streaming the body and still needs the connection. Leaving it open
+        # cost a connection per Thingiverse and MyMiniFactory request.
+        borrowed = session is not None
         session = session or self.session(platform)
+        close_session = not borrowed and not kwargs.get("stream")
+        try:
+            return self._request_following_redirects(
+                platform, method, url, session, kwargs
+            )
+        finally:
+            if close_session:
+                session.close()
+
+    def _request_following_redirects(self, platform, method, url, session, kwargs):
+        import requests
+
         supplied = dict(kwargs.pop("headers", {}) or {})
         for name in tuple(supplied):
             if name.lower() in ("authorization", "cookie", "xx-token"):
@@ -1549,7 +1731,7 @@ class AuthManager:
             or "MakerWorld did not return an access token"
         )
 
-    def login_makerworld(self, account, password=None, code=None):
+    def login_makerworld(self, account, password=None, code=None, epoch=None):
         import requests
 
         account, payload = self._makerworld_login_payload(account, password, code)
@@ -1567,6 +1749,7 @@ class AuthManager:
             label=account,
             refresh_token=data.get("refreshToken"),
             expires_in=data.get("expiresIn"),
+            epoch=epoch,
         )
 
     @staticmethod
@@ -1711,6 +1894,8 @@ def _slug_title(url):
         urllib.parse.urlsplit(url).path.rstrip("/").split("/")[-1]
     )
     path = re.sub(r"-\d+$", "", path)
+    # Some catalogs put the item id in front of the slug, not behind it.
+    path = re.sub(r"^\d+[-_]", "", path)
     path = re.sub(r"[-_]+", " ", path).strip()
     return path[:120] or "Untitled"
 
@@ -1841,13 +2026,22 @@ def _looks_like_login_page(raw, platform=""):
     return False
 
 
-def _extract_catalog_models(raw, base_url, path_pattern, platform, limit=30):
+# These catalogs are scraped from one page and have no second request to make,
+# so a low cap simply throws away rows that are already parsed -- Cults3D
+# returns 48 models in a single response. The bound is kept only so a
+# pathological page cannot flood the interface.
+_CATALOG_PAGE_LIMIT = 200
+
+
+def _extract_catalog_models(
+    raw, base_url, path_pattern, platform, limit=_CATALOG_PAGE_LIMIT
+):
     parser = _parse_catalog_html(raw)
     regex = re.compile(path_pattern, re.IGNORECASE)
     found = []
     seen = set()
 
-    def add(href, title="", img=""):
+    def add(href, title="", img="", title_attr=""):
         href = _decode_embedded_url(href)
         if not href:
             return
@@ -1864,6 +2058,9 @@ def _extract_catalog_models(raw, base_url, path_pattern, platform, limit=30):
         found.append(
             {
                 "name": _clean_web_text(title) or _slug_title(canonical),
+                # Some catalogs wrap the tile in one anchor whose visible text
+                # is a price badge and whose title attribute is the real name.
+                "_title_attr": _clean_web_text(title_attr),
                 "author": "Unknown",
                 "platform": platform,
                 "thumbnail_url": urllib.parse.urljoin(
@@ -1887,6 +2084,7 @@ def _extract_catalog_models(raw, base_url, path_pattern, platform, limit=30):
             a.get("href"),
             a.get("text") or a.get("title") or a.get("aria"),
             a.get("img"),
+            a.get("title") or a.get("aria"),
         )
         if len(found) >= limit:
             return found
@@ -1991,7 +2189,16 @@ def _request_probe(session, url, auth, platform, use_range):
 
 
 def _probe_result(response, platform):
-    if response.status_code in (401, 403) and _session_recheck(platform):
+    spec = _platform(platform)
+    # The probed URLs are scraped off the model page and routinely point at
+    # CDNs and storage hosts. Only a refusal from the portal's own host says
+    # anything about the session; anything else is just a dead candidate.
+    if (
+        response.status_code in (401, 403)
+        and _session_recheck(platform)
+        and spec is not None
+        and _host_matches(_url_host(response.url), spec.auth_hosts)
+    ):
         raise AuthRequired(
             f"{_display_name(platform)} session was rejected while resolving files."
         )
@@ -2183,12 +2390,21 @@ def _normalize_download_files(files):
     for index, item in enumerate(files or ()):
         if not isinstance(item, dict) or not item.get("url"):
             continue
+        name = item.get("name") or f"model_{index + 1}.3mf"
+        extension = os.path.splitext(name)[1].lower()
         normalized.append(
             {
                 "url": item["url"],
-                "name": item.get("name") or f"model_{index + 1}.3mf",
-                "preview_url": item.get("preview_url") or "",
+                "name": name,
+                "preview_url": _safe_display_url(item.get("preview_url")),
                 "size": item.get("size"),
+                # Pre-tick only what the slicer could actually open. A portal
+                # that publishes drawings and PDFs beside the geometry would
+                # otherwise have every one of them downloaded by default and
+                # then discarded, leaving the user with junk and no model.
+                # An extensionless name is left ticked: those get their real
+                # extension from the download response.
+                "selected": not extension or extension in _MODEL_FILE_EXTS,
             }
         )
     return normalized
@@ -2634,7 +2850,7 @@ class NexprintSearcher:
         return {
             "profile_id": profile_id,
             "title": _coalesce(item.get("settingName"), default="Print profile"),
-            "cover": NexprintSearcher._profile_cover(item),
+            "cover": _safe_display_url(NexprintSearcher._profile_cover(item)),
             "creator": _coalesce(author.get("nickname"), item.get("authorName")),
             "printer": str(params.get("printerModel") or ""),
             "filament": NexprintSearcher._profile_filament(item),
@@ -2997,7 +3213,9 @@ class MakerWorldSearcher:
             "creator": creator.get("name")
             if isinstance(creator, dict)
             else str(creator or ""),
-            "cover": _coalesce(item.get("cover"), item.get("coverUrl")),
+            "cover": _safe_display_url(
+                _coalesce(item.get("cover"), item.get("coverUrl"))
+            ),
             "summary": _strip_html(
                 _coalesce(item.get("summaryTranslated"), item.get("summary"))
             ),
@@ -3796,6 +4014,7 @@ class ThangsSearcher:
         import requests
 
         manager = auth if isinstance(auth, AuthManager) else AuthManager()
+        session = requests.Session()
 
         def request(user_agent):
             headers = {
@@ -3804,36 +4023,47 @@ class ThangsSearcher:
                 "Origin": ThangsSearcher.BASE,
                 "Referer": ThangsSearcher.BASE + "/",
             }
+            # Routed through AuthManager so this call gets the same policy as
+            # every other: the SSRF guard runs on each redirect hop, the
+            # clearance cookie is pinned to the host that earned it instead of
+            # following a 3xx anywhere, and the redirect chain is bounded.
             # A stored clearance pins its own User-Agent; that is deliberate.
-            cookies = manager.clearance.apply(ThangsSearcher.SEARCH_URL, headers)
-            return requests.get(
+            return manager.request(
+                "thangs",
+                "GET",
                 ThangsSearcher.SEARCH_URL,
+                session=session,
                 params=params,
                 headers=headers,
-                cookies=cookies,
                 timeout=30,
             )
 
-        response = request(_BROWSER_UA)
-        if _is_cloudflare_challenge(response):
-            response.close()
-            response = request(_STANDARD_BROWSER_UA)
+        try:
+            response = request(_BROWSER_UA)
             if _is_cloudflare_challenge(response):
                 response.close()
-                raise _cloudflare_challenge(
-                    ThangsSearcher._browser_url(query),
-                    manager,
-                    host=_url_host(ThangsSearcher.SEARCH_URL),
-                    detail=(
-                        "The official Thangs API is asking for a Cloudflare "
-                        "browser check. Open Thangs, complete the verification "
-                        "yourself, then add the cf_clearance cookie and your "
-                        "browser User-Agent for "
-                        f"{_url_host(ThangsSearcher.SEARCH_URL)}."
-                    ),
-                )
-        response.raise_for_status()
-        return response.json()
+                response = request(_STANDARD_BROWSER_UA)
+                if _is_cloudflare_challenge(response):
+                    response.close()
+                    raise _cloudflare_challenge(
+                        ThangsSearcher._browser_url(query),
+                        manager,
+                        host=_url_host(ThangsSearcher.SEARCH_URL),
+                        detail=(
+                            "The official Thangs API is asking for a Cloudflare "
+                            "browser check. Open Thangs, complete the verification "
+                            "yourself, then add the cf_clearance cookie and your "
+                            "browser User-Agent for "
+                            f"{_url_host(ThangsSearcher.SEARCH_URL)}."
+                        ),
+                    )
+            try:
+                response.raise_for_status()
+                return response.json()
+            finally:
+                response.close()
+        finally:
+            session.close()
 
     @staticmethod
     def search(query, context, options=None):
@@ -4007,15 +4237,33 @@ class CrealityCloudSearcher:
     def _post(path, body, auth=None, *, requires_auth=False):
         import requests
 
-        response = requests.post(
-            CrealityCloudSearcher.API_BASE + path,
-            json=body,
-            headers=CrealityCloudSearcher._headers(auth),
-            timeout=30,
-            allow_redirects=False,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        manager = auth if isinstance(auth, AuthManager) else AuthManager()
+        url = CrealityCloudSearcher.API_BASE + path
+        session = requests.Session()
+        try:
+            # Routed through AuthManager so a clearance stored for this host is
+            # attached; calling requests.post directly left one inert and let a
+            # Cloudflare 403 surface as a bare HTTPError the panel never
+            # offered to fix.
+            response = manager.request(
+                "crealitycloud",
+                "POST",
+                url,
+                session=session,
+                json=body,
+                headers=CrealityCloudSearcher._headers(auth),
+                timeout=30,
+                allow_redirects=False,
+            )
+            try:
+                if _is_cloudflare_challenge(response):
+                    raise _cloudflare_challenge(url, manager, host=_url_host(url))
+                response.raise_for_status()
+                payload = response.json()
+            finally:
+                response.close()
+        finally:
+            session.close()
         if not isinstance(payload, dict):
             raise TypeError("Creality Cloud returned an invalid API response")
         code = _number(payload.get("code"), integer=True)
@@ -4128,7 +4376,7 @@ class CrealityCloudSearcher:
             "profile_id": str(item.get("id") or ""),
             "title": item.get("secondName") or item.get("name") or "Print profile",
             "summary": _strip_html(item.get("desc")),
-            "cover": cover if _is_http_url(cover) else "",
+            "cover": _safe_display_url(cover),
             "creator": user.get("nickName") or "",
             "printer": item.get("printerName") or "",
             "layer_height": item.get("layerHeight") or "",
@@ -4167,7 +4415,7 @@ class CrealityCloudSearcher:
                     "profile_id": "model-files",
                     "title": "Original model files",
                     "summary": "No public Creality print profile is available.",
-                    "cover": str(model.get("thumbnail_url") or ""),
+                    "cover": _safe_display_url(model.get("thumbnail_url")),
                 }
             ]
         return {
@@ -4354,9 +4602,18 @@ def _grabcad_model_files(slug):
     import requests
 
     listing_url = f"{GRABCAD_API}/{urllib.parse.quote(slug, safe='')}/files"
-    collected, visited, pending = [], set(), [None]
-    while pending and len(visited) <= _GRABCAD_MAX_FOLDERS:
+    collected, queued, pending = [], set(), [None]
+    folder_fetches = 0
+    while pending:
         folder_id = pending.pop(0)
+        # The budget caps requests actually spent. Counting folders as they are
+        # discovered instead would let a model that advertises many folders
+        # exhaust it before fetching any of them -- the more there was to walk,
+        # the less got walked.
+        if folder_id is not None:
+            if folder_fetches >= _GRABCAD_MAX_FOLDERS:
+                break
+            folder_fetches += 1
         response = requests.get(
             listing_url,
             params={"folder_id": folder_id} if folder_id else None,
@@ -4369,8 +4626,8 @@ def _grabcad_model_files(slug):
             raise TypeError("GrabCAD returned an invalid file listing")
         for folder in body.get("folders") or ():
             identifier = folder.get("id") if isinstance(folder, dict) else None
-            if identifier and identifier not in visited:
-                visited.add(identifier)
+            if identifier and identifier not in queued:
+                queued.add(identifier)
                 pending.append(identifier)
         collected.extend(
             item for item in body.get("files") or () if isinstance(item, dict)
@@ -4449,7 +4706,7 @@ class GrabcadSearcher:
 class YouMagineSearcher:
     BASE = "https://youmagine.com"
     SEARCH_URLS = (BASE + "/explore?query={query}",)
-    PATH_RE = r"/designs/[a-f0-9-]+"
+    PATH_RE = r"/designs/[a-z0-9%._~+()-]+"
 
     @staticmethod
     def search(query, context, options=None):
@@ -4481,7 +4738,9 @@ class PinshapeSearcher:
         for item in items:
             price_label = item.get("name", "").casefold()
             if price_label in ("free", "premium"):
-                item["name"] = _slug_title(item.get("url", ""))
+                item["name"] = item.get("_title_attr") or _slug_title(
+                    item.get("url", "")
+                )
             item["direct_import"] = price_label == "free"
             item["is_free"] = (
                 True if price_label == "free" else False if price_label == "premium" else None
@@ -4798,14 +5057,29 @@ def _send_windows_instance_message(executable, paths):
         return False, f"Windows OrcaSlicer import handoff failed: {exc}"
 
 
+# Exit codes that mean the running OrcaSlicer accepted the files: 0, and the
+# 255 that POSIX makes of the -1 its forwarding branch returns.
+_ORCA_HANDOFF_OK = frozenset({0, 255})
+
+
 def _load_in_orca(paths):
     """Import local files into the already-open OrcaSlicer project.
 
     On Windows, send OrcaSlicer's native WM_COPYDATA single-instance message
     directly to the current main window. This avoids depending on CLI options
-    that differ between OrcaSlicer releases. On macOS/Linux, start OrcaSlicer
-    with only the file paths and let its configured single-instance handler
-    forward them to the running plater.
+    that differ between OrcaSlicer releases.
+
+    On macOS/Linux the paths are handed to a short-lived OrcaSlicer process
+    that forwards them to the running plater. Two details of that contract are
+    easy to get wrong and both leave the user with a failed import:
+
+    * The forwarding is opt-in. OrcaSlicer defaults `single_instance` to false,
+      and its command line only arms the hand-off when the flag is present, so
+      without `--single-instance` the process opens a second GUI instead and
+      the paths never reach the project the user is working in.
+    * A successful forward exits non-zero. OrcaSlicer returns -1 from the
+      branch that forwards and exits, which POSIX reports as status 255, so
+      that is the code meaning "the model arrived".
     """
     normalized = []
     for path in paths:
@@ -4825,16 +5099,23 @@ def _load_in_orca(paths):
 
     try:
         proc = subprocess.run(  # nosec B603
-            [executable, *normalized],
+            [executable, "--single-instance", *normalized],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
             timeout=20,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        return False, (
+            "OrcaSlicer did not take the files within 20 seconds. It may have "
+            "opened a second window instead of adding them to this project."
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"OrcaSlicer import handoff failed: {exc}"
-    if proc.returncode != 0:
+    # 255 is the truncated -1 the forwarding branch returns; a signal-killed
+    # child reports a negative code and is still a failure.
+    if proc.returncode not in _ORCA_HANDOFF_OK:
         detail = (proc.stderr or "").strip().replace("\n", " ")[:400]
         return False, detail or f"OrcaSlicer handoff exited with code {proc.returncode}"
     return True, ""
@@ -4930,13 +5211,24 @@ def _download_stream(url, name, dest_dir, auth, platform):
             allow_redirects=True,
         )
         spec = _platform(platform)
+        # Only the portal itself can reject a session. These downloads are
+        # mostly short-lived presigned URLs on storage hosts that never see
+        # the credential, so treating their 403 as an expiry would delete a
+        # perfectly good token because a link went stale.
         if (
             response.status_code in (401, 403)
             and spec is not None
             and spec.requires_auth
+            and _host_matches(_url_host(response.url or url), spec.auth_hosts)
         ):
             raise AuthRequired(
                 f"{_display_name(platform)} session was rejected while downloading"
+            )
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"{_display_name(platform)} refused the download link "
+                f"(HTTP {response.status_code}). It has probably expired -- "
+                "start the import again."
             )
         response.raise_for_status()
         _write_download_response(response, path)
@@ -5047,7 +5339,7 @@ button,input,select{font:inherit}.search-row{display:flex;gap:8px;margin:12px 0}
 <img id="image-preview" class="image-preview" alt="Enlarged model, file, or print profile preview">
 <div id="status">Ready.</div>
 <script>
-var selectedModel=null, searching=false, canLoadMore=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[], pendingMakerWorldModel=null, activeAuthHelp=null, resultImageObserver=null, makerWorldChoicesCache={}, makerWorldPrefetching={}, makerWorldPreloadedImages={}, currentPage=1, pageSize=100;
+var selectedModel=null, searching=false, canLoadMore=false, importInFlight=false, authPlatform=null, authStates={}, pendingImport=null, pendingFiles=[], pendingMakerWorldModel=null, activeAuthHelp=null, resultImageObserver=null, makerWorldChoicesCache={}, makerWorldPrefetching={}, makerWorldPreloadedImages={}, currentPage=1, pageSize=100;
 var $=function(id){return document.getElementById(id)};
 var AUTH_HELP={makerworld:'Click Account, then sign in with your Bambu email and password, including the MFA code when requested. You can alternatively paste an existing Bambu Cloud access token. Passwords are never saved.',nexprint:'Click Account, open the official Nexprint login, and sign in. Copy the auth_token cookie value from that signed-in browser session, paste it into the plugin, and connect.',makeronline:'Open the official Anycubic OAuth login in your browser. After MakerOnline returns, copy the mo_access_token cookie value (or its Cookie header), paste it below, and connect. You can alternatively import the Anycubic Slicer Next session. The plugin never reads the browser profile or password.',cults3d:'Click Account, open the official Cults3D login, and sign in. From the signed-in browser request headers, copy the Cookie header or session-cookie string, paste it into the plugin, and connect.',grabcad:'Searching GrabCAD needs no account; a free GrabCAD membership is only required to download. Click Account, sign in on the official site, copy the Cookie request header or session-cookie string from the signed-in browser, and paste it into the plugin.',thingiverse:'Create or open a Thingiverse developer app, obtain your personal API access token, then click API token, paste it, and connect.',myminifactory:'Create a MyMiniFactory API client and obtain its API key. Click API key, paste the key, and connect. Storefront and OAuth-only downloads will still open in the browser.',crealitycloud:'Open the official Creality Cloud login and sign in. In the signed-in browser session, copy the model_token cookie value (or a Cookie header containing model_token and model_user_id), paste it below, and connect. The plugin never reads your browser profile or password.',thangs:'Open the official Thangs sign-in page and log in. In the signed-in browser developer tools, copy the token from an Authorization: Bearer request header, paste it below, and connect. The token is sent only to Thangs and never to the signed storage URL.'};
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
@@ -5085,8 +5377,9 @@ function cacheMakerWorldChoices(msg){var model=msg.model||selectedModel;if(!mode
 function prefetchMakerWorld(m){var platform=platformKey(m&&m.platform);if(platform!=='makerworld'&&platform!=='crealitycloud'&&platform!=='nexprint')return;var key=modelIdentity(m);if(makerWorldChoicesCache[key]||makerWorldPrefetching[key])return;makerWorldPrefetching[key]=true;orca.postMessage({action:'prefetch_profile_choices',model:m})}
 function openModelDetail(m){var load=m._details_available&&!m._details_loaded&&!m._details_loading;if(load)m._details_loading=true;showDetail(m,true);prefetchMakerWorld(m);if(load)orca.postMessage({action:'model_details',model:m})}
 $('results').addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('.card');if(!c)return;var m=window._results[parseInt(c.dataset.idx,10)];if(m)openModelDetail(m)});
-function showDetail(m,open){selectedModel=m;var loading=!!m._details_loading;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-metrics').innerHTML=metricText(m)?'<strong>Metrics:</strong> '+esc(metricText(m)):'';$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(loading?'Loading...':(m.license||'Unknown'))+'</span>';$('det-summary').textContent=loading?'Loading the official license and complete metrics...':(m.license_summary||'No license information available.');var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');b.disabled=m.result_type==='search_link';b.textContent=m.result_type==='search_link'?'Browser search only':(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer';if(open!==false)$('detail').classList.add('active')}
-function applyModelDetails(m,silent){m._details_loading=false;var idx=-1;for(var i=0;i<(window._results||[]).length;i++){if(modelIdentity(window._results[i])===modelIdentity(m)){idx=i;break}}if(idx>=0){window._results[idx]=m;renderResults(window._results,false)}if(selectedModel&&modelIdentity(selectedModel)===modelIdentity(m))showDetail(m,false);if(m._details_error&&!silent)$('status').textContent='Could not load model details: '+m._details_error}
+function showDetail(m,open){selectedModel=m;var loading=!!m._details_loading;$('det-name').textContent=m.name;$('det-author').innerHTML='<strong>Author:</strong> '+esc(m.author);$('det-platform').innerHTML='<strong>Platform:</strong> '+esc(m.platform);$('det-metrics').innerHTML=metricText(m)?'<strong>Metrics:</strong> '+esc(metricText(m)):'';$('det-license').innerHTML='<strong>License:</strong> <span class="license-badge '+licenseClass(m.license)+'">'+esc(loading?'Loading...':(m.license||'Unknown'))+'</span>';$('det-summary').textContent=loading?'Loading the official license and complete metrics...':(m.license_summary||'No license information available.');var modelUrl=safeUrl(m.url);$('det-url').innerHTML=modelUrl?'<strong>Model page:</strong> <a href="'+esc(modelUrl)+'">'+esc(modelUrl)+'</a>':'';var b=$('det-import-btn');if(!importInFlight){b.disabled=m.result_type==='search_link';b.textContent=m.result_type==='search_link'?'Browser search only':(m.requires_auth&&!isAuthed(m))?('Log in to '+m.platform+' & import'):'Import into OrcaSlicer'}if(open!==false)$('detail').classList.add('active')}
+function updateResultCard(index){var card=document.querySelector('#results .card[data-idx="'+index+'"]');if(!card)return;var m=window._results[index];var metrics=card.querySelector('.metrics'),badge=card.querySelector('.license-badge');if(metrics)metrics.textContent=metricText(m);if(badge){badge.textContent=m.license||'Unknown';badge.className='license-badge '+licenseClass(m.license)}}
+function applyModelDetails(m,silent){m._details_loading=false;var idx=-1;for(var i=0;i<(window._results||[]).length;i++){if(modelIdentity(window._results[i])===modelIdentity(m)){idx=i;break}}if(idx>=0){window._results[idx]=m;updateResultCard(idx)}if(selectedModel&&modelIdentity(selectedModel)===modelIdentity(m))showDetail(m,false);if(m._details_error&&!silent)$('status').textContent='Could not load model details: '+m._details_error}
 function closeDetail(){$('detail').classList.remove('active')}
 document.addEventListener('pointerdown',function(e){var d=$('detail');if(!d||!d.classList.contains('active'))return;if(d.contains(e.target))return;closeDetail()},true);
 $('detail').addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;e.preventDefault();openExternal(a.getAttribute('href'))});
@@ -5100,16 +5393,16 @@ function openCloudflareSite(){if(cloudflareUrl)openExternal(cloudflareUrl)}
 function submitCloudflare(){var host=$('cf-host').value.trim(),cookie=$('cf-cookie').value.trim(),agent=$('cf-agent').value.trim();if(!host){$('status').textContent='Enter the Cloudflare-protected host.';return}if(!cookie){$('status').textContent='Paste the cf_clearance cookie from the tab that passed the check.';return}if(!agent){$('status').textContent='The User-Agent is required: Cloudflare ties the clearance to it.';return}orca.postMessage({action:'cloudflare_save',host:host,cookie:cookie,user_agent:agent});$('cf-submit').disabled=true;$('status').textContent='Saving Cloudflare verification...'}
 function forgetCloudflare(){var host=$('cf-host').value.trim();if(!host){$('status').textContent='Enter the host to forget.';return}orca.postMessage({action:'cloudflare_forget',host:host})}
 function doDownload(){if(selectedModel)openExternal(selectedModel.url||selectedModel.download_url)}
-function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var platform=platformKey(selectedModel.platform);if(!selectedModel._download_format&&(platform==='makerworld'||platform==='crealitycloud'||platform==='nexprint')){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id,picker_platform:cached.picker_platform});$('status').textContent='Select a '+cached.picker_platform+' print profile and file format.';return}}var b=$('det-import-btn');b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
+function doImport(){if(!selectedModel)return;if(selectedModel.result_type==='search_link'){doDownload();return}if(selectedModel.requires_auth&&!isAuthed(selectedModel)){pendingImport=selectedModel;openAuth(platformKey(selectedModel.platform));return}var platform=platformKey(selectedModel.platform);if(!selectedModel._download_format&&(platform==='makerworld'||platform==='crealitycloud'||platform==='nexprint')){var cached=makerWorldChoicesCache[modelIdentity(selectedModel)];if(cached){showMakerWorldChoices({model:selectedModel,profiles:cached.profiles,formats:cached.formats,default_profile_id:cached.default_profile_id,picker_platform:cached.picker_platform});$('status').textContent='Select a '+cached.picker_platform+' print profile and file format.';return}}var b=$('det-import-btn');importInFlight=true;b.disabled=true;b.textContent='Resolving...';$('status').textContent='Resolving files...';orca.postMessage({action:'resolve_import',model:selectedModel})}
 function openAuth(p){authPlatform=p;$('auth-modal').classList.add('active');$('modal-bg').classList.add('active');$('auth-password').value='';$('auth-code').value='';$('auth-token').value='';$('code-field').style.display='none';$('import-anycubic').style.display=p==='makeronline'?'':'none';var tokenOnly=(p==='nexprint'||p==='makeronline'||p==='cults3d'||p==='grabcad'||p==='thingiverse'||p==='myminifactory'||p==='crealitycloud'||p==='thangs');$('password-field').style.display=tokenOnly?'none':'';$('email-field').style.display=tokenOnly?'none':'';var title={makerworld:'MakerWorld / Bambu account',nexprint:'Nexprint / Elegoo account',makeronline:'Makeronline / Anycubic account',cults3d:'Cults3D account',grabcad:'GrabCAD account',thingiverse:'Thingiverse API',myminifactory:'MyMiniFactory API',crealitycloud:'Creality Cloud account',thangs:'Thangs account'}[p]||'Account';$('auth-title').textContent=title;$('token-label').textContent=p==='nexprint'?'Nexprint auth_token cookie value':p==='makeronline'?'MakerOnline mo_access_token value or Cookie header':p==='crealitycloud'?'Creality model_token value or Cookie header':p==='thangs'?'Thangs Bearer access token':p==='grabcad'?'GrabCAD Cookie header / session cookies':p==='cults3d'?'Cults3D Cookie header / session cookies':p==='thingiverse'?'Thingiverse access token':p==='myminifactory'?'MyMiniFactory API key':'Session/access token (alternative)';$('auth-note').textContent=AUTH_HELP[p]||'Use the account credentials supplied by the selected platform.';var st=authStates[p]||{};$('auth-logout').style.display=st.authenticated?'':'none'}
 function syncBackdrop(){var active=$('auth-modal').classList.contains('active')||$('file-modal').classList.contains('active')||$('cloudflare-modal').classList.contains('active')||$('makerworld-modal').classList.contains('active');$('modal-bg').classList.toggle('active',active)}
-function closeAuth(){orca.postMessage({action:'auth_cancel_login'});$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';syncBackdrop()}
-function closeFilePicker(){$('file-modal').classList.remove('active');hideImagePreview(null,true);pendingFiles=[];syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
-function closeMakerWorldPicker(){$('makerworld-modal').classList.remove('active');hideImagePreview(null,true);pendingMakerWorldModel=null;syncBackdrop();var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
+function closeAuth(){orca.postMessage({action:'auth_cancel_login'});$('auth-modal').classList.remove('active');$('auth-password').value='';$('auth-token').value='';pendingImport=null;syncBackdrop()}
+function closeFilePicker(){$('file-modal').classList.remove('active');hideImagePreview(null,true);pendingFiles=[];syncBackdrop();importInFlight=false;var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
+function closeMakerWorldPicker(){$('makerworld-modal').classList.remove('active');hideImagePreview(null,true);pendingMakerWorldModel=null;syncBackdrop();importInFlight=false;var b=$('det-import-btn');if(b){b.disabled=false;b.textContent='Import into OrcaSlicer'}}
 function closeTopModal(){if($('file-modal').classList.contains('active'))closeFilePicker();else if($('makerworld-modal').classList.contains('active'))closeMakerWorldPicker();else if($('cloudflare-modal').classList.contains('active'))closeCloudflare();else closeAuth()}
 function updateFileCount(){var all=document.querySelectorAll('#file-list input[type=checkbox]');var checked=document.querySelectorAll('#file-list input[type=checkbox]:checked');$('file-count').textContent=checked.length+' / '+all.length+' selected';$('file-import').disabled=checked.length===0}
 function formatBytes(v){v=Number(v);if(!isFinite(v)||v<0)return'';var units=['B','KB','MB','GB'],i=0;while(v>=1024&&i<units.length-1){v/=1024;i++}return(v>=10||i===0?Math.round(v):Math.round(v*10)/10)+' '+units[i]}
-function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){var name=f.name||('File '+(Number(f.index)+1)),image=safeUrl(f.preview_url),preview=image?'<img class="file-preview" src="'+esc(image)+'" loading="lazy" decoding="async" alt="'+esc(name)+' preview" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="file-preview-placeholder">No preview</span>',meta=formatBytes(f.size);html+='<label class="file-choice"><input type="checkbox" checked value="'+Number(f.index)+'" onchange="updateFileCount()">'+preview+'<span class="file-details"><span class="file-name">'+esc(name)+'</span>'+(meta?'<span class="file-meta">'+esc(meta)+'</span>':'')+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
+function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){var name=f.name||('File '+(Number(f.index)+1)),image=safeUrl(f.preview_url),preview=image?'<img class="file-preview" src="'+esc(image)+'" loading="lazy" decoding="async" alt="'+esc(name)+' preview" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="file-preview-placeholder">No preview</span>',meta=formatBytes(f.size);html+='<label class="file-choice"><input type="checkbox"'+(f.selected===false?'':' checked')+' value="'+Number(f.index)+'" onchange="updateFileCount()">'+preview+'<span class="file-details"><span class="file-name">'+esc(name)+'</span>'+(meta?'<span class="file-meta">'+esc(meta)+'</span>':'')+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
 function setAllFiles(value){document.querySelectorAll('#file-list input[type=checkbox]').forEach(function(x){x.checked=!!value});updateFileCount()}
 function confirmFileImport(){var selected=[];document.querySelectorAll('#file-list input[type=checkbox]:checked').forEach(function(x){selected.push(parseInt(x.value,10))});if(!selected.length)return;$('file-import').disabled=true;$('status').textContent='Downloading selected files...';$('file-modal').classList.remove('active');syncBackdrop();orca.postMessage({action:'import_selected',indices:selected})}
 function profileMeta(p){var v=[];if(p.creator)v.push('by '+p.creator);if(p.printer)v.push(p.printer);if(p.filament)v.push(p.filament);if(p.layer_height)v.push(p.layer_height+' layer');if(p.walls)v.push(p.walls+' walls');if(p.infill)v.push(p.infill+' infill');if(p.prediction_text)v.push(p.prediction_text);else if(p.prediction)v.push(Math.max(1,Math.round(Number(p.prediction)/3600*10)/10)+' h');if(p.plates)v.push(p.plates+' plate'+(Number(p.plates)===1?'':'s'));if(p.rating!=null)v.push('Rating '+p.rating+(p.rating_count?' ('+p.rating_count+')':''));if(p.downloads!=null)v.push('Downloads '+compactNumber(p.downloads));if(p.size!=null)v.push(formatBytes(p.size));return v.join(' / ')}
@@ -5143,14 +5436,14 @@ orca.onMessage(function(msg){
     updateAuth(msg.states||{});renderCloudflare(msg.cloudflare);$('auth-submit').disabled=false;$('cf-submit').disabled=false;resetForgetButton();
     if($('cloudflare-modal').classList.contains('active')&&msg.action==='auth_changed')closeCloudflare();
     if(msg.action==='auth_changed'){
-      closeAuth();$('status').textContent=msg.message||'Account session updated.';
-      if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}
+      var resume=pendingImport;closeAuth();$('status').textContent=msg.message||'Account session updated.';
+      if(resume&&isAuthed(resume)){pendingImport=null;selectedModel=resume;doImport()}
       else if(selectedModel){prefetchMakerWorld(selectedModel)}
     }
   }else if(msg.action==='auth_challenge'){
     $('auth-submit').disabled=false;$('code-field').style.display='';$('status').textContent=msg.message||'Verification code required.';
   }else if(msg.action==='auth_required'){
-    $('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform);
+    importInFlight=false;$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer';$('status').textContent=msg.message||'Login required.';pendingImport=msg.model||selectedModel;openAuth(msg.platform);
   }else if(msg.action==='profile_prefetched'){
     cacheMakerWorldChoices(msg);
   }else if(msg.action==='profile_prefetch_failed'){
@@ -5174,7 +5467,7 @@ orca.onMessage(function(msg){
   }else if(msg.action==='error'){
     searching=false;$('search-btn').disabled=false;$('search-btn').textContent='Search';$('auth-submit').disabled=false;
     if($('load-more')){$('load-more').disabled=false;$('load-more').textContent='Load more from portals'}
-    if($('det-import-btn')){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer'}
+    importInFlight=false;if($('det-import-btn')){$('det-import-btn').disabled=false;$('det-import-btn').textContent='Import into OrcaSlicer'}
     if($('file-import'))$('file-import').disabled=false;
     if($('mw-import'))$('mw-import').disabled=false;
     $('status').textContent='Error: '+msg.message;
@@ -5220,6 +5513,7 @@ if orca is not None:
             self._detail_prefetch_inflight = set()
             self._login_lock = threading.RLock()
             self._login = None
+            self._login_epoch = None
 
         def get_name(self):
             return "Search 3D Models"
@@ -5245,8 +5539,13 @@ if orca is not None:
             self._stop_login()
 
         def _post(self, msg):
-            if self.win is not None and self.win.is_open():
-                self.win.post(msg)
+            # Read once: on_close() clears self.win from the UI thread while a
+            # dozen detached workers post, and re-reading the attribute between
+            # the check and the call let one of them raise AttributeError and
+            # unwind the whole task.
+            window = self.win
+            if window is not None and window.is_open():
+                window.post(msg)
 
         def _post_auth(self, action="auth_status", message=""):
             self._post(
@@ -5388,14 +5687,31 @@ if orca is not None:
             self._start(self._do_start_login, msg.get("platform", ""))
 
         def _handle_auth_cancel_login(self, _msg):
-            self._stop_login()
-            self._post({"action": "login_cancelled"})
+            # Only report a cancellation that actually happened. The interface
+            # closes the account modal on every auth change, so an
+            # unconditional reply made "Browser sign-in cancelled." the last
+            # status line after every successful connect.
+            if self._stop_login():
+                self._post({"action": "login_cancelled"})
 
         def _stop_login(self):
             with self._login_lock:
-                receiver, self._login = self._login, None
-            if receiver is not None:
-                receiver.stop()
+                return self._stop_login_locked()
+
+        def _stop_login_locked(self):
+            """Retire the current receiver. The caller must hold _login_lock.
+
+            Returns whether there was one, so callers can stay quiet when
+            there was nothing to cancel.
+            """
+            receiver, self._login = self._login, None
+            self._login_epoch = None
+            if receiver is None:
+                return False
+            # stop() marks the receiver used before closing the socket, so a
+            # submission already in flight cannot still store a token.
+            receiver.stop()
+            return True
 
         @staticmethod
         def _clearance_host(spec):
@@ -5414,7 +5730,11 @@ if orca is not None:
             here and the user does not have to repeat the exercise in the
             Cloudflare panel.
             """
-            token = CloudflareClearance.parse_cookie(value)
+            # named_only: the submitted value is a portal credential, not a
+            # clearance the user chose to paste. Only an explicit cf_clearance=
+            # pair may be adopted, or every bare bearer token would be stored a
+            # second time as a fake clearance and replayed as that cookie.
+            token = CloudflareClearance.parse_cookie(value, named_only=True)
             spec = _platform(platform)
             if not token or not user_agent or spec is None:
                 return ""
@@ -5429,7 +5749,11 @@ if orca is not None:
 
         def _store_login_credential(self, platform, value, user_agent=""):
             """Called from the loopback receiver once the user submits."""
-            self.auth.save_token(platform, value, label="Browser sign-in")
+            with self._login_lock:
+                epoch = self._login_epoch
+            # Refuses the write if the credential store was erased while the
+            # user was away in the browser.
+            self.auth.save_token(platform, value, label="Browser sign-in", epoch=epoch)
             host = self._adopt_clearance(platform, value, user_agent)
             with self._login_lock:
                 self._login = None
@@ -5448,11 +5772,19 @@ if orca is not None:
                     {"action": "error", "message": "This portal does not use a session."}
                 )
                 return
-            self._stop_login()
-            receiver = LoginReceiver(platform, self._store_login_credential)
-            try:
-                url = receiver.start()
-            except OSError as exc:
+            # Serialise the whole start: without this a double click races
+            # two _do_start_login workers past _stop_login, both bind a socket,
+            # and the second assignment orphans the first receiver where
+            # cancel, window close and the erase control can no longer reach it.
+            with self._login_lock:
+                self._stop_login_locked()
+                receiver = LoginReceiver(platform, self._store_login_credential)
+                try:
+                    url = receiver.start()
+                except OSError as exc:
+                    # `exc` is unbound once the except block ends.
+                    receiver, error = None, str(exc)
+            if receiver is None:
                 # A sandbox may refuse the loopback socket. Fall back to the
                 # existing paste flow rather than leaving the user stuck.
                 self._post(
@@ -5460,13 +5792,14 @@ if orca is not None:
                         "action": "error",
                         "message": (
                             "Could not open the local sign-in endpoint "
-                            f"({exc}). Use the token field instead."
+                            f"({error}). Use the token field instead."
                         ),
                     }
                 )
                 return
             with self._login_lock:
                 self._login = receiver
+                self._login_epoch = self.auth.store.epoch()
             if spec.login_url:
                 self._open_external(spec.login_url)
             self._open_external(url)
@@ -5530,9 +5863,12 @@ if orca is not None:
             platform = msg.get("platform", "")
             token = (msg.get("token") or "").strip()
             email = (msg.get("email") or "").strip()
+            # Captured before any network round-trip: a portal login can take
+            # tens of seconds, and the erase control stays clickable meanwhile.
+            epoch = self.auth.store.epoch()
             if token:
                 self.auth.save_token(
-                    platform, token, label=email or "Connected session"
+                    platform, token, label=email or "Connected session", epoch=epoch
                 )
                 return
             if platform == "makerworld":
@@ -5540,6 +5876,7 @@ if orca is not None:
                     email,
                     password=msg.get("password"),
                     code=(msg.get("code") or "").strip(),
+                    epoch=epoch,
                 )
                 return
             raise AuthError(self._token_login_error(platform))
@@ -5857,7 +6194,15 @@ if orca is not None:
                 if generation != self._search_generation:
                     self._release_detail_prefetch(generation, detail_candidates)
                     return
-                self._search_results = results
+                # `results` began as a snapshot taken before seconds of portal
+                # HTTP. The detail prefetch replaces entries by identity while
+                # that runs, so assigning the snapshot back would silently drop
+                # licences it had already fetched. Keep the live row wherever
+                # one exists and let this page contribute only what is new.
+                live = {_result_identity(item): item for item in self._search_results}
+                self._search_results = [
+                    live.get(_result_identity(item), item) for item in results
+                ]
                 self._search_pages = pages
                 self._search_stats = stats
                 self._search_loading_more = False
@@ -6153,6 +6498,8 @@ if orca is not None:
                             "name": item["name"],
                             "preview_url": item.get("preview_url", ""),
                             "size": item.get("size"),
+                            # Whether the picker pre-ticks this row.
+                            "selected": item.get("selected", True),
                         }
                         for i, item in enumerate(normalized)
                     ],

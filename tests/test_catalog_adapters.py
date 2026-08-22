@@ -4,6 +4,8 @@ import unittest
 import zipfile
 from unittest import mock
 
+import requests
+
 from tests._module_loader import PLUGIN_PATH, load_plugin
 
 mod = load_plugin("search_engine_catalog")
@@ -342,10 +344,17 @@ class CatalogSearchTests(unittest.TestCase):
             "totalPages": 75,
             "totalResults": 3733,
         }
-        with mock.patch("requests.get", return_value=FakeResponse(payload)) as get:
+        session = mock.Mock()
+        session.request.return_value = FakeResponse(payload)
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
             rows = mod.ThangsSearcher.search(
                 "cup", None, {"page": 2, "sort": "downloads"}
             )
+        get = session.request
 
         self.assertEqual(rows[0]["platform"], "Thangs")
         self.assertEqual(rows[0]["downloads"], 9649)
@@ -371,6 +380,9 @@ class CatalogSearchTests(unittest.TestCase):
             "https://production-api.thangs.com/search/v5/search-by-text",
         )
         self.assertEqual(get.call_args.kwargs["headers"]["Origin"], "https://thangs.com")
+        # Routed through AuthManager, so redirects are handled hop by hop.
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(get.call_args.args[1], mod.ThangsSearcher.SEARCH_URL)
 
     def test_thangs_cloudflare_challenge_retries_then_opens_browser(self):
         first = FakeResponse(
@@ -385,12 +397,16 @@ class CatalogSearchTests(unittest.TestCase):
             headers={"server": "cloudflare", "cf-mitigated": "challenge"},
             url=mod.ThangsSearcher.SEARCH_URL,
         )
+        session = mock.Mock()
+        session.request.side_effect = (first, second)
+        session.cookies = requests.cookies.cookiejar_from_dict({})
         with (
-            mock.patch("requests.get", side_effect=(first, second)) as get,
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
             self.assertRaises(mod.CloudflareChallenge) as raised,
         ):
             mod.ThangsSearcher.search("dragon", None)
-        self.assertEqual(get.call_count, 2)
+        self.assertEqual(session.request.call_count, 2)
         self.assertIn("/search/dragon", raised.exception.url)
 
     def test_thangs_download_resolver_normalization_is_strict(self):
@@ -438,10 +454,17 @@ class CatalogSearchTests(unittest.TestCase):
                 ],
             },
         }
-        with mock.patch("requests.post", return_value=FakeResponse(payload)) as post:
+        session = mock.Mock()
+        session.request.return_value = FakeResponse(payload)
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
             rows = mod.CrealityCloudSearcher.search(
                 "dragon cup", None, {"page": 2, "sort": "downloads"}
             )
+        post = session.request
         self.assertEqual(rows[0]["platform"], "Creality Cloud")
         self.assertEqual(rows[0]["name"], "DRAGON CUP")
         self.assertEqual(
@@ -514,7 +537,14 @@ class CatalogSearchTests(unittest.TestCase):
                 }
             ),
         ]
-        with mock.patch("requests.post", side_effect=responses) as post:
+        session = mock.Mock()
+        session.request.side_effect = responses
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
+            post = session.request
             files = mod.CrealityCloudSearcher.get_files(
                 {
                     "platform": "Creality Cloud",
@@ -550,6 +580,188 @@ class CatalogSearchTests(unittest.TestCase):
         }
         model.update(overrides)
         return {"per_page": 100, "total_entries": 742, "models": [model]}
+
+    def test_printables_maps_a_real_row(self):
+        payload = {
+            "data": {
+                "searchPrints2": {
+                    "items": [
+                        {
+                            "id": "1234",
+                            "name": "Calibration cube",
+                            "slug": "calibration-cube",
+                            "downloadCount": 4210,
+                            "likesCount": 318,
+                            "ratingAvg": 4.6,
+                            "datePublished": "2025-03-04T10:00:00Z",
+                            "image": {"filePath": "media/cube.png"},
+                            "license": {"name": "CC BY-SA"},
+                            "user": {"publicUsername": "cubemaker"},
+                        }
+                    ]
+                }
+            }
+        }
+        with mock.patch("requests.post", return_value=FakeResponse(payload)):
+            rows = mod.PrintablesSearcher.search("cube", None)
+        row = rows[0]
+        self.assertEqual(row["name"], "Calibration cube")
+        self.assertEqual(row["author"], "cubemaker")
+        self.assertEqual(row["platform"], "Printables")
+        self.assertEqual(row["url"], "https://www.printables.com/model/1234-calibration-cube")
+        self.assertEqual(row["thumbnail_url"], "https://media.printables.com/media/cube.png")
+        self.assertEqual(row["license"], "CC BY-SA")
+        self.assertEqual(row["downloads"], 4210)
+        self.assertEqual(row["likes"], 318)
+        self.assertEqual(row["rating"], 4.6)
+        self.assertEqual(row["published_at"], "2025-03-04T10:00:00Z")
+        self.assertFalse(row["requires_auth"])
+        self.assertTrue(row["is_free"])
+
+    def test_makerworld_maps_a_real_row(self):
+        payload = {
+            "hits": [
+                {
+                    "id": 55123,
+                    "title": "Hex organiser",
+                    "cover": "https://makerworld.bblmw.com/hex.png",
+                    "designCreator": {"name": "hexer"},
+                    "downloadCount": 900,
+                    "likeCount": 77,
+                    "license": "CC-BY",
+                }
+            ],
+            "total": 12,
+        }
+        with mock.patch("requests.get", return_value=FakeResponse(payload)):
+            rows = mod.MakerWorldSearcher.search("hex", None)
+        row = rows[0]
+        self.assertEqual(row["name"], "Hex organiser")
+        self.assertEqual(row["author"], "hexer")
+        self.assertEqual(row["platform"], "MakerWorld")
+        self.assertEqual(row["url"], "https://makerworld.com/en/models/55123")
+        self.assertEqual(row["_model_id"], 55123)
+        self.assertEqual(row["thumbnail_url"], "https://makerworld.bblmw.com/hex.png")
+        self.assertEqual(row["downloads"], 900)
+        self.assertTrue(row["requires_auth"])
+
+    def test_nexprint_maps_a_real_row(self):
+        payload = {
+            "code": 0,
+            "data": {
+                "pageResult": {
+                    "list": [
+                        {
+                            "modelId": "m-42",
+                            "modelName": "Filament clip",
+                            "authorName": "elegoo-fan",
+                            "coverImgUrl": "https://cdn.nexprint.com/clip.png",
+                            "licenseType": 0,
+                            "publishTime": "2026-01-05T08:00:00Z",
+                            "statistics": {"downloadCount": 51, "likeCount": 9},
+                            "price": 0,
+                        }
+                    ],
+                    "total": 1,
+                }
+            },
+        }
+        with mock.patch("requests.get", return_value=FakeResponse(payload)):
+            rows = mod.NexprintSearcher.search("clip", None)
+        row = rows[0]
+        self.assertEqual(row["name"], "Filament clip")
+        self.assertEqual(row["author"], "elegoo-fan")
+        self.assertEqual(row["platform"], "Nexprint")
+        self.assertEqual(row["thumbnail_url"], "https://cdn.nexprint.com/clip.png")
+        self.assertEqual(row["published_at"], "2026-01-05T08:00:00Z")
+        self.assertTrue(row["is_free"])
+
+    def test_makeronline_maps_a_real_row(self):
+        payload = {
+            "code": 0,
+            "data": {
+                "data": [
+                    {
+                        "mold_id": 771,
+                        "title": "Spool holder",
+                        "show_user_name": "anycubic-fan",
+                        "mold_image": "https://cdn.makeronline.com/spool.png",
+                        "target_url": "https://www.makeronline.com/model/771",
+                        "license": 0,
+                        "download_num": 33,
+                        "like_num": 4,
+                    }
+                ],
+                "total": 1,
+            },
+        }
+        with mock.patch("requests.post", return_value=FakeResponse(payload)):
+            rows = mod.MakeronlineSearcher.search("spool", None)
+        row = rows[0]
+        self.assertEqual(row["name"], "Spool holder")
+        self.assertEqual(row["author"], "anycubic-fan")
+        self.assertEqual(row["platform"], "Makeronline")
+        self.assertEqual(row["_mold_id"], 771)
+        self.assertEqual(row["downloads"], 33)
+        self.assertEqual(row["likes"], 4)
+
+    def test_youmagine_keeps_slug_designs_and_invents_none(self):
+        # The old pattern stopped at the first character outside [a-f0-9-].
+        # In the anchor pass that dropped real designs; in the JSON pass the
+        # partial match itself became the href, so "/designs/crawler-c23" was
+        # filed as a result named "c".
+        html = (
+            '<a href="/designs/skeeride-rc-snowmobile">Skeeride</a>'
+            '<a href="/designs/9f8e7d6c-1111-2222-3333-444455556666">UUID one</a>'
+            '{"url":"/designs/crawler-c23-body"}'
+        )
+        with mock.patch.object(
+            mod, "_fetch_html", return_value=(html, "https://youmagine.com/explore")
+        ):
+            rows = mod.YouMagineSearcher.search("rc", None)
+        urls = sorted(row["url"] for row in rows)
+        self.assertEqual(
+            urls,
+            [
+                "https://youmagine.com/designs/9f8e7d6c-1111-2222-3333-444455556666",
+                "https://youmagine.com/designs/crawler-c23-body",
+                "https://youmagine.com/designs/skeeride-rc-snowmobile",
+            ],
+        )
+        self.assertNotIn("https://youmagine.com/designs/c", urls)
+
+    def test_a_scraped_catalog_keeps_every_model_on_the_page(self):
+        # Cults3D returns 48 models in one response and has no second request
+        # to make, so capping at 30 discarded rows that were already parsed.
+        html = "".join(
+            f'<a href="/en/3d-model/tool/model-{index}">Model {index}</a>'
+            for index in range(48)
+        )
+        with mock.patch.object(
+            mod, "_fetch_html", return_value=(html, "https://cults3d.com/en/tags/x")
+        ):
+            rows = mod.Cults3DSearcher.search("x", None)
+        self.assertEqual(len(rows), 48)
+
+    def test_pinshape_takes_its_name_from_the_title_not_the_price_badge(self):
+        # The tile is one anchor whose visible text is the price and whose
+        # title attribute holds the real name.
+        html = (
+            '<a href="/items/15318-four-dragons-candlestick" '
+            'title="Four Dragons Candlestick">Free</a>'
+        )
+        with mock.patch.object(
+            mod, "_fetch_html", return_value=(html, "https://pinshape.com/items")
+        ):
+            rows = mod.PinshapeSearcher.search("dragon", None)
+        self.assertEqual(rows[0]["name"], "Four Dragons Candlestick")
+        self.assertTrue(rows[0]["is_free"])
+
+    def test_a_leading_item_id_is_not_part_of_the_name(self):
+        self.assertEqual(
+            mod._slug_title("https://pinshape.com/items/15318-four-dragons-candlestick"),
+            "four dragons candlestick",
+        )
 
     def test_grabcad_search_uses_json_api_without_a_session(self):
         payload = self._grabcad_payload()
@@ -869,6 +1081,51 @@ class DownloadResolverTests(unittest.TestCase):
         self.assertEqual(files[0]["preview_url"], "https://grabcad.com/pics/large.png")
         self.assertNotIn("_loadable", files[0])
 
+    def test_grabcad_folder_budget_is_spent_on_fetches_not_discoveries(self):
+        # A model that advertises more folders than the budget used to exhaust
+        # it during the very first listing and fetch none of them, so the more
+        # a model had to walk, the less got walked.
+        def listing(url, params=None, **kwargs):
+            folder_id = (params or {}).get("folder_id")
+            if folder_id is None:
+                return FakeResponse(
+                    {
+                        "folders": [
+                            {"id": index, "name": f"F{index}"} for index in range(1, 8)
+                        ],
+                        "files": [],
+                    }
+                )
+            return FakeResponse(
+                {
+                    "folders": [],
+                    "files": [
+                        {
+                            "name": f"part{folder_id}.stl",
+                            "extension": "stl",
+                            "download_url": (
+                                "https://grabcad.com/community/api/v1/models/x"
+                                f"/files/download?cadid={folder_id}"
+                            ),
+                        }
+                    ],
+                }
+            )
+
+        model = {"url": "https://grabcad.com/library/example-1", "_slug": "example-1"}
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("grabcad", "Cookie: sid=secret")
+            with mock.patch("requests.get", side_effect=listing) as get:
+                files = mod.GrabcadSearcher.get_files(model, auth)
+        fetched = [
+            call.kwargs["params"]["folder_id"]
+            for call in get.call_args_list
+            if call.kwargs.get("params")
+        ]
+        self.assertEqual(len(fetched), mod._GRABCAD_MAX_FOLDERS)
+        self.assertEqual(len(files), mod._GRABCAD_MAX_FOLDERS)
+
     def test_grabcad_model_without_files_offers_the_browser(self):
         listing = {"cached_slug": "example-1", "folders": [], "files": []}
         model = {"url": "https://grabcad.com/library/example-1", "_slug": "example-1"}
@@ -1084,7 +1341,11 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn("function paginationItems(page,total)", mod.PAGE)
         self.assertIn("window._results.slice(start,end)", mod.PAGE)
         self.assertIn("index=start+i", mod.PAGE)
-        self.assertIn("renderResults(window._results,false)", mod.PAGE)
+        # A background details message patches the one card it changed; it
+        # used to re-render the whole page, tearing down up to 300 cards and
+        # rebuilding the image observer once per prefetched result.
+        self.assertIn("function updateResultCard(index)", mod.PAGE)
+        self.assertNotIn("renderResults(window._results,false)", mod.PAGE)
 
     def test_search_results_support_server_side_pagination(self):
         self.assertIn('id="source-results"', mod.PAGE)

@@ -142,6 +142,43 @@ class SpeedDialActionTests(unittest.TestCase):
             self.assertEqual(second["sources"][0]["loaded"], 2)
             self.assertEqual(second["sources"][0]["visible"], 2)
 
+    def test_a_page_of_nothing_new_stops_offering_load_more(self):
+        # Some portals keep answering with the same rows past the last real
+        # page. Without the added-count check the interface offers "Load more"
+        # for ever and every press returns the same models.
+        module, _ = load_with_fake_orca()
+        action = module.SearchEngineScript()
+        action.win = FakeWindow()
+        row = {
+            "name": "Model 1",
+            "platform": "Printables",
+            "url": "https://www.printables.com/model/1",
+        }
+
+        def search(_query, _auth, _options):
+            # The portal always claims there is another page, and always
+            # serves the same row.
+            return module.SearchPage([dict(row)], total=99, has_more=True)
+
+        with mock.patch.object(
+            module.PrintablesSearcher, "search", side_effect=search
+        ):
+            action._search_generation = 1
+            action._do_search(
+                {"query": "cube", "platforms": ["printables"], "options": {}}, 1
+            )
+            self.assertTrue(action.win.posts[-1]["can_load_more"])
+
+            action._do_search_more(1)
+
+        last = action.win.posts[-1]
+        self.assertEqual(len(last["results"]), 1, "the duplicate must not be added")
+        self.assertFalse(
+            last["sources"][0]["has_more"],
+            "a page that added nothing is the last page",
+        )
+        self.assertFalse(last["can_load_more"])
+
     def test_selected_portals_search_concurrently_but_merge_in_order(self):
         module, _ = load_with_fake_orca()
         action = module.SearchEngineScript()

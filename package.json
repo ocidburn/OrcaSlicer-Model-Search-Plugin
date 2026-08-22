@@ -1,0 +1,12 @@
+{
+  "name": "orcaslicer-model-search-plugin-ui-tests",
+  "private": true,
+  "description": "Behavioural tests for the WebView interface embedded in src/search_engine.py",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/ui/*.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

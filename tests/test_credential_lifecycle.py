@@ -16,6 +16,8 @@ import types
 import unittest
 from unittest import mock
 
+import requests
+
 from tests._module_loader import load_plugin
 
 mod = load_plugin("search_engine_credentials")
@@ -272,6 +274,104 @@ class DownloadRefusalTests(StoreFixture):
         self.assertIsNone(mod._probe_result(cdn, "cults3d"))
         with self.assertRaises(mod.AuthRequired):
             mod._probe_result(portal, "cults3d")
+
+
+class SessionLifetimeTests(StoreFixture):
+    def test_a_session_this_call_opened_is_closed_again(self):
+        auth = self.auth()
+        auth.save_token("thingiverse", "token")
+        session = mock.Mock()
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        session.request.return_value = DownloadRefusalTests.Response(
+            200, "https://api.thingiverse.com/things"
+        )
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
+            auth.request("thingiverse", "GET", "https://api.thingiverse.com/things")
+        session.close.assert_called_once_with()
+
+    def test_a_streaming_call_keeps_its_connection(self):
+        auth = self.auth()
+        auth.save_token("thingiverse", "token")
+        session = mock.Mock()
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        session.request.return_value = DownloadRefusalTests.Response(
+            200, "https://api.thingiverse.com/f.zip"
+        )
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
+            auth.request(
+                "thingiverse", "GET", "https://api.thingiverse.com/f.zip", stream=True
+            )
+        session.close.assert_not_called()
+
+    def test_a_session_the_caller_owns_is_left_alone(self):
+        auth = self.auth()
+        auth.save_token("thingiverse", "token")
+        session = mock.Mock()
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        session.request.return_value = DownloadRefusalTests.Response(
+            200, "https://api.thingiverse.com/things"
+        )
+        with mock.patch.object(mod, "_reject_obvious_local_target"):
+            auth.request(
+                "thingiverse",
+                "GET",
+                "https://api.thingiverse.com/things",
+                session=session,
+            )
+        session.close.assert_not_called()
+
+
+class CancelReportingTests(StoreFixture):
+    def test_cancelling_nothing_reports_nothing(self):
+        script = load_script_module()
+        action = script.SearchEngineScript()
+        action.auth = self.auth()
+        posts = []
+        action._post = posts.append
+
+        action._handle_auth_cancel_login({})
+
+        self.assertEqual(
+            posts,
+            [],
+            "the interface closes the modal on every auth change, so an "
+            "unconditional reply overwrote every success message",
+        )
+
+    def test_cancelling_a_real_sign_in_is_reported(self):
+        script = load_script_module()
+        action = script.SearchEngineScript()
+        action.auth = self.auth()
+        posts = []
+        action._post = posts.append
+        action._login = mod.LoginReceiver("thingiverse", lambda *args: None)
+
+        action._handle_auth_cancel_login({})
+
+        self.assertEqual([post["action"] for post in posts], ["login_cancelled"])
+
+
+@unittest.skipUnless(os.name == "nt", "Windows ACL behaviour")
+class WindowsPermissionTests(unittest.TestCase):
+    def test_the_credential_directory_is_restricted_to_this_user(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as td:
+            folder = os.path.join(td, "store")
+            mod._ensure_private_dir(folder)
+            listing = subprocess.run(
+                ["icacls", folder], capture_output=True, text=True, check=False
+            ).stdout
+        # Inheritance is broken and only the current account is granted, so
+        # the file does not simply inherit whatever the parent allowed.
+        self.assertNotIn("BUILTIN\\Users", listing)
+        self.assertIn(os.environ["USERNAME"], listing)
 
 
 class FilePickerSelectionTests(unittest.TestCase):

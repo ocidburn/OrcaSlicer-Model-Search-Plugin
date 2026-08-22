@@ -134,8 +134,50 @@ def _auth_file():
     return os.path.join(_orca_data_dir(), "model_search_auth", "sessions.json")
 
 
+_RESTRICTED_DIRS = set()
+
+
+def _restrict_windows_dir(path):
+    """Hand the current user sole access to a directory on Windows.
+
+    os.chmod only toggles the read-only attribute there: for mode 0o700 it
+    clears that flag, returns successfully, and never touches the ACL -- so the
+    credential file silently inherited whatever its parent allowed, and the
+    OSError fallback could not fire because nothing failed. icacls is the only
+    way to set a real ACL without leaving the standard library.
+    """
+    user = os.environ.get("USERNAME") or ""
+    if not user:
+        return False
+    try:
+        completed = subprocess.run(  # nosec B603 B607
+            [
+                "icacls",
+                path,
+                "/inheritance:r",
+                "/grant:r",
+                f"{user}:(OI)(CI)F",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
 def _ensure_private_dir(path):
     os.makedirs(path, exist_ok=True)
+    if os.name == "nt":
+        # Once per directory: this runs before every credential write and
+        # every download, and the ACL does not need reapplying each time.
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in _RESTRICTED_DIRS:
+            _restrict_windows_dir(path)
+            _RESTRICTED_DIRS.add(key)
+        return
     try:
         os.chmod(path, 0o700)
     except OSError:
@@ -564,8 +606,9 @@ def _display_name(key):
 class AuthStore:
     """Small token-only credential store.
 
-    Passwords are never persisted.  The file lives below Orca's data directory
-    and is written with restrictive permissions where the OS supports them.
+    Passwords are never persisted.  The file lives below Orca's data directory,
+    whose access is narrowed to the current user: a POSIX mode on Unix, and an
+    explicit ACL on Windows, where chmod cannot express one.
     """
 
     # One lock per credential file, shared by every AuthStore opened over it.
@@ -1554,11 +1597,26 @@ class AuthManager:
 
     def request(self, platform, method, url, session=None, **kwargs):
         """Request a URL while rebuilding scoped auth headers after every redirect."""
-        import requests
-
         if not _is_http_url(url):
             raise ValueError("Refusing non-HTTP URL")
+        # Mirrors what requests' own module-level helpers do: a session this
+        # call opened is closed again on the way out, unless the caller is
+        # streaming the body and still needs the connection. Leaving it open
+        # cost a connection per Thingiverse and MyMiniFactory request.
+        borrowed = session is not None
         session = session or self.session(platform)
+        close_session = not borrowed and not kwargs.get("stream")
+        try:
+            return self._request_following_redirects(
+                platform, method, url, session, kwargs
+            )
+        finally:
+            if close_session:
+                session.close()
+
+    def _request_following_redirects(self, platform, method, url, session, kwargs):
+        import requests
+
         supplied = dict(kwargs.pop("headers", {}) or {})
         for name in tuple(supplied):
             if name.lower() in ("authorization", "cookie", "xx-token"):
@@ -4155,15 +4213,33 @@ class CrealityCloudSearcher:
     def _post(path, body, auth=None, *, requires_auth=False):
         import requests
 
-        response = requests.post(
-            CrealityCloudSearcher.API_BASE + path,
-            json=body,
-            headers=CrealityCloudSearcher._headers(auth),
-            timeout=30,
-            allow_redirects=False,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        manager = auth if isinstance(auth, AuthManager) else AuthManager()
+        url = CrealityCloudSearcher.API_BASE + path
+        session = requests.Session()
+        try:
+            # Routed through AuthManager so a clearance stored for this host is
+            # attached; calling requests.post directly left one inert and let a
+            # Cloudflare 403 surface as a bare HTTPError the panel never
+            # offered to fix.
+            response = manager.request(
+                "crealitycloud",
+                "POST",
+                url,
+                session=session,
+                json=body,
+                headers=CrealityCloudSearcher._headers(auth),
+                timeout=30,
+                allow_redirects=False,
+            )
+            try:
+                if _is_cloudflare_challenge(response):
+                    raise _cloudflare_challenge(url, manager, host=_url_host(url))
+                response.raise_for_status()
+                payload = response.json()
+            finally:
+                response.close()
+        finally:
+            session.close()
         if not isinstance(payload, dict):
             raise TypeError("Creality Cloud returned an invalid API response")
         code = _number(payload.get("code"), integer=True)
@@ -5587,21 +5663,31 @@ if orca is not None:
             self._start(self._do_start_login, msg.get("platform", ""))
 
         def _handle_auth_cancel_login(self, _msg):
-            self._stop_login()
-            self._post({"action": "login_cancelled"})
+            # Only report a cancellation that actually happened. The interface
+            # closes the account modal on every auth change, so an
+            # unconditional reply made "Browser sign-in cancelled." the last
+            # status line after every successful connect.
+            if self._stop_login():
+                self._post({"action": "login_cancelled"})
 
         def _stop_login(self):
             with self._login_lock:
-                self._stop_login_locked()
+                return self._stop_login_locked()
 
         def _stop_login_locked(self):
-            """Retire the current receiver. The caller must hold _login_lock."""
+            """Retire the current receiver. The caller must hold _login_lock.
+
+            Returns whether there was one, so callers can stay quiet when
+            there was nothing to cancel.
+            """
             receiver, self._login = self._login, None
             self._login_epoch = None
-            if receiver is not None:
-                # stop() marks the receiver used before closing the socket, so
-                # a submission already in flight cannot still store a token.
-                receiver.stop()
+            if receiver is None:
+                return False
+            # stop() marks the receiver used before closing the socket, so a
+            # submission already in flight cannot still store a token.
+            receiver.stop()
+            return True
 
         @staticmethod
         def _clearance_host(spec):

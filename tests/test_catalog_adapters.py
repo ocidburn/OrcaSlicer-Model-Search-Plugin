@@ -454,10 +454,17 @@ class CatalogSearchTests(unittest.TestCase):
                 ],
             },
         }
-        with mock.patch("requests.post", return_value=FakeResponse(payload)) as post:
+        session = mock.Mock()
+        session.request.return_value = FakeResponse(payload)
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
             rows = mod.CrealityCloudSearcher.search(
                 "dragon cup", None, {"page": 2, "sort": "downloads"}
             )
+        post = session.request
         self.assertEqual(rows[0]["platform"], "Creality Cloud")
         self.assertEqual(rows[0]["name"], "DRAGON CUP")
         self.assertEqual(
@@ -530,7 +537,14 @@ class CatalogSearchTests(unittest.TestCase):
                 }
             ),
         ]
-        with mock.patch("requests.post", side_effect=responses) as post:
+        session = mock.Mock()
+        session.request.side_effect = responses
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
+            post = session.request
             files = mod.CrealityCloudSearcher.get_files(
                 {
                     "platform": "Creality Cloud",

@@ -64,10 +64,10 @@ def load_module():
 
 
 class ImportHandoffTests(unittest.TestCase):
-    def test_non_windows_handoff_does_not_use_invalid_single_instance_cli_flag(self):
+    def _posix_handoff(self, returncode, stderr=""):
         mod = load_module()
         with tempfile.NamedTemporaryFile(suffix=".stl") as fh:
-            completed = types.SimpleNamespace(returncode=0, stderr="")
+            completed = types.SimpleNamespace(returncode=returncode, stderr=stderr)
             with (
                 mock.patch.object(
                     mod, "_current_orca_executable", return_value="/opt/OrcaSlicer"
@@ -76,12 +76,51 @@ class ImportHandoffTests(unittest.TestCase):
                 mock.patch.object(mod.subprocess, "run", return_value=completed) as run,
             ):
                 ok, detail = mod._load_in_orca([fh.name])
+        return ok, detail, run.call_args.args[0], os.path.abspath(fh.name)
+
+    def test_non_windows_handoff_asks_for_the_single_instance_forward(self):
+        # OrcaSlicer defaults single_instance to false and only arms the
+        # forward when the flag is on the command line. Without it the spawned
+        # process opens a second window and the paths never reach the project.
+        ok, detail, argv, path = self._posix_handoff(0)
         self.assertTrue(ok)
         self.assertEqual(detail, "")
-        argv = run.call_args.args[0]
         self.assertEqual(argv[0], "/opt/OrcaSlicer")
-        self.assertNotIn("--single-instance", argv)
-        self.assertEqual(argv[1], os.path.abspath(fh.name))
+        self.assertIn("--single-instance", argv)
+        self.assertEqual(argv[-1], path)
+
+    def test_a_successful_forward_exits_255_and_is_not_an_error(self):
+        # The branch that forwards and exits returns -1, which POSIX reports
+        # as 255. Treating that as a failure told users an import they could
+        # see on the plater had failed.
+        ok, detail, _argv, _path = self._posix_handoff(255)
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+
+    def test_a_signal_killed_handoff_is_still_a_failure(self):
+        ok, detail, _argv, _path = self._posix_handoff(-9)
+        self.assertFalse(ok)
+        self.assertIn("-9", detail)
+
+    def test_a_genuine_orca_error_is_reported(self):
+        ok, detail, _argv, _path = self._posix_handoff(1, stderr="GUI init failed")
+        self.assertFalse(ok)
+        self.assertEqual(detail, "GUI init failed")
+
+    def test_a_handoff_that_hangs_explains_the_second_window(self):
+        mod = load_module()
+        with tempfile.NamedTemporaryFile(suffix=".stl") as fh:
+            timeout = mod.subprocess.TimeoutExpired(cmd="orca", timeout=20)
+            with (
+                mock.patch.object(
+                    mod, "_current_orca_executable", return_value="/opt/OrcaSlicer"
+                ),
+                mock.patch.object(mod.os, "name", "posix"),
+                mock.patch.object(mod.subprocess, "run", side_effect=timeout),
+            ):
+                ok, detail = mod._load_in_orca([fh.name])
+        self.assertFalse(ok)
+        self.assertIn("second window", detail)
 
     def test_windows_handoff_uses_native_ipc_without_spawning_orca(self):
         mod = load_module()

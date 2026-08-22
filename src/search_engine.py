@@ -4928,14 +4928,29 @@ def _send_windows_instance_message(executable, paths):
         return False, f"Windows OrcaSlicer import handoff failed: {exc}"
 
 
+# Exit codes that mean the running OrcaSlicer accepted the files: 0, and the
+# 255 that POSIX makes of the -1 its forwarding branch returns.
+_ORCA_HANDOFF_OK = frozenset({0, 255})
+
+
 def _load_in_orca(paths):
     """Import local files into the already-open OrcaSlicer project.
 
     On Windows, send OrcaSlicer's native WM_COPYDATA single-instance message
     directly to the current main window. This avoids depending on CLI options
-    that differ between OrcaSlicer releases. On macOS/Linux, start OrcaSlicer
-    with only the file paths and let its configured single-instance handler
-    forward them to the running plater.
+    that differ between OrcaSlicer releases.
+
+    On macOS/Linux the paths are handed to a short-lived OrcaSlicer process
+    that forwards them to the running plater. Two details of that contract are
+    easy to get wrong and both leave the user with a failed import:
+
+    * The forwarding is opt-in. OrcaSlicer defaults `single_instance` to false,
+      and its command line only arms the hand-off when the flag is present, so
+      without `--single-instance` the process opens a second GUI instead and
+      the paths never reach the project the user is working in.
+    * A successful forward exits non-zero. OrcaSlicer returns -1 from the
+      branch that forwards and exits, which POSIX reports as status 255, so
+      that is the code meaning "the model arrived".
     """
     normalized = []
     for path in paths:
@@ -4955,16 +4970,23 @@ def _load_in_orca(paths):
 
     try:
         proc = subprocess.run(  # nosec B603
-            [executable, *normalized],
+            [executable, "--single-instance", *normalized],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
             timeout=20,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        return False, (
+            "OrcaSlicer did not take the files within 20 seconds. It may have "
+            "opened a second window instead of adding them to this project."
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"OrcaSlicer import handoff failed: {exc}"
-    if proc.returncode != 0:
+    # 255 is the truncated -1 the forwarding branch returns; a signal-killed
+    # child reports a negative code and is still a failure.
+    if proc.returncode not in _ORCA_HANDOFF_OK:
         detail = (proc.stderr or "").strip().replace("\n", " ")[:400]
         return False, detail or f"OrcaSlicer handoff exited with code {proc.returncode}"
     return True, ""

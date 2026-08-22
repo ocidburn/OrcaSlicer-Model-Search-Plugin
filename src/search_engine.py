@@ -6474,6 +6474,8 @@ if orca is not None:
                             "name": item["name"],
                             "preview_url": item.get("preview_url", ""),
                             "size": item.get("size"),
+                            # Whether the picker pre-ticks this row.
+                            "selected": item.get("selected", True),
                         }
                         for i, item in enumerate(normalized)
                     ],

@@ -200,6 +200,25 @@ class MultiFileSelectionTests(unittest.TestCase):
         self.assertEqual(msg["files"][0]["size"], 1024)
         self.assertEqual(msg["files"][1]["preview_url"], "")
 
+    def test_the_picker_is_told_which_rows_to_pre_tick(self):
+        mod, action = self.make_action()
+        model = {"platform": "Printables", "name": "Assembly", "requires_auth": False}
+        files = [
+            {"name": "body.stl", "url": "https://cdn.example/body.stl"},
+            {"name": "drawing.pdf", "url": "https://cdn.example/drawing.pdf"},
+            {"name": "part.SLDPRT", "url": "https://cdn.example/part.SLDPRT"},
+        ]
+        with mock.patch.object(
+            mod._PLATFORMS["printables"].adapter, "get_files", return_value=files
+        ):
+            action._resolve_import(model)
+        msg = action.win.posts[-1]
+        self.assertEqual(msg["action"], "file_choices")
+        self.assertEqual(
+            {item["name"]: item["selected"] for item in msg["files"]},
+            {"body.stl": True, "drawing.pdf": False, "part.SLDPRT": False},
+        )
+
     def test_single_resolved_file_imports_immediately(self):
         mod, action = self.make_action()
         model = {"platform": "Printables", "name": "Demo", "requires_auth": False}

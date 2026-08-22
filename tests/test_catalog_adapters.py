@@ -581,6 +581,130 @@ class CatalogSearchTests(unittest.TestCase):
         model.update(overrides)
         return {"per_page": 100, "total_entries": 742, "models": [model]}
 
+    def test_printables_maps_a_real_row(self):
+        payload = {
+            "data": {
+                "searchPrints2": {
+                    "items": [
+                        {
+                            "id": "1234",
+                            "name": "Calibration cube",
+                            "slug": "calibration-cube",
+                            "downloadCount": 4210,
+                            "likesCount": 318,
+                            "ratingAvg": 4.6,
+                            "datePublished": "2025-03-04T10:00:00Z",
+                            "image": {"filePath": "media/cube.png"},
+                            "license": {"name": "CC BY-SA"},
+                            "user": {"publicUsername": "cubemaker"},
+                        }
+                    ]
+                }
+            }
+        }
+        with mock.patch("requests.post", return_value=FakeResponse(payload)):
+            rows = mod.PrintablesSearcher.search("cube", None)
+        row = rows[0]
+        self.assertEqual(row["name"], "Calibration cube")
+        self.assertEqual(row["author"], "cubemaker")
+        self.assertEqual(row["platform"], "Printables")
+        self.assertEqual(row["url"], "https://www.printables.com/model/1234-calibration-cube")
+        self.assertEqual(row["thumbnail_url"], "https://media.printables.com/media/cube.png")
+        self.assertEqual(row["license"], "CC BY-SA")
+        self.assertEqual(row["downloads"], 4210)
+        self.assertEqual(row["likes"], 318)
+        self.assertEqual(row["rating"], 4.6)
+        self.assertEqual(row["published_at"], "2025-03-04T10:00:00Z")
+        self.assertFalse(row["requires_auth"])
+        self.assertTrue(row["is_free"])
+
+    def test_makerworld_maps_a_real_row(self):
+        payload = {
+            "hits": [
+                {
+                    "id": 55123,
+                    "title": "Hex organiser",
+                    "cover": "https://makerworld.bblmw.com/hex.png",
+                    "designCreator": {"name": "hexer"},
+                    "downloadCount": 900,
+                    "likeCount": 77,
+                    "license": "CC-BY",
+                }
+            ],
+            "total": 12,
+        }
+        with mock.patch("requests.get", return_value=FakeResponse(payload)):
+            rows = mod.MakerWorldSearcher.search("hex", None)
+        row = rows[0]
+        self.assertEqual(row["name"], "Hex organiser")
+        self.assertEqual(row["author"], "hexer")
+        self.assertEqual(row["platform"], "MakerWorld")
+        self.assertEqual(row["url"], "https://makerworld.com/en/models/55123")
+        self.assertEqual(row["_model_id"], 55123)
+        self.assertEqual(row["thumbnail_url"], "https://makerworld.bblmw.com/hex.png")
+        self.assertEqual(row["downloads"], 900)
+        self.assertTrue(row["requires_auth"])
+
+    def test_nexprint_maps_a_real_row(self):
+        payload = {
+            "code": 0,
+            "data": {
+                "pageResult": {
+                    "list": [
+                        {
+                            "modelId": "m-42",
+                            "modelName": "Filament clip",
+                            "authorName": "elegoo-fan",
+                            "coverImgUrl": "https://cdn.nexprint.com/clip.png",
+                            "licenseType": 0,
+                            "publishTime": "2026-01-05T08:00:00Z",
+                            "statistics": {"downloadCount": 51, "likeCount": 9},
+                            "price": 0,
+                        }
+                    ],
+                    "total": 1,
+                }
+            },
+        }
+        with mock.patch("requests.get", return_value=FakeResponse(payload)):
+            rows = mod.NexprintSearcher.search("clip", None)
+        row = rows[0]
+        self.assertEqual(row["name"], "Filament clip")
+        self.assertEqual(row["author"], "elegoo-fan")
+        self.assertEqual(row["platform"], "Nexprint")
+        self.assertEqual(row["thumbnail_url"], "https://cdn.nexprint.com/clip.png")
+        self.assertEqual(row["published_at"], "2026-01-05T08:00:00Z")
+        self.assertTrue(row["is_free"])
+
+    def test_makeronline_maps_a_real_row(self):
+        payload = {
+            "code": 0,
+            "data": {
+                "data": [
+                    {
+                        "mold_id": 771,
+                        "title": "Spool holder",
+                        "show_user_name": "anycubic-fan",
+                        "mold_image": "https://cdn.makeronline.com/spool.png",
+                        "target_url": "https://www.makeronline.com/model/771",
+                        "license": 0,
+                        "download_num": 33,
+                        "like_num": 4,
+                    }
+                ],
+                "total": 1,
+            },
+        }
+        with mock.patch("requests.post", return_value=FakeResponse(payload)):
+            rows = mod.MakeronlineSearcher.search("spool", None)
+        row = rows[0]
+        self.assertEqual(row["name"], "Spool holder")
+        self.assertEqual(row["author"], "anycubic-fan")
+        self.assertEqual(row["platform"], "Makeronline")
+        self.assertEqual(row["_mold_id"], 771)
+        self.assertEqual(row["downloads"], 33)
+        self.assertEqual(row["likes"], 4)
+
     def test_youmagine_keeps_slug_designs_and_invents_none(self):
         # The old pattern stopped at the first character outside [a-f0-9-].
         # In the anchor pass that dropped real designs; in the JSON pass the

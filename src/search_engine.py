@@ -1814,6 +1814,8 @@ def _slug_title(url):
         urllib.parse.urlsplit(url).path.rstrip("/").split("/")[-1]
     )
     path = re.sub(r"-\d+$", "", path)
+    # Some catalogs put the item id in front of the slug, not behind it.
+    path = re.sub(r"^\d+[-_]", "", path)
     path = re.sub(r"[-_]+", " ", path).strip()
     return path[:120] or "Untitled"
 
@@ -1944,13 +1946,22 @@ def _looks_like_login_page(raw, platform=""):
     return False
 
 
-def _extract_catalog_models(raw, base_url, path_pattern, platform, limit=30):
+# These catalogs are scraped from one page and have no second request to make,
+# so a low cap simply throws away rows that are already parsed -- Cults3D
+# returns 48 models in a single response. The bound is kept only so a
+# pathological page cannot flood the interface.
+_CATALOG_PAGE_LIMIT = 200
+
+
+def _extract_catalog_models(
+    raw, base_url, path_pattern, platform, limit=_CATALOG_PAGE_LIMIT
+):
     parser = _parse_catalog_html(raw)
     regex = re.compile(path_pattern, re.IGNORECASE)
     found = []
     seen = set()
 
-    def add(href, title="", img=""):
+    def add(href, title="", img="", title_attr=""):
         href = _decode_embedded_url(href)
         if not href:
             return
@@ -1967,6 +1978,9 @@ def _extract_catalog_models(raw, base_url, path_pattern, platform, limit=30):
         found.append(
             {
                 "name": _clean_web_text(title) or _slug_title(canonical),
+                # Some catalogs wrap the tile in one anchor whose visible text
+                # is a price badge and whose title attribute is the real name.
+                "_title_attr": _clean_web_text(title_attr),
                 "author": "Unknown",
                 "platform": platform,
                 "thumbnail_url": urllib.parse.urljoin(
@@ -1990,6 +2004,7 @@ def _extract_catalog_models(raw, base_url, path_pattern, platform, limit=30):
             a.get("href"),
             a.get("text") or a.get("title") or a.get("aria"),
             a.get("img"),
+            a.get("title") or a.get("aria"),
         )
         if len(found) >= limit:
             return found
@@ -3917,6 +3932,7 @@ class ThangsSearcher:
         import requests
 
         manager = auth if isinstance(auth, AuthManager) else AuthManager()
+        session = requests.Session()
 
         def request(user_agent):
             headers = {
@@ -3925,36 +3941,47 @@ class ThangsSearcher:
                 "Origin": ThangsSearcher.BASE,
                 "Referer": ThangsSearcher.BASE + "/",
             }
+            # Routed through AuthManager so this call gets the same policy as
+            # every other: the SSRF guard runs on each redirect hop, the
+            # clearance cookie is pinned to the host that earned it instead of
+            # following a 3xx anywhere, and the redirect chain is bounded.
             # A stored clearance pins its own User-Agent; that is deliberate.
-            cookies = manager.clearance.apply(ThangsSearcher.SEARCH_URL, headers)
-            return requests.get(
+            return manager.request(
+                "thangs",
+                "GET",
                 ThangsSearcher.SEARCH_URL,
+                session=session,
                 params=params,
                 headers=headers,
-                cookies=cookies,
                 timeout=30,
             )
 
-        response = request(_BROWSER_UA)
-        if _is_cloudflare_challenge(response):
-            response.close()
-            response = request(_STANDARD_BROWSER_UA)
+        try:
+            response = request(_BROWSER_UA)
             if _is_cloudflare_challenge(response):
                 response.close()
-                raise _cloudflare_challenge(
-                    ThangsSearcher._browser_url(query),
-                    manager,
-                    host=_url_host(ThangsSearcher.SEARCH_URL),
-                    detail=(
-                        "The official Thangs API is asking for a Cloudflare "
-                        "browser check. Open Thangs, complete the verification "
-                        "yourself, then add the cf_clearance cookie and your "
-                        "browser User-Agent for "
-                        f"{_url_host(ThangsSearcher.SEARCH_URL)}."
-                    ),
-                )
-        response.raise_for_status()
-        return response.json()
+                response = request(_STANDARD_BROWSER_UA)
+                if _is_cloudflare_challenge(response):
+                    response.close()
+                    raise _cloudflare_challenge(
+                        ThangsSearcher._browser_url(query),
+                        manager,
+                        host=_url_host(ThangsSearcher.SEARCH_URL),
+                        detail=(
+                            "The official Thangs API is asking for a Cloudflare "
+                            "browser check. Open Thangs, complete the verification "
+                            "yourself, then add the cf_clearance cookie and your "
+                            "browser User-Agent for "
+                            f"{_url_host(ThangsSearcher.SEARCH_URL)}."
+                        ),
+                    )
+            try:
+                response.raise_for_status()
+                return response.json()
+            finally:
+                response.close()
+        finally:
+            session.close()
 
     @staticmethod
     def search(query, context, options=None):
@@ -4579,7 +4606,7 @@ class GrabcadSearcher:
 class YouMagineSearcher:
     BASE = "https://youmagine.com"
     SEARCH_URLS = (BASE + "/explore?query={query}",)
-    PATH_RE = r"/designs/[a-f0-9-]+"
+    PATH_RE = r"/designs/[a-z0-9%._~+()-]+"
 
     @staticmethod
     def search(query, context, options=None):
@@ -4611,7 +4638,9 @@ class PinshapeSearcher:
         for item in items:
             price_label = item.get("name", "").casefold()
             if price_label in ("free", "premium"):
-                item["name"] = _slug_title(item.get("url", ""))
+                item["name"] = item.get("_title_attr") or _slug_title(
+                    item.get("url", "")
+                )
             item["direct_import"] = price_label == "free"
             item["is_free"] = (
                 True if price_label == "free" else False if price_label == "premium" else None

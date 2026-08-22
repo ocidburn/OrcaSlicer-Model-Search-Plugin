@@ -316,17 +316,30 @@ class ChallengeReportingTests(unittest.TestCase):
             )
             auth.clearance.save("thangs.com", "cf_clearance=abc", "Mozilla/5.0 Real")
             captured = {}
+            session = requests.Session()
 
-            def fake_get(url, **kwargs):
+            def fake_request(method, url, **kwargs):
                 captured["headers"] = dict(kwargs.get("headers") or {})
-                captured["cookies"] = dict(kwargs.get("cookies") or {})
+                captured["jar"] = [
+                    (cookie.name, cookie.value, cookie.domain)
+                    for cookie in session.cookies
+                ]
                 return FakeResponse(url=url)
 
-            with mock.patch("requests.get", side_effect=fake_get):
+            with (
+                mock.patch("requests.Session", return_value=session),
+                mock.patch.object(session, "request", side_effect=fake_request),
+                mock.patch.object(mod, "_reject_obvious_local_target"),
+            ):
                 mod.ThangsSearcher._request({"searchTerm": "x"}, "x", auth)
 
-            self.assertEqual(captured["cookies"], {"cf_clearance": "abc"})
             self.assertEqual(captured["headers"]["User-Agent"], "Mozilla/5.0 Real")
+            # Scoped to the host that earned it, not a bare dict that
+            # http.cookiejar would replay to any redirect target.
+            self.assertEqual(
+                captured["jar"],
+                [("cf_clearance", "abc", "production-api.thangs.com")],
+            )
 
     def test_thangs_challenge_points_at_the_page_but_names_the_api_host(self):
         with tempfile.TemporaryDirectory() as td:
@@ -334,11 +347,14 @@ class ChallengeReportingTests(unittest.TestCase):
                 mod.AuthStore(os.path.join(td, "sessions.json"))
             )
             api_url = mod.ThangsSearcher.SEARCH_URL
+            session = mock.Mock()
+            session.cookies = requests.cookies.cookiejar_from_dict({})
+            session.request.side_effect = (
+                lambda method, url, **kwargs: challenge_response(api_url)
+            )
             with (
-                mock.patch(
-                    "requests.get",
-                    side_effect=lambda url, **kwargs: challenge_response(api_url),
-                ),
+                mock.patch("requests.Session", return_value=session),
+                mock.patch.object(mod, "_reject_obvious_local_target"),
                 self.assertRaises(mod.CloudflareChallenge) as raised,
             ):
                 mod.ThangsSearcher._request({"searchTerm": "x"}, "benchy", auth)

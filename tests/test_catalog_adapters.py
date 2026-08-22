@@ -4,6 +4,8 @@ import unittest
 import zipfile
 from unittest import mock
 
+import requests
+
 from tests._module_loader import PLUGIN_PATH, load_plugin
 
 mod = load_plugin("search_engine_catalog")
@@ -342,10 +344,17 @@ class CatalogSearchTests(unittest.TestCase):
             "totalPages": 75,
             "totalResults": 3733,
         }
-        with mock.patch("requests.get", return_value=FakeResponse(payload)) as get:
+        session = mock.Mock()
+        session.request.return_value = FakeResponse(payload)
+        session.cookies = requests.cookies.cookiejar_from_dict({})
+        with (
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
+        ):
             rows = mod.ThangsSearcher.search(
                 "cup", None, {"page": 2, "sort": "downloads"}
             )
+        get = session.request
 
         self.assertEqual(rows[0]["platform"], "Thangs")
         self.assertEqual(rows[0]["downloads"], 9649)
@@ -371,6 +380,9 @@ class CatalogSearchTests(unittest.TestCase):
             "https://production-api.thangs.com/search/v5/search-by-text",
         )
         self.assertEqual(get.call_args.kwargs["headers"]["Origin"], "https://thangs.com")
+        # Routed through AuthManager, so redirects are handled hop by hop.
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(get.call_args.args[1], mod.ThangsSearcher.SEARCH_URL)
 
     def test_thangs_cloudflare_challenge_retries_then_opens_browser(self):
         first = FakeResponse(
@@ -385,12 +397,16 @@ class CatalogSearchTests(unittest.TestCase):
             headers={"server": "cloudflare", "cf-mitigated": "challenge"},
             url=mod.ThangsSearcher.SEARCH_URL,
         )
+        session = mock.Mock()
+        session.request.side_effect = (first, second)
+        session.cookies = requests.cookies.cookiejar_from_dict({})
         with (
-            mock.patch("requests.get", side_effect=(first, second)) as get,
+            mock.patch("requests.Session", return_value=session),
+            mock.patch.object(mod, "_reject_obvious_local_target"),
             self.assertRaises(mod.CloudflareChallenge) as raised,
         ):
             mod.ThangsSearcher.search("dragon", None)
-        self.assertEqual(get.call_count, 2)
+        self.assertEqual(session.request.call_count, 2)
         self.assertIn("/search/dragon", raised.exception.url)
 
     def test_thangs_download_resolver_normalization_is_strict(self):
@@ -550,6 +566,64 @@ class CatalogSearchTests(unittest.TestCase):
         }
         model.update(overrides)
         return {"per_page": 100, "total_entries": 742, "models": [model]}
+
+    def test_youmagine_keeps_slug_designs_and_invents_none(self):
+        # The old pattern stopped at the first character outside [a-f0-9-].
+        # In the anchor pass that dropped real designs; in the JSON pass the
+        # partial match itself became the href, so "/designs/crawler-c23" was
+        # filed as a result named "c".
+        html = (
+            '<a href="/designs/skeeride-rc-snowmobile">Skeeride</a>'
+            '<a href="/designs/9f8e7d6c-1111-2222-3333-444455556666">UUID one</a>'
+            '{"url":"/designs/crawler-c23-body"}'
+        )
+        with mock.patch.object(
+            mod, "_fetch_html", return_value=(html, "https://youmagine.com/explore")
+        ):
+            rows = mod.YouMagineSearcher.search("rc", None)
+        urls = sorted(row["url"] for row in rows)
+        self.assertEqual(
+            urls,
+            [
+                "https://youmagine.com/designs/9f8e7d6c-1111-2222-3333-444455556666",
+                "https://youmagine.com/designs/crawler-c23-body",
+                "https://youmagine.com/designs/skeeride-rc-snowmobile",
+            ],
+        )
+        self.assertNotIn("https://youmagine.com/designs/c", urls)
+
+    def test_a_scraped_catalog_keeps_every_model_on_the_page(self):
+        # Cults3D returns 48 models in one response and has no second request
+        # to make, so capping at 30 discarded rows that were already parsed.
+        html = "".join(
+            f'<a href="/en/3d-model/tool/model-{index}">Model {index}</a>'
+            for index in range(48)
+        )
+        with mock.patch.object(
+            mod, "_fetch_html", return_value=(html, "https://cults3d.com/en/tags/x")
+        ):
+            rows = mod.Cults3DSearcher.search("x", None)
+        self.assertEqual(len(rows), 48)
+
+    def test_pinshape_takes_its_name_from_the_title_not_the_price_badge(self):
+        # The tile is one anchor whose visible text is the price and whose
+        # title attribute holds the real name.
+        html = (
+            '<a href="/items/15318-four-dragons-candlestick" '
+            'title="Four Dragons Candlestick">Free</a>'
+        )
+        with mock.patch.object(
+            mod, "_fetch_html", return_value=(html, "https://pinshape.com/items")
+        ):
+            rows = mod.PinshapeSearcher.search("dragon", None)
+        self.assertEqual(rows[0]["name"], "Four Dragons Candlestick")
+        self.assertTrue(rows[0]["is_free"])
+
+    def test_a_leading_item_id_is_not_part_of_the_name(self):
+        self.assertEqual(
+            mod._slug_title("https://pinshape.com/items/15318-four-dragons-candlestick"),
+            "four dragons candlestick",
+        )
 
     def test_grabcad_search_uses_json_api_without_a_session(self):
         payload = self._grabcad_payload()

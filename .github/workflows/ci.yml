@@ -32,6 +32,11 @@ jobs:
         run: |
           python scripts/check_embedded_js.py > embedded-ui.js
           node --check embedded-ui.js
+      - name: Interface behaviour tests
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
       - name: Unit tests
         run: python -m unittest discover -s tests -t . -v
       - name: Pyright

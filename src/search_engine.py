@@ -5336,8 +5336,8 @@ orca.onMessage(function(msg){
     updateAuth(msg.states||{});renderCloudflare(msg.cloudflare);$('auth-submit').disabled=false;$('cf-submit').disabled=false;resetForgetButton();
     if($('cloudflare-modal').classList.contains('active')&&msg.action==='auth_changed')closeCloudflare();
     if(msg.action==='auth_changed'){
-      closeAuth();$('status').textContent=msg.message||'Account session updated.';
-      if(pendingImport&&isAuthed(pendingImport)){var m=pendingImport;pendingImport=null;selectedModel=m;doImport()}
+      var resume=pendingImport;closeAuth();$('status').textContent=msg.message||'Account session updated.';
+      if(resume&&isAuthed(resume)){pendingImport=null;selectedModel=resume;doImport()}
       else if(selectedModel){prefetchMakerWorld(selectedModel)}
     }
   }else if(msg.action==='auth_challenge'){

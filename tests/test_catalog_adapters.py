@@ -869,6 +869,51 @@ class DownloadResolverTests(unittest.TestCase):
         self.assertEqual(files[0]["preview_url"], "https://grabcad.com/pics/large.png")
         self.assertNotIn("_loadable", files[0])
 
+    def test_grabcad_folder_budget_is_spent_on_fetches_not_discoveries(self):
+        # A model that advertises more folders than the budget used to exhaust
+        # it during the very first listing and fetch none of them, so the more
+        # a model had to walk, the less got walked.
+        def listing(url, params=None, **kwargs):
+            folder_id = (params or {}).get("folder_id")
+            if folder_id is None:
+                return FakeResponse(
+                    {
+                        "folders": [
+                            {"id": index, "name": f"F{index}"} for index in range(1, 8)
+                        ],
+                        "files": [],
+                    }
+                )
+            return FakeResponse(
+                {
+                    "folders": [],
+                    "files": [
+                        {
+                            "name": f"part{folder_id}.stl",
+                            "extension": "stl",
+                            "download_url": (
+                                "https://grabcad.com/community/api/v1/models/x"
+                                f"/files/download?cadid={folder_id}"
+                            ),
+                        }
+                    ],
+                }
+            )
+
+        model = {"url": "https://grabcad.com/library/example-1", "_slug": "example-1"}
+        with tempfile.TemporaryDirectory() as td:
+            auth = mod.AuthManager(mod.AuthStore(os.path.join(td, "sessions.json")))
+            auth.save_token("grabcad", "Cookie: sid=secret")
+            with mock.patch("requests.get", side_effect=listing) as get:
+                files = mod.GrabcadSearcher.get_files(model, auth)
+        fetched = [
+            call.kwargs["params"]["folder_id"]
+            for call in get.call_args_list
+            if call.kwargs.get("params")
+        ]
+        self.assertEqual(len(fetched), mod._GRABCAD_MAX_FOLDERS)
+        self.assertEqual(len(files), mod._GRABCAD_MAX_FOLDERS)
+
     def test_grabcad_model_without_files_offers_the_browser(self):
         listing = {"cached_slug": "example-1", "folders": [], "files": []}
         model = {"url": "https://grabcad.com/library/example-1", "_slug": "example-1"}

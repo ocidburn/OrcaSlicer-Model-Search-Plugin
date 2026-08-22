@@ -181,6 +181,7 @@ class MultiFileSelectionTests(unittest.TestCase):
                     "url": "https://cdn.example/only.stl",
                     "preview_url": "",
                     "size": None,
+                    "selected": True,
                 }
             ],
         )

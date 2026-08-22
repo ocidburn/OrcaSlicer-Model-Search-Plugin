@@ -2303,6 +2303,13 @@ def _normalize_download_files(files):
                 "name": name,
                 "preview_url": item.get("preview_url") or "",
                 "size": item.get("size"),
+                # Pre-tick only what the slicer could actually open. A portal
+                # that publishes drawings and PDFs beside the geometry would
+                # otherwise have every one of them downloaded by default and
+                # then discarded, leaving the user with junk and no model.
+                # An extensionless name is left ticked: those get their real
+                # extension from the download response.
+                "selected": not extension or extension in _MODEL_FILE_EXTS,
             }
         )
     return normalized
@@ -4468,9 +4475,18 @@ def _grabcad_model_files(slug):
     import requests
 
     listing_url = f"{GRABCAD_API}/{urllib.parse.quote(slug, safe='')}/files"
-    collected, visited, pending = [], set(), [None]
-    while pending and len(visited) <= _GRABCAD_MAX_FOLDERS:
+    collected, queued, pending = [], set(), [None]
+    folder_fetches = 0
+    while pending:
         folder_id = pending.pop(0)
+        # The budget caps requests actually spent. Counting folders as they are
+        # discovered instead would let a model that advertises many folders
+        # exhaust it before fetching any of them -- the more there was to walk,
+        # the less got walked.
+        if folder_id is not None:
+            if folder_fetches >= _GRABCAD_MAX_FOLDERS:
+                break
+            folder_fetches += 1
         response = requests.get(
             listing_url,
             params={"folder_id": folder_id} if folder_id else None,
@@ -4483,8 +4499,8 @@ def _grabcad_model_files(slug):
             raise TypeError("GrabCAD returned an invalid file listing")
         for folder in body.get("folders") or ():
             identifier = folder.get("id") if isinstance(folder, dict) else None
-            if identifier and identifier not in visited:
-                visited.add(identifier)
+            if identifier and identifier not in queued:
+                queued.add(identifier)
                 pending.append(identifier)
         collected.extend(
             item for item in body.get("files") or () if isinstance(item, dict)
@@ -5044,13 +5060,24 @@ def _download_stream(url, name, dest_dir, auth, platform):
             allow_redirects=True,
         )
         spec = _platform(platform)
+        # Only the portal itself can reject a session. These downloads are
+        # mostly short-lived presigned URLs on storage hosts that never see
+        # the credential, so treating their 403 as an expiry would delete a
+        # perfectly good token because a link went stale.
         if (
             response.status_code in (401, 403)
             and spec is not None
             and spec.requires_auth
+            and _host_matches(_url_host(response.url or url), spec.auth_hosts)
         ):
             raise AuthRequired(
                 f"{_display_name(platform)} session was rejected while downloading"
+            )
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"{_display_name(platform)} refused the download link "
+                f"(HTTP {response.status_code}). It has probably expired -- "
+                "start the import again."
             )
         response.raise_for_status()
         _write_download_response(response, path)
@@ -5060,25 +5087,14 @@ def _download_stream(url, name, dest_dir, auth, platform):
         except OSError:
             pass
         raise
-        # Only the portal itself can reject a session. These downloads are
-        # mostly short-lived presigned URLs on storage hosts that never see
-        # the credential, so treating their 403 as an expiry would delete a
-        # perfectly good token because a link went stale.
     finally:
         if response is not None:
             response.close()
         session.close()
-            and _host_matches(_url_host(response.url or url), spec.auth_hosts)
     return path
 
 
 # ---------------------------------------------------------------------------
-        if response.status_code in (401, 403):
-            raise RuntimeError(
-                f"{_display_name(platform)} refused the download link "
-                f"(HTTP {response.status_code}). It has probably expired -- "
-                "start the import again."
-            )
 # Web UI
 # ---------------------------------------------------------------------------
 
@@ -5234,7 +5250,7 @@ function closeMakerWorldPicker(){$('makerworld-modal').classList.remove('active'
 function closeTopModal(){if($('file-modal').classList.contains('active'))closeFilePicker();else if($('makerworld-modal').classList.contains('active'))closeMakerWorldPicker();else if($('cloudflare-modal').classList.contains('active'))closeCloudflare();else closeAuth()}
 function updateFileCount(){var all=document.querySelectorAll('#file-list input[type=checkbox]');var checked=document.querySelectorAll('#file-list input[type=checkbox]:checked');$('file-count').textContent=checked.length+' / '+all.length+' selected';$('file-import').disabled=checked.length===0}
 function formatBytes(v){v=Number(v);if(!isFinite(v)||v<0)return'';var units=['B','KB','MB','GB'],i=0;while(v>=1024&&i<units.length-1){v/=1024;i++}return(v>=10||i===0?Math.round(v):Math.round(v*10)/10)+' '+units[i]}
-function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){var name=f.name||('File '+(Number(f.index)+1)),image=safeUrl(f.preview_url),preview=image?'<img class="file-preview" src="'+esc(image)+'" loading="lazy" decoding="async" alt="'+esc(name)+' preview" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="file-preview-placeholder">No preview</span>',meta=formatBytes(f.size);html+='<label class="file-choice"><input type="checkbox" checked value="'+Number(f.index)+'" onchange="updateFileCount()">'+preview+'<span class="file-details"><span class="file-name">'+esc(name)+'</span>'+(meta?'<span class="file-meta">'+esc(meta)+'</span>':'')+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
+function showFilePicker(files){pendingFiles=files||[];var html='';pendingFiles.forEach(function(f){var name=f.name||('File '+(Number(f.index)+1)),image=safeUrl(f.preview_url),preview=image?'<img class="file-preview" src="'+esc(image)+'" loading="lazy" decoding="async" alt="'+esc(name)+' preview" tabindex="0" onmouseenter="showImagePreview(this)" onmouseleave="hideImagePreview(this)" onfocus="showImagePreview(this)" onblur="hideImagePreview(this)">':'<span class="file-preview-placeholder">No preview</span>',meta=formatBytes(f.size);html+='<label class="file-choice"><input type="checkbox"'+(f.selected===false?'':' checked')+' value="'+Number(f.index)+'" onchange="updateFileCount()">'+preview+'<span class="file-details"><span class="file-name">'+esc(name)+'</span>'+(meta?'<span class="file-meta">'+esc(meta)+'</span>':'')+'</span></label>'});$('file-list').innerHTML=html;$('file-modal').classList.add('active');syncBackdrop();updateFileCount()}
 function setAllFiles(value){document.querySelectorAll('#file-list input[type=checkbox]').forEach(function(x){x.checked=!!value});updateFileCount()}
 function confirmFileImport(){var selected=[];document.querySelectorAll('#file-list input[type=checkbox]:checked').forEach(function(x){selected.push(parseInt(x.value,10))});if(!selected.length)return;$('file-import').disabled=true;$('status').textContent='Downloading selected files...';$('file-modal').classList.remove('active');syncBackdrop();orca.postMessage({action:'import_selected',indices:selected})}
 function profileMeta(p){var v=[];if(p.creator)v.push('by '+p.creator);if(p.printer)v.push(p.printer);if(p.filament)v.push(p.filament);if(p.layer_height)v.push(p.layer_height+' layer');if(p.walls)v.push(p.walls+' walls');if(p.infill)v.push(p.infill+' infill');if(p.prediction_text)v.push(p.prediction_text);else if(p.prediction)v.push(Math.max(1,Math.round(Number(p.prediction)/3600*10)/10)+' h');if(p.plates)v.push(p.plates+' plate'+(Number(p.plates)===1?'':'s'));if(p.rating!=null)v.push('Rating '+p.rating+(p.rating_count?' ('+p.rating_count+')':''));if(p.downloads!=null)v.push('Downloads '+compactNumber(p.downloads));if(p.size!=null)v.push(formatBytes(p.size));return v.join(' / ')}
@@ -5345,6 +5361,7 @@ if orca is not None:
             self._detail_prefetch_inflight = set()
             self._login_lock = threading.RLock()
             self._login = None
+            self._login_epoch = None
 
         def get_name(self):
             return "Search 3D Models"
@@ -5361,7 +5378,6 @@ if orca is not None:
                 width=980,
                 height=720,
                 on_message=self.on_message,
-            self._login_epoch = None
                 on_close=self.on_close,
             )
             return _orca.ExecutionResult.success()
@@ -5526,6 +5542,8 @@ if orca is not None:
             receiver, self._login = self._login, None
             self._login_epoch = None
             if receiver is not None:
+                # stop() marks the receiver used before closing the socket, so
+                # a submission already in flight cannot still store a token.
                 receiver.stop()
 
         @staticmethod
@@ -5542,8 +5560,6 @@ if orca is not None:
             Cloudflare check already contains cf_clearance. That clearance is
             bound to the browser's User-Agent, which the hand-over page reports
             because it runs in that same browser -- so both halves are present
-                # stop() marks the receiver used before closing the socket, so
-                # a submission already in flight cannot still store a token.
             here and the user does not have to repeat the exercise in the
             Cloudflare panel.
             """
@@ -5616,6 +5632,7 @@ if orca is not None:
                 return
             with self._login_lock:
                 self._login = receiver
+                self._login_epoch = self.auth.store.epoch()
             if spec.login_url:
                 self._open_external(spec.login_url)
             self._open_external(url)
@@ -5632,7 +5649,6 @@ if orca is not None:
             self._start(self._do_cloudflare_save, msg)
 
         def _handle_cloudflare_forget(self, msg):
-                self._login_epoch = self.auth.store.epoch()
             host = CloudflareClearance.normalize_host(msg.get("host") or "")
             removed = self.auth.clearance.forget(host) if host else False
             self._post_auth(
@@ -5680,6 +5696,9 @@ if orca is not None:
             platform = msg.get("platform", "")
             token = (msg.get("token") or "").strip()
             email = (msg.get("email") or "").strip()
+            # Captured before any network round-trip: a portal login can take
+            # tens of seconds, and the erase control stays clickable meanwhile.
+            epoch = self.auth.store.epoch()
             if token:
                 self.auth.save_token(
                     platform, token, label=email or "Connected session", epoch=epoch
@@ -5690,15 +5709,13 @@ if orca is not None:
                     email,
                     password=msg.get("password"),
                     code=(msg.get("code") or "").strip(),
+                    epoch=epoch,
                 )
                 return
             raise AuthError(self._token_login_error(platform))
 
         def _do_auth_login(self, msg):
             import requests
-            # Captured before any network round-trip: a portal login can take
-            # tens of seconds, and the erase control stays clickable meanwhile.
-            epoch = self.auth.store.epoch()
 
             platform = msg.get("platform", "")
             # Never log the incoming message: it may contain a password/token.
@@ -5709,7 +5726,6 @@ if orca is not None:
                     {
                         "action": "auth_challenge",
                         "platform": platform,
-                    epoch=epoch,
                         "message": str(exc),
                     }
                 )

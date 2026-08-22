@@ -1203,7 +1203,11 @@ class RegistryAndUiTests(unittest.TestCase):
         self.assertIn("function paginationItems(page,total)", mod.PAGE)
         self.assertIn("window._results.slice(start,end)", mod.PAGE)
         self.assertIn("index=start+i", mod.PAGE)
-        self.assertIn("renderResults(window._results,false)", mod.PAGE)
+        # A background details message patches the one card it changed; it
+        # used to re-render the whole page, tearing down up to 300 cards and
+        # rebuilding the image observer once per prefetched result.
+        self.assertIn("function updateResultCard(index)", mod.PAGE)
+        self.assertNotIn("renderResults(window._results,false)", mod.PAGE)
 
     def test_search_results_support_server_side_pagination(self):
         self.assertIn('id="source-results"', mod.PAGE)

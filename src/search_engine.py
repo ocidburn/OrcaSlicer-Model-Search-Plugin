@@ -403,6 +403,7 @@ def _timestamp(value):
 
 def _normalize_result(item, source_rank=0):
     normalized = dict(item or {})
+    normalized["thumbnail_url"] = _safe_display_url(normalized.get("thumbnail_url"))
     for field in _COMMON_RESULT_FIELDS:
         normalized.setdefault(field, None)
     for field in ("downloads", "likes", "rating_count", "views", "makes"):
@@ -777,6 +778,27 @@ def _reject_obvious_local_target(url):
         return
     if not ip.is_global:
         raise ValueError("Refusing a private/local download URL")
+
+
+def _safe_display_url(url):
+    """Drop an image URL the interface should not be asked to fetch.
+
+    The webview loads thumbnails and covers directly, so the class of target
+    the download path refuses should not be handed to it either. Only the
+    literal forms are checked -- a hostname is left alone, because resolving
+    every thumbnail would mean a blocking DNS lookup per card and an <img>
+    cannot read a cross-origin response back anyway.
+    """
+    if not _is_http_url(url):
+        return ""
+    host = _url_host(url)
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+        return ""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return url
+    return url if ip.is_global else ""
 
 
 class CloudflareClearance:
@@ -2374,7 +2396,7 @@ def _normalize_download_files(files):
             {
                 "url": item["url"],
                 "name": name,
-                "preview_url": item.get("preview_url") or "",
+                "preview_url": _safe_display_url(item.get("preview_url")),
                 "size": item.get("size"),
                 # Pre-tick only what the slicer could actually open. A portal
                 # that publishes drawings and PDFs beside the geometry would
@@ -2828,7 +2850,7 @@ class NexprintSearcher:
         return {
             "profile_id": profile_id,
             "title": _coalesce(item.get("settingName"), default="Print profile"),
-            "cover": NexprintSearcher._profile_cover(item),
+            "cover": _safe_display_url(NexprintSearcher._profile_cover(item)),
             "creator": _coalesce(author.get("nickname"), item.get("authorName")),
             "printer": str(params.get("printerModel") or ""),
             "filament": NexprintSearcher._profile_filament(item),
@@ -3191,7 +3213,9 @@ class MakerWorldSearcher:
             "creator": creator.get("name")
             if isinstance(creator, dict)
             else str(creator or ""),
-            "cover": _coalesce(item.get("cover"), item.get("coverUrl")),
+            "cover": _safe_display_url(
+                _coalesce(item.get("cover"), item.get("coverUrl"))
+            ),
             "summary": _strip_html(
                 _coalesce(item.get("summaryTranslated"), item.get("summary"))
             ),
@@ -4352,7 +4376,7 @@ class CrealityCloudSearcher:
             "profile_id": str(item.get("id") or ""),
             "title": item.get("secondName") or item.get("name") or "Print profile",
             "summary": _strip_html(item.get("desc")),
-            "cover": cover if _is_http_url(cover) else "",
+            "cover": _safe_display_url(cover),
             "creator": user.get("nickName") or "",
             "printer": item.get("printerName") or "",
             "layer_height": item.get("layerHeight") or "",
@@ -4391,7 +4415,7 @@ class CrealityCloudSearcher:
                     "profile_id": "model-files",
                     "title": "Original model files",
                     "summary": "No public Creality print profile is available.",
-                    "cover": str(model.get("thumbnail_url") or ""),
+                    "cover": _safe_display_url(model.get("thumbnail_url")),
                 }
             ]
         return {

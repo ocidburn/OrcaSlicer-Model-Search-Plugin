@@ -276,6 +276,53 @@ class ResultIdentityTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
 
 
+class DisplayUrlTests(unittest.TestCase):
+    def test_an_image_url_pointing_at_this_machine_is_dropped(self):
+        for hostile in (
+            "http://127.0.0.1:8080/probe.png",
+            "http://localhost/probe.png",
+            "http://[::1]/probe.png",
+            "http://10.0.0.5/internal.png",
+            "http://169.254.169.254/latest/meta-data",
+            "http://192.168.1.1/router.png",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+        ):
+            self.assertEqual(mod._safe_display_url(hostile), "", hostile)
+
+    def test_an_ordinary_cdn_image_is_kept(self):
+        for good in (
+            "https://media.printables.com/cube.png",
+            "http://cdn.example.test/a.jpg",
+            "https://8.8.8.8/a.png",
+        ):
+            self.assertEqual(mod._safe_display_url(good), good, good)
+
+    def test_a_portal_cannot_get_the_webview_to_fetch_a_local_address(self):
+        rows = mod._filter_and_sort_results(
+            [
+                {
+                    "name": "probe",
+                    "platform": "Printables",
+                    "thumbnail_url": "http://169.254.169.254/latest/meta-data",
+                }
+            ]
+        )
+        self.assertEqual(rows[0]["thumbnail_url"], "")
+
+    def test_a_file_preview_is_held_to_the_same_rule(self):
+        files = mod._normalize_download_files(
+            [
+                {
+                    "url": "https://cdn.example/a.stl",
+                    "name": "a.stl",
+                    "preview_url": "http://127.0.0.1/probe.png",
+                }
+            ]
+        )
+        self.assertEqual(files[0]["preview_url"], "")
+
+
 class ExternalUrlTests(unittest.TestCase):
     def _action(self):
         script = load_script_module()

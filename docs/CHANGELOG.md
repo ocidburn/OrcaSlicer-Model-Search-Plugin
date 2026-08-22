@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+An adversarial review of the whole plugin found thirty-seven defects. All are
+fixed here, each with a regression test that was checked by reverting the fix
+and confirming the test fails.
+
+- **Credentials.** A bare portal token was stored a second time as a fake
+  Cloudflare clearance and survived "Forget session"; the credential file's
+  lock was per-instance while search workers opened their own store over it;
+  the clearances were edited with a read-modify-write spanning two lock holds;
+  "Delete all authorization data" could be undone by a sign-in already in
+  flight; and a 401 or 403 from a signed storage host was read as the portal
+  rejecting the session, which deleted a perfectly good token.
+- **Import.** On macOS and Linux the hand-off never asked for the forwarding
+  it depended on, so it opened a second OrcaSlicer, froze for twenty seconds
+  and was then killed -- and once forwarding does work, its exit code was
+  reported as a failure.
+- **Adapters.** YouMagine dropped real designs and invented junk rows from
+  partial pattern matches; the scraped catalogs discarded eighteen of the
+  forty-eight models Cults3D returns in one response; every Pinshape card was
+  named after the URL slug; Thangs search bypassed the shared transport, so
+  its Cloudflare clearance could follow a redirect off-host; and Creality never
+  sent a stored clearance at all.
+- **Interface.** An abandoned sign-in imported itself when an unrelated account
+  connected later; a background details message handed back an in-flight Import
+  button and rebuilt the entire results grid; and thumbnails were exempt from
+  the destination policy the download path enforces.
+- **GrabCAD.** The folder walk spent its budget on folders discovered rather
+  than fetched, so a model that kept its geometry in folders reported as having
+  no downloadable file; and the picker pre-ticked drawings and native CAD the
+  slicer cannot open.
+- **Coverage.** The five guards between a remote response and the user's disk
+  had no test that depended on them, four adapters were driven only with empty
+  payloads, and the interface was tested by searching its source for literals.
+  It now runs in a real DOM under `npm test`, which CI executes on all three
+  platforms.
+
 - Added a control that erases every stored authorization detail at once. The
   account panel could only drop one portal session at a time, so there was no
   way to remove everything the plugin had saved on this computer. Portal

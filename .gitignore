@@ -10,3 +10,4 @@ embedded-ui.js
 test_tokens.json
 downloads/
 node_modules/
+model_search_auth/

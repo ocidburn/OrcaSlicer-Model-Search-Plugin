@@ -545,8 +545,22 @@ See [`docs/LEGAL_ANALYSIS.md`](docs/LEGAL_ANALYSIS.md) for additional project no
 
 See [`docs/CHANGELOG.md`](docs/CHANGELOG.md) for the consolidated release history.
 
+## Origin
+
+This is a fork of [tommasobbianchi/OrcaSlicer-Model-Search-Plugin](https://github.com/tommasobbianchi/OrcaSlicer-Model-Search-Plugin)
+by Tommaso Bianchi, which established the plugin: the OrcaSlicer script capability,
+the embedded search window, the licence gate shown before every download, the
+import hand-off onto the plate, and the first six portals (Printables, Nexprint,
+Makeronline, Thingiverse, MakerWorld and GrabCAD).
+
+The fork has since added eight further portals, the authentication and Cloudflare
+hand-off layers, result pagination and cross-portal sorting, the repository
+layout, and the test suite and CI. Both the original and this fork are MIT
+licensed.
+
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). Copyright is held jointly by the original author and
+the fork's contributors; the original notice is retained as MIT requires.
 
 OrcaSlicer is a separate project licensed under its own terms.
